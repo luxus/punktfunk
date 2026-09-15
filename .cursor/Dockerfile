@@ -14,7 +14,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libpipewire-0.3-dev libopus-dev libwayland-dev libxkbcommon-dev \
       libgl-dev libegl-dev libgbm-dev \
       libgtk-4-dev libadwaita-1-dev libsdl3-dev \
-      libvulkan-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # The agent runs as `ubuntu` (uid 1000 on the cloud image). Give it passwordless sudo so setup
