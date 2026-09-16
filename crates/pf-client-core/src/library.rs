@@ -426,10 +426,9 @@ pub fn fetch_art(pinned: &ureq::Agent, base: &str, url: &str) -> Result<Vec<u8>,
 #[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
 const ART_WORKERS: usize = 3;
 
-/// Walk each job's candidate URLs until one loads — [`crate::art_cache`] first,
-/// then the network, which writes what it fetched back. Results arrive on the
-/// returned channel; drop the receiver to stop the workers (page popped).
-/// Consumer decodes textures on the main loop, cached bytes included.
+/// Walk each job's candidates until one loads. Disk first, then the network.
+/// Drop the receiver to stop the workers. Miss traces keep only the origin
+/// so CDN credentials never reach the client log ring.
 #[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
 pub fn spawn_art_fetch(
     base: String,
@@ -483,7 +482,12 @@ pub fn spawn_art_fetch(
                                 break;
                             }
                             // Miss (often 404 on a guessed CDN path) — try the next URL.
-                            Err(e) => tracing::debug!(%id, url, error = %e, "poster miss"),
+                            Err(e) => tracing::debug!(
+                                %id,
+                                url = %poster_log_url(url),
+                                error = %e,
+                                "poster miss"
+                            ),
                         }
                     }
                 }
@@ -507,9 +511,44 @@ pub(crate) fn classify(e: ureq::Error) -> LibraryError {
     }
 }
 
+/// Keep enough of a poster URL to name its receiver without retaining its credential.
+#[cfg(any(test, all(feature = "desktop", any(target_os = "linux", windows))))]
+fn poster_log_url(url: &str) -> String {
+    if url.starts_with("data:") {
+        return "data:".to_string();
+    }
+    let (scheme, rest) = url.split_once("://").unwrap_or(("", url));
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    format!(
+        "{scheme}://{}",
+        host.chars().filter(|c| !c.is_control()).collect::<String>()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn poster_log_url_drops_credentials() {
+        let shown = poster_log_url(
+            "https://user:password@cdn.example:8443\r\n/private/bearer-token.png?X-Amz-Signature=secret",
+        );
+        assert_eq!(shown, "https://cdn.example:8443");
+        for secret in [
+            "user",
+            "password",
+            "bearer-token",
+            "X-Amz-Signature",
+            "secret",
+        ] {
+            assert!(!shown.contains(secret), "{secret} leaked: {shown}");
+        }
+        assert_eq!(poster_log_url("data:image/png;base64,SEKRIT"), "data:");
+    }
 
     #[test]
     fn poster_candidates_order_and_resolution() {
