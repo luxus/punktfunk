@@ -688,6 +688,7 @@ pub(super) async fn negotiate(
                 audio_kbps: super::audio_reserved_kbps(&welcome),
                 shard_payload: welcome.shard_payload,
                 fec_percent: welcome.fec.fec_percent,
+                refresh_hz: mode.refresh_hz,
                 identity: codec == crate::encode::Codec::PyroWave,
             };
             let trace = bringup.clone();

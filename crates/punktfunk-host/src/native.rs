@@ -860,47 +860,39 @@ fn resolve_bitrate_kbps_for(
     resolve_bitrate_kbps(requested)
 }
 
-/// 40-byte header + 24-byte crypto seal inside each UDP payload (~4.5 % at 1408).
-const SHARD_WIRE_OVERHEAD: u64 =
-    (punktfunk_core::packet::HEADER_LEN + punktfunk_core::packet::CRYPTO_OVERHEAD) as u64;
-
 /// Wire budget → encoder rate. Client bitrate is the session wire budget.
 ///
-/// ```text
-/// wire  = video × (payload+64)/payload × (100+fec)/100 + audio
-/// video = (wire − audio) × payload/(payload+64) × 100/(100+fec)
-/// ```
-///
-/// Adaptive FEC reallocates inside the budget: more parity, lower encoder rate, never a
-/// fatter wire. Floored at [`MIN_BITRATE_KBPS`]. PyroWave bypasses this (bpp pin, ABR off).
+/// Expansion is [`FecConfig::recovery_count`] (ceil plus a 2-shard floor), not
+/// linear `(100+fec)/100`. Adaptive FEC reallocates inside the budget: more
+/// parity, lower encoder rate, never a fatter wire. Floored at
+/// [`MIN_BITRATE_KBPS`]. PyroWave bypasses this.
 fn encoder_kbps_for_budget(
     budget_kbps: u32,
     audio_kbps: u32,
     fec_percent: u8,
     shard_payload: u16,
+    refresh_hz: u32,
 ) -> u32 {
-    let payload = shard_payload.max(1) as u64;
-    let video_wire = budget_kbps.saturating_sub(audio_kbps) as u64;
-    let video =
-        video_wire * payload * 100 / ((payload + SHARD_WIRE_OVERHEAD) * (100 + fec_percent as u64));
-    u32::try_from(video)
-        .unwrap_or(u32::MAX)
-        .max(MIN_BITRATE_KBPS)
+    FecConfig::encoder_kbps_for_wire(
+        fec_percent,
+        budget_kbps.saturating_sub(audio_kbps),
+        shard_payload,
+        refresh_hz,
+    )
+    .max(MIN_BITRATE_KBPS)
 }
 
-/// Inverse: wire spend of an encoder rate. A short apply reports this so the client's climb
-/// base tracks wire truth. Rounds up where the derivation rounds down, so a roundtrip never
-/// inflates the budget the client believes.
+/// Inverse: sealed `k + recovery` spend of an encoder rate, plus audio. A short
+/// apply reports this so the client's climb base tracks wire truth.
 fn budget_kbps_for_encoder(
     encoder_kbps: u32,
     audio_kbps: u32,
     fec_percent: u8,
     shard_payload: u16,
+    refresh_hz: u32,
 ) -> u32 {
-    let payload = shard_payload.max(1) as u64;
-    let wire = encoder_kbps as u64 * (payload + SHARD_WIRE_OVERHEAD) * (100 + fec_percent as u64)
-        / (payload * 100);
-    u32::try_from(wire.saturating_add(audio_kbps as u64)).unwrap_or(u32::MAX)
+    FecConfig::wire_kbps_for_encoder(fec_percent, encoder_kbps, shard_payload, refresh_hz)
+        .saturating_add(audio_kbps)
 }
 
 /// Budget↔encoder at one moment: session constants plus a snapshot of adaptive FEC,
@@ -910,6 +902,8 @@ struct EncDerive {
     audio_kbps: u32,
     shard_payload: u16,
     fec_percent: u8,
+    /// Sizes `k` for the parity floor. 0 is 60 Hz.
+    refresh_hz: u32,
     /// PyroWave: pin is an encoder rate; both directions are identity.
     identity: bool,
 }
@@ -924,6 +918,7 @@ impl EncDerive {
                 self.audio_kbps,
                 self.fec_percent,
                 self.shard_payload,
+                self.refresh_hz,
             )
         }
     }
@@ -937,6 +932,7 @@ impl EncDerive {
                 self.audio_kbps,
                 self.fec_percent,
                 self.shard_payload,
+                self.refresh_hz,
             )
         }
     }
@@ -2646,9 +2642,11 @@ mod tests {
             audio_kbps: 576,
             shard_payload: 1408,
             fec_percent: 8,
+            refresh_hz: 60,
             identity: false,
         };
-        for budget in [2349u32, 4799, 6857, 9798, 14000, 20000, 940_032] {
+        // 2695 kbps is one data shard + floor parity + this audio at 60 Hz.
+        for budget in [3000u32, 4799, 6857, 9798, 14000, 20000, 940_032] {
             let asked_enc = ed.enc_kbps(budget);
             assert!(
                 ed.budget_kbps(asked_enc) <= budget,
@@ -2879,24 +2877,34 @@ mod tests {
 
     #[test]
     fn wire_budget_derivation_never_overshoots() {
-        // 20 Mbps budget, 300 kbps audio, 10 % FEC, 1408-byte shards → 17 130 kbps video.
-        assert_eq!(encoder_kbps_for_budget(20_000, 300, 10, 1408), 17_130);
+        // 20 Mbps, 300 kbps audio, 10 % FEC, 1408, 60 Hz: k=24 m=3 (not linear 10 %).
+        assert_eq!(encoder_kbps_for_budget(20_000, 300, 10, 1408, 60), 16_220);
         // Wire spend rounds back under the budget, never over.
-        assert_eq!(budget_kbps_for_encoder(17_130, 300, 10, 1408), 19_999);
+        assert_eq!(budget_kbps_for_encoder(16_220, 300, 10, 1408, 60), 19_377);
 
         // Non-floored roundtrip spends within the budget.
         for budget in [2_000u32, 5_000, 20_000, 100_000, 1_000_000] {
             for fec in [1u8, 5, 10, 25, 50] {
                 for audio in [0u32, 256, 512, 8_500] {
                     for payload in [1388u16, 1408, 8896] {
-                        let e = encoder_kbps_for_budget(budget, audio, fec, payload);
-                        if e > MIN_BITRATE_KBPS {
-                            let back = budget_kbps_for_encoder(e, audio, fec, payload);
-                            assert!(
-                                back <= budget,
-                                "budget {budget} fec {fec} audio {audio} payload {payload}: \
-                                 derived {e} spends {back}"
-                            );
+                        for hz in [24u32, 60, 120] {
+                            let video = u64::from(budget.saturating_sub(audio));
+                            let oh = punktfunk_core::config::sealed_datagram_bytes(payload as usize)
+                                as u64;
+                            let m1 = FecConfig::recovery_count(fec, 1) as u64;
+                            let min_wire = (1 + m1) * oh * u64::from(hz) * 8 / 1_000;
+                            if video < min_wire {
+                                continue; // one data + floor parity cannot fit
+                            }
+                            let e = encoder_kbps_for_budget(budget, audio, fec, payload, hz);
+                            if e > MIN_BITRATE_KBPS {
+                                let back = budget_kbps_for_encoder(e, audio, fec, payload, hz);
+                                assert!(
+                                    back <= budget,
+                                    "budget {budget} fec {fec} audio {audio} payload {payload} \
+                                     hz {hz}: derived {e} spends {back}"
+                                );
+                            }
                         }
                     }
                 }
@@ -2905,15 +2913,21 @@ mod tests {
 
         // Budget too small for its audio: floor at MIN and overshoot honestly.
         assert_eq!(
-            encoder_kbps_for_budget(500, 8_500, 50, 1408),
+            encoder_kbps_for_budget(500, 8_500, 50, 1408, 60),
             MIN_BITRATE_KBPS
         );
 
-        // More parity ⇒ lower video rate, same budget.
-        let calm = encoder_kbps_for_budget(20_000, 300, 1, 1408);
-        let burned = encoder_kbps_for_budget(20_000, 300, 5, 1408);
-        let stormy = encoder_kbps_for_budget(20_000, 300, 50, 1408);
-        assert!(calm > burned && burned > stormy);
+        // 1 % and 5 % share the 2-shard floor at this k; 10 % already emits 3.
+        let floor = encoder_kbps_for_budget(20_000, 300, 1, 1408, 60);
+        let still_floor = encoder_kbps_for_budget(20_000, 300, 5, 1408, 60);
+        let percent = encoder_kbps_for_budget(20_000, 300, 10, 1408, 60);
+        let stormy = encoder_kbps_for_budget(20_000, 300, 50, 1408, 60);
+        assert_eq!(floor, still_floor);
+        assert!(floor > percent && percent > stormy);
+        // 24 Hz: k is large enough that 5 % beats the floor.
+        let calm_24 = encoder_kbps_for_budget(20_000, 300, 1, 1408, 24);
+        let burned_24 = encoder_kbps_for_budget(20_000, 300, 5, 1408, 24);
+        assert!(calm_24 > burned_24);
     }
 
     #[test]

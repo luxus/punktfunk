@@ -207,12 +207,13 @@ pub(super) struct StreamState {
 }
 
 impl StreamState {
-    /// The encoder-rate derivation for a FEC percentage.
+    /// Encoder-rate derivation at this FEC percent, using the live refresh.
     pub(super) fn enc_derive(&self, fec: u8) -> super::super::EncDerive {
         super::super::EncDerive {
             audio_kbps: self.audio_reserved_kbps,
             shard_payload: self.shard_payload,
             fec_percent: fec,
+            refresh_hz: self.cur_mode.refresh_hz,
             identity: self.budget_identity,
         }
     }
@@ -389,12 +390,6 @@ impl StreamState {
         // `PUNKTFUNK_STREAMED_AU=0` reverts to whole-AU sends. Encoder chunking is per-AU.
         // `bitrate_kbps` is the total wire budget; only encoder opens convert via EncDerive.
         let budget_identity = plan.codec == crate::encode::Codec::PyroWave;
-        let enc_derive = move |fec: u8| super::super::EncDerive {
-            audio_kbps: audio_reserved_kbps,
-            shard_payload,
-            fec_percent: fec,
-            identity: budget_identity,
-        };
         let streamed_wire =
             streamed_au && std::env::var("PUNKTFUNK_STREAMED_AU").as_deref() != Ok("0");
         let slice_wire = streamed_wire
@@ -451,6 +446,14 @@ impl StreamState {
                 }
             }
         }
+        // Sizes k from the mode this pipeline will run.
+        let enc_derive = move |fec: u8| super::super::EncDerive {
+            audio_kbps: audio_reserved_kbps,
+            shard_payload,
+            fec_percent: fec,
+            refresh_hz: mode.refresh_hz,
+            identity: budget_identity,
+        };
         tracing::info!(
             compositor = compositor.id(),
             ?mode,

@@ -328,13 +328,70 @@ pub(crate) const MIN_RECOVERY_SHARDS: usize = 2;
 
 impl FecConfig {
     pub fn recovery_for(&self, data_shards: usize) -> usize {
-        if self.fec_percent == 0 || data_shards == 0 {
+        Self::recovery_count(self.fec_percent, data_shards)
+    }
+
+    /// `max(2, ceil(k · pct / 100))`. Zero percent or zero `k` is no parity.
+    pub fn recovery_count(fec_percent: u8, data_shards: usize) -> usize {
+        if fec_percent == 0 || data_shards == 0 {
             return 0;
         }
-        (data_shards * self.fec_percent as usize)
+        (data_shards * fec_percent as usize)
             .div_ceil(100)
             .max(MIN_RECOVERY_SHARDS)
     }
+
+    /// Video encoder kbps whose sealed `k + recovery` shards spend `video_wire_kbps`.
+    /// `k` is shards in one frame at this rate. `refresh_hz` 0 is 60.
+    pub fn encoder_kbps_for_wire(
+        fec_percent: u8,
+        video_wire_kbps: u32,
+        shard_payload: u16,
+        refresh_hz: u32,
+    ) -> u32 {
+        let payload = shard_payload.max(1) as u64;
+        let oh = sealed_datagram_bytes(payload as usize) as u64;
+        let hz = u64::from(if refresh_hz == 0 { 60 } else { refresh_hz });
+        let video_wire = u64::from(video_wire_kbps);
+        // Linear guess for `k`, then walk down until `k+m` sealed shards fit.
+        // Wire is per full shard (tail pad included), not per encoder byte.
+        let mut k = data_shards_for_rate(
+            video_wire * payload * 100 / (oh * (100 + u64::from(fec_percent)).max(1)),
+            payload,
+            refresh_hz,
+        );
+        loop {
+            let m = Self::recovery_count(fec_percent, k as usize) as u64;
+            if (k + m) * oh * hz * 8 <= video_wire * 1_000 || k == 1 {
+                break;
+            }
+            k -= 1;
+        }
+        u32::try_from(k * payload * 8 * hz / 1_000).unwrap_or(u32::MAX)
+    }
+
+    /// Inverse of [`Self::encoder_kbps_for_wire`]: sealed-shard spend of an encoder rate.
+    pub fn wire_kbps_for_encoder(
+        fec_percent: u8,
+        encoder_kbps: u32,
+        shard_payload: u16,
+        refresh_hz: u32,
+    ) -> u32 {
+        let payload = shard_payload.max(1) as u64;
+        let oh = sealed_datagram_bytes(payload as usize) as u64;
+        let hz = u64::from(if refresh_hz == 0 { 60 } else { refresh_hz });
+        let k = data_shards_for_rate(u64::from(encoder_kbps), payload, refresh_hz);
+        let m = Self::recovery_count(fec_percent, k as usize) as u64;
+        u32::try_from((k + m) * oh * hz * 8 / 1_000).unwrap_or(u32::MAX)
+    }
+}
+
+/// Data shards in one frame at this encoder rate. `refresh_hz` 0 is 60.
+fn data_shards_for_rate(encoder_kbps: u64, shard_payload: u64, refresh_hz: u32) -> u64 {
+    let hz = u64::from(if refresh_hz == 0 { 60 } else { refresh_hz });
+    let payload = shard_payload.max(1);
+    let frame_bytes = encoder_kbps.saturating_mul(1_000) / 8 / hz;
+    frame_bytes.div_ceil(payload).max(1)
 }
 
 /// Header + crypto still fit in [`MAX_DATAGRAM_BYTES`].
@@ -921,5 +978,65 @@ mod tests {
         assert_eq!(GamepadPref::from_name("nope"), None);
         // Unknown wire byte degrades to Auto.
         assert_eq!(GamepadPref::from_u8(200), GamepadPref::Auto);
+    }
+
+    #[test]
+    fn recovery_floor_beats_linear_percent_on_small_blocks() {
+        // 5 % of 26 shards is 1.3, ceil 2, floor 2 → 7.7 %, not 5 %.
+        assert_eq!(FecConfig::recovery_count(5, 26), 2);
+        assert!(2 * 100 > 26 * 5);
+        assert_eq!(FecConfig::recovery_count(10, 25), 3);
+        assert_eq!(FecConfig::recovery_count(0, 25), 0);
+    }
+
+    #[test]
+    fn wire_budget_covers_the_parity_floor() {
+        // 20 Mbps video, 5 % FEC, 1408, 60 Hz: k=25 m=2. Linear 5 % overshoots.
+        let payload = mtu1500_shard_payload() as u16;
+        assert_eq!(payload, 1408);
+        assert_eq!(
+            FecConfig::encoder_kbps_for_wire(10, 19_700, payload, 60),
+            16_220
+        );
+        assert_eq!(
+            FecConfig::wire_kbps_for_encoder(10, 16_220, payload, 60),
+            19_077
+        );
+        let e = FecConfig::encoder_kbps_for_wire(5, 19_700, payload, 60);
+        let k = data_shards_for_rate(u64::from(e), payload as u64, 60);
+        let m = FecConfig::recovery_count(5, k as usize) as u64;
+        let wire = (k + m) * sealed_datagram_bytes(payload as usize) as u64 * 60 * 8 / 1_000;
+        assert!(
+            wire <= 19_700,
+            "enc {e} k {k} m {m} spends {wire} over 19700"
+        );
+        assert!(e < 17_946, "floor-aware rate {e} still looks linear");
+        // 1 % and 5 % share m=2 at this k; 10 % already emits 3.
+        assert_eq!(
+            FecConfig::encoder_kbps_for_wire(1, 19_700, payload, 60),
+            FecConfig::encoder_kbps_for_wire(5, 19_700, payload, 60)
+        );
+
+        for video in [1_700u32, 4_700, 19_700, 99_700] {
+            for fec in [1u8, 5, 10, 25, 50] {
+                for payload in [1388u16, 1408, 8896] {
+                    for hz in [24u32, 60, 120] {
+                        let oh = sealed_datagram_bytes(payload as usize) as u64;
+                        let m1 = FecConfig::recovery_count(fec, 1) as u64;
+                        let min_wire = (1 + m1) * oh * u64::from(hz) * 8 / 1_000;
+                        if u64::from(video) < min_wire {
+                            continue; // one data + floor parity cannot fit — honest overshoot
+                        }
+                        let e = FecConfig::encoder_kbps_for_wire(fec, video, payload, hz);
+                        let back = FecConfig::wire_kbps_for_encoder(fec, e, payload, hz);
+                        assert!(
+                            back <= video,
+                            "video {video} fec {fec} payload {payload} hz {hz}: \
+                             derived {e} spends {back}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }
