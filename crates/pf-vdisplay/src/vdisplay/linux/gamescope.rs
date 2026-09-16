@@ -4162,7 +4162,7 @@ fn spawn(
             cmd.env("PULSE_SOURCE", src);
         }
     }
-    cmd.arg(app)
+    cmd.arg(&app)
         // Prefer the NVIDIA GL vendor for the nested session (harmless on a pure-NVIDIA box).
         .env("__GLX_VENDOR_LIBRARY_NAME", "nvidia")
         // The box's keyboard layout — see [`xkb_env`]. Empty on an unconfigured box.
