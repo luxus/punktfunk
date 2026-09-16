@@ -278,10 +278,15 @@ pub trait VirtualDisplay: Send {
     fn last_identity_slot(&self) -> Option<u32> {
         None
     }
+    /// `kde_output_device_v2` UUID of the last [`create`](Self::create). Registry
+    /// keys a group apply on this (name is the fallback). Default `None`.
+    fn last_output_uuid(&self) -> Option<String> {
+        None
+    }
     /// Place the last [`create`](Self::create) at `(x, y)` in desktop space. Registry owns the
-    /// group and calls this after `create` (auto-row or console arrangement). Never called for
-    /// origin `(0, 0)`. Default no-op (only KWin positions). Best-effort: failure keeps compositor
-    /// default. See `design/display-management.md`.
+    /// group and calls this after `create` (fallback when the KWin group apply misses).
+    /// Skipped for auto-row origin of the first member. Default no-op (only KWin positions).
+    /// Best-effort: failure keeps compositor default. See `design/display-management.md`.
     fn apply_position(&mut self, _x: i32, _y: i32) {}
     /// Topology restore this [`create`](Self::create) prepared (re-enable heads an `exclusive` /
     /// `primary` change disabled). Registry lifts it into the group so it runs once, when the

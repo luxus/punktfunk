@@ -196,6 +196,10 @@ impl VirtualDisplay for KwinDisplay {
         self.last_slot
     }
 
+    fn last_output_uuid(&self) -> Option<String> {
+        self.our_uuid.clone()
+    }
+
     fn take_topology_restore(&mut self) -> Option<Box<dyn FnOnce() + Send>> {
         self.pending_restore.take()
     }

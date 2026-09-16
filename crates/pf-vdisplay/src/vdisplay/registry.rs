@@ -273,6 +273,9 @@ mod pool {
         /// Identity slot at create (`None` = anonymous). Kept across reuse; keys
         /// group arrangement and `/display/state`.
         pub(super) identity_slot: Option<u32>,
+        /// `kde_output_device_v2` UUID. Group apply addresses KWin by this;
+        /// `join_name` / `input_output` / `output_name` is the fallback.
+        pub(super) output_uuid: Option<String>,
         /// Per-group topology restore: re-enable physicals that `exclusive`
         /// disabled. At most one entry per group holds it; teardown hands it to
         /// a sibling, and it runs only when the last member drops.
@@ -629,6 +632,7 @@ mod pool {
                 },
                 backend,
                 identity_slot: None,
+                output_uuid: None,
                 topology_restore: restore,
                 isolation: None,
                 seat: None,
@@ -981,12 +985,11 @@ mod pool {
             };
             let pos = position_for_new(vec![(1, new)], new, &layout);
             assert_eq!(pos, Placement { x: 100, y: 200 });
-            assert!(crate::layout::needs_apply(pos, false, &new, &layout));
         }
 
         #[test]
-        fn a_manual_pin_at_origin_is_a_real_placement() {
-            use crate::layout::{Member, Placement};
+        fn a_manual_pin_at_origin_composes_the_whole_group() {
+            use crate::layout::{compose, Member, Placement, Rect};
             let mut positions = BTreeMap::new();
             positions.insert("7".to_string(), Position { x: 0, y: 0 });
             let layout = Layout {
@@ -1001,10 +1004,25 @@ mod pool {
                 identity_slot: Some(7),
                 width: 1920,
             };
-            let pos = position_for_new(vec![(1, first)], pinned, &layout);
-            assert_eq!(pos, Placement { x: 0, y: 0 });
-            assert!(crate::layout::needs_apply(pos, false, &pinned, &layout));
-            assert!(crate::layout::needs_apply(pos, true, &pinned, &layout));
+            let members = [first, pinned];
+            // Exclusive: both members. Applying only the pin stacks it on slot 1.
+            let out = compose(&members, &layout, &[]);
+            assert_eq!(
+                out,
+                vec![Placement { x: 1920, y: 0 }, Placement { x: 0, y: 0 },]
+            );
+            // Extend: the pin is past the lit physical, not on it.
+            let lit = [Rect {
+                x: 0,
+                y: 0,
+                w: 3840,
+                h: 1080,
+            }];
+            let out = compose(&members, &layout, &lit);
+            assert_eq!(
+                out,
+                vec![Placement { x: 5760, y: 0 }, Placement { x: 3840, y: 0 },]
+            );
         }
 
         #[test]
@@ -1092,11 +1110,11 @@ mod linux {
     use super::pool::{
         assemble_displays, assign_group_ids, budget_count, effective_linger, epoch_matches,
         group_key, hand_off_restore, in_group, join_target, kept_to_retire, lingering_to_evict,
-        position_for_new, take_expired, Entry, Restore, Row,
+        take_expired, Entry, Restore, Row,
     };
     use super::DisplayInfo;
     use crate::lifecycle::{self, Release};
-    use crate::policy::{self, Layout, Linger};
+    use crate::policy::{self, Layout, LayoutMode, Linger};
     use crate::{Mode, VirtualDisplay, VirtualOutput};
 
     enum ReuseOutcome {
@@ -1154,6 +1172,81 @@ mod linux {
             .unwrap_or(Linger::Immediate)
     }
 
+    /// KWin address for a group apply: UUID first, then the names `Entry` already keeps.
+    fn entry_addr(e: &Entry) -> crate::kwin_output_mgmt::OutputPos {
+        crate::kwin_output_mgmt::OutputPos {
+            uuid: e.output_uuid.clone(),
+            name: e
+                .join_name
+                .as_ref()
+                .and_then(|j| j.get().cloned())
+                .or_else(|| e.input_output.clone())
+                .or_else(|| e.output_name.clone()),
+            x: 0,
+            y: 0,
+        }
+    }
+
+    fn layout_member(e: &Entry) -> crate::layout::Member {
+        crate::layout::Member {
+            identity_slot: e.identity_slot,
+            width: e.mode.width as i32,
+        }
+    }
+
+    /// Same-group members in acquire order, with the KWin address for each.
+    fn group_plan(
+        es: &[Entry],
+        backend: &'static str,
+        generation: u64,
+        supersedes: Option<u64>,
+    ) -> (
+        Vec<crate::layout::Member>,
+        Vec<crate::kwin_output_mgmt::OutputPos>,
+    ) {
+        let mut rows: Vec<(
+            u64,
+            crate::layout::Member,
+            crate::kwin_output_mgmt::OutputPos,
+        )> = es
+            .iter()
+            .filter(|e| in_group(e.backend, e.generation, backend, generation, supersedes))
+            .map(|e| (e.generation, layout_member(e), entry_addr(e)))
+            .collect();
+        rows.sort_by_key(|(g, _, _)| *g);
+        let members = rows.iter().map(|(_, m, _)| *m).collect();
+        let addrs = rows.into_iter().map(|(_, _, a)| a).collect();
+        (members, addrs)
+    }
+
+    /// `arrange` plus lit-physical offset, then one KWin config. Manual always
+    /// sends every member. Auto-row skips first-at-origin (compositor default).
+    fn apply_kwin_group(
+        members: &[crate::layout::Member],
+        addrs: &[crate::kwin_output_mgmt::OutputPos],
+        layout: &Layout,
+    ) -> bool {
+        let lit = crate::kwin_output_mgmt::lit_physical_rects();
+        let composed = crate::layout::compose(members, layout, &lit);
+        let mut positions: Vec<crate::kwin_output_mgmt::OutputPos> = Vec::new();
+        for (i, (addr, at)) in addrs.iter().zip(&composed).enumerate() {
+            let send = layout.mode == LayoutMode::Manual || crate::layout::needs_apply(*at, i == 0);
+            if !send || (addr.uuid.is_none() && addr.name.is_none()) {
+                continue;
+            }
+            positions.push(crate::kwin_output_mgmt::OutputPos {
+                uuid: addr.uuid.clone(),
+                name: addr.name.clone(),
+                x: at.x,
+                y: at.y,
+            });
+        }
+        if positions.is_empty() {
+            return true;
+        }
+        crate::kwin_output_mgmt::set_positions(&positions)
+    }
+
     /// Do not wrap `spawn` in `Once` and discard `Result`: a failed spawn
     /// (EAGAIN / RLIMIT_NPROC) would consume the Once and leave kept displays
     /// unreaped for the process lifetime. Set the flag only on success; the
@@ -1169,9 +1262,25 @@ mod linux {
             .spawn(|| {
                 loop {
                     std::thread::sleep(Duration::from_millis(500));
-                    let (expired, restores) = {
+                    let (expired, restores, relayout) = {
                         let mut es = reg().entries.lock().unwrap();
-                        take_expired(&mut es, Instant::now(), crate::session_epoch())
+                        let (expired, restores) =
+                            take_expired(&mut es, Instant::now(), crate::session_epoch());
+                        let layout = policy::prefs()
+                            .configured_effective()
+                            .map(|p| p.layout)
+                            .unwrap_or_default();
+                        let relayout = (layout.mode == LayoutMode::Manual
+                            && !expired.is_empty()
+                            && expired.iter().any(|e| e.backend == "kwin"))
+                        .then(|| {
+                            expired.iter().find(|e| e.backend == "kwin").map(|e| {
+                                let (members, addrs) = group_plan(&es, "kwin", e.generation, None);
+                                (members, addrs, layout)
+                            })
+                        })
+                        .flatten();
+                        (expired, restores, relayout)
                     };
                     // Restore physicals (group emptied) before dropping outputs, outside the lock.
                     for restore in restores {
@@ -1186,6 +1295,9 @@ mod linux {
                         drop(e); // outside the lock
                     }
                     emit_released(reaped);
+                    if let Some((members, addrs, layout)) = relayout {
+                        let _ = apply_kwin_group(&members, &addrs, &layout);
+                    }
                 }
             }) {
             Ok(_) => *started = true,
@@ -1463,6 +1575,7 @@ mod linux {
             mode,
             backend,
             identity_slot,
+            output_uuid: vd.last_output_uuid(),
             topology_restore,
             isolation: isolation.clone(),
             seat: real.seat.clone(),
@@ -1475,42 +1588,39 @@ mod linux {
 
         // Position then push under the same lock (I/O-free). Apply is below,
         // outside the lock.
-        let (position, apply) = {
-            use crate::layout::Member;
+        let (members, addrs, layout_policy) = {
             let layout_policy = policy::prefs()
                 .configured_effective()
                 .map(|e| e.layout)
                 .unwrap_or_default();
             let mut es = r.entries.lock().unwrap();
+            es.push(entry);
             // Same-group, excluding `supersedes` — else a resize auto-rows past
             // the predecessor and walks one width right on every mode switch.
-            let existing: Vec<(u64, Member)> = es
-                .iter()
-                .filter(|e| in_group(e.backend, e.generation, backend, generation, supersedes))
-                .map(|e| {
-                    (
-                        e.generation,
-                        Member {
-                            identity_slot: e.identity_slot,
-                            width: e.mode.width as i32,
-                        },
-                    )
-                })
-                .collect();
-            let new_member = Member {
-                identity_slot,
-                width: mode.width as i32,
-            };
-            let first = existing.is_empty();
-            let pos = position_for_new(existing, new_member, &layout_policy);
-            let apply = crate::layout::needs_apply(pos, first, &new_member, &layout_policy);
-            es.push(entry);
-            (pos, apply)
+            let (members, addrs) = group_plan(&es, backend, generation, supersedes);
+            (members, addrs, layout_policy)
         };
-        // Outside the lock: kscreen blocks. `needs_apply` skips auto-row origin
-        // of the first member (compositor default) and honors a pin at (0, 0).
-        if apply {
-            vd.apply_position(position.x, position.y);
+        // Outside the lock: kscreen / output-management blocks. Manual re-applies
+        // every member in one KWin config; Auto-row skips first-at-origin.
+        if backend == "kwin" {
+            if !apply_kwin_group(&members, &addrs, &layout_policy) {
+                let lit = crate::kwin_output_mgmt::lit_physical_rects();
+                let composed = crate::layout::compose(&members, &layout_policy, &lit);
+                if let Some((i, at)) = composed.iter().enumerate().last() {
+                    if layout_policy.mode == LayoutMode::Manual
+                        || crate::layout::needs_apply(*at, i == 0)
+                    {
+                        vd.apply_position(at.x, at.y);
+                    }
+                }
+            }
+        } else {
+            let composed = crate::layout::compose(&members, &layout_policy, &[]);
+            if let Some((i, at)) = composed.iter().enumerate().last() {
+                if crate::layout::needs_apply(*at, i == 0) {
+                    vd.apply_position(at.x, at.y);
+                }
+            }
         }
         let mut out = output_for(
             node_id,
@@ -1621,7 +1731,7 @@ mod linux {
     /// Torn-down keepalive drops after the lock is released.
     fn release(generation: u64, force_immediate: bool) {
         let Some(r) = REG.get() else { return };
-        let (torn_down, restore) = {
+        let (torn_down, restore, relayout) = {
             let mut es = r.entries.lock().unwrap();
             let Some(idx) = es.iter().position(|e| e.generation == generation) else {
                 return; // stale lease (entry reused + re-stamped, or already gone) — no-op
@@ -1634,28 +1744,39 @@ mod linux {
                     let mut e = es.remove(idx);
                     let (backend, g) = (e.backend, e.generation);
                     let restore = hand_off_restore(&mut es, backend, g, e.topology_restore.take());
-                    (Some(e), restore)
+                    let layout = policy::prefs()
+                        .configured_effective()
+                        .map(|p| p.layout)
+                        .unwrap_or_default();
+                    let relayout = (backend == "kwin"
+                        && layout.mode == LayoutMode::Manual
+                        && restore.is_none())
+                    .then(|| {
+                        let (members, addrs) = group_plan(&es, backend, g, None);
+                        (members, addrs, layout)
+                    });
+                    (Some(e), restore, relayout)
                 }
                 // No live hold: do nothing. Do not treat this as Teardown — a
                 // stale/duplicate drop would kill the display. Unreachable
                 // (lookup is by unique generation) but must match Windows.
-                Release::Noop => (None, None),
+                Release::Noop => (None, None, None),
                 Release::Linger => {
                     tracing::info!(
                         backend = es[idx].backend,
                         "virtual display: last session left — lingering (keep-alive)"
                     );
-                    (None, None)
+                    (None, None, None)
                 }
                 Release::Pin => {
                     tracing::info!(
                         backend = es[idx].backend,
                         "virtual display: last session left — pinned (keep-alive forever)"
                     );
-                    (None, None)
+                    (None, None, None)
                 }
                 // A JOIN session left a shared display; another session still holds it.
-                Release::Decref => (None, None),
+                Release::Decref => (None, None, None),
             }
         };
         // Restore physicals (group emptied) before dropping the output, outside the lock.
@@ -1676,6 +1797,9 @@ mod linux {
             }
             drop(e); // outside the lock — the keepalive Drop may block
             emit_released(1);
+        }
+        if let Some((members, addrs, layout)) = relayout {
+            let _ = apply_kwin_group(&members, &addrs, &layout);
         }
     }
 

@@ -1272,7 +1272,7 @@ impl VirtualDisplayManager {
     /// Arrange live slots' desktop origins (`auto-row` default, console `manual`
     /// pins win) and commit them in one CCD apply. No-ops for a single member.
     fn apply_group_layout(&self, inner: &mut MgrInner) {
-        use crate::layout::{arrange, Member};
+        use crate::layout::Member;
         if inner.slots.len() < 2 {
             return;
         }
@@ -1296,7 +1296,7 @@ impl VirtualDisplayManager {
                 width,
             })
             .collect();
-        let placements = arrange(&members, &layout_policy);
+        let placements = crate::layout::compose(&members, &layout_policy, &[]);
         let positions: Vec<(CcdTargetKey, i32, i32)> = ordered
             .iter()
             .zip(&placements)

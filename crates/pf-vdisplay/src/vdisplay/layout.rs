@@ -8,12 +8,14 @@
 //! left-to-right past the rightmost pinned edge. Overlapping pins are copied
 //! verbatim.
 //!
-//! Members have no height, so clearance is x-only and every pin counts
+//! Members have no height, so packing is x-only and every pin counts
 //! regardless of `y`. A vertical stack therefore packs further right than it
 //! needs to: a gap wastes coordinate space; an overlap maps two desktops onto
 //! the same pixels.
 //!
-//! Group membership lives in [`super::registry`].
+//! [`compose`] is the desktop placement: `arrange`, then a rigid shift past
+//! every lit physical that shares a pixel. Exclusive (nothing lit) is
+//! `arrange` as-is. Group membership lives in [`super::registry`].
 
 use super::policy::{Layout, LayoutMode};
 
@@ -53,8 +55,8 @@ fn pin_of(m: &Member, layout: &Layout) -> Option<Placement> {
         .map(|p| Placement { x: p.x, y: p.y })
 }
 
-/// One [`Placement`] per member, same order. Shared by the state readout and
-/// (KWin) the per-backend position apply.
+/// One group-relative [`Placement`] per member, same order. Pins and packing
+/// live here; [`compose`] is what the compositor must apply.
 pub fn arrange(members: &[Member], layout: &Layout) -> Vec<Placement> {
     match layout.mode {
         LayoutMode::AutoRow => (0..members.len())
@@ -67,30 +69,26 @@ pub fn arrange(members: &[Member], layout: &Layout) -> Vec<Placement> {
     }
 }
 
-/// Whether the backend must move the output to `at`.
+/// Desktop placement: [`arrange`], then a rigid shift so no member overlaps
+/// a lit physical. Exclusive (empty `lit`) is `arrange` unchanged.
+pub fn compose(members: &[Member], layout: &Layout, lit: &[Rect]) -> Vec<Placement> {
+    offset_past_lit(&arrange(members, layout), members, lit)
+}
+
+/// Whether the backend must move this member to `at`.
 ///
-/// Auto-row origin of the first member is the compositor default; applying it
-/// in extend stacks on the physical. A later member or a pin at the origin is a
-/// move — KWin parks a new output to the right of the row.
-pub fn needs_apply(at: Placement, first_in_group: bool, member: &Member, layout: &Layout) -> bool {
-    if (at.x, at.y) != (0, 0) {
-        return true;
-    }
-    if !first_in_group {
-        return true;
-    }
-    layout.mode == LayoutMode::Manual && pin_of(member, layout).is_some()
+/// Skip auto-row origin of the first member: that is the compositor default,
+/// and applying it in extend stacks on the physical. A later member at origin
+/// is a move. Call this on [`compose`] results, not raw pins: a pin at origin
+/// beside a lit screen is no longer `(0, 0)`.
+pub fn needs_apply(at: Placement, first_in_group: bool) -> bool {
+    (at.x, at.y) != (0, 0) || !first_in_group
 }
 
 /// Pins verbatim; unpinned members row out past the rightmost pinned edge.
 ///
-/// The cursor is seeded from every pin, so an already-placed unpinned `x`
-/// shifts when a pinned sibling arrives later in acquire order. Nothing here
-/// re-applies: `registry::position_for_new` takes only `.last()` and moves the
-/// new display. The registry must re-apply the whole group on a Manual
-/// membership change (`windows/manager.rs` `arrange_slots` already does).
-/// Seeding from preceding pins only restores incremental stability by
-/// bringing the overlap back — the wrong trade.
+/// A later pin moves an already-placed unpinned sibling. Callers re-apply
+/// the whole group on a Manual membership change.
 fn arrange_manual(members: &[Member], layout: &Layout) -> Vec<Placement> {
     let pins: Vec<Option<Placement>> = members.iter().map(|m| pin_of(m, layout)).collect();
     // `max(0)` so a negative width cannot pull the cursor back over a pin.
@@ -146,6 +144,36 @@ pub fn origin_for(lit: &[Rect], ours: Option<Rect>) -> Option<Placement> {
             .unwrap_or(0),
         y: 0,
     })
+}
+
+/// Rigid +x so no member shares a pixel with `lit`. Zero when already clear.
+fn offset_past_lit(placed: &[Placement], members: &[Member], lit: &[Rect]) -> Vec<Placement> {
+    if lit.is_empty() {
+        return placed.to_vec();
+    }
+    let mut dx = 0i32;
+    for (p, m) in placed.iter().zip(members) {
+        // Packing is x-only; against a physical, y still matters. Height 1 at
+        // the pin's y: a pin on the physical's row shifts, one below it does not.
+        let ours = Rect {
+            x: p.x,
+            y: p.y,
+            w: m.width.max(0),
+            h: 1,
+        };
+        for s in lit {
+            if overlaps(ours, *s) {
+                dx = dx.max(s.x.saturating_add(s.w.max(0)).saturating_sub(p.x));
+            }
+        }
+    }
+    placed
+        .iter()
+        .map(|p| Placement {
+            x: p.x.saturating_add(dx),
+            y: p.y,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -243,21 +271,69 @@ mod tests {
     }
 
     /// Skip auto-row origin of the first member (KWin default). Apply a later
-    /// member or a pin at (0, 0): new outputs park to the right of the row.
+    /// member at origin. A first-member pin is not a reason to send (0, 0).
     #[test]
     fn origin_is_applied_when_it_is_a_move() {
         let origin = Placement { x: 0, y: 0 };
         let elsewhere = Placement { x: 1920, y: 0 };
-        let first = m(Some(1), 2560);
-        let later = m(Some(7), 1920);
-        assert!(!needs_apply(origin, true, &first, &Layout::default()));
-        assert!(needs_apply(elsewhere, true, &first, &Layout::default()));
-        assert!(needs_apply(origin, false, &later, &Layout::default()));
+        assert!(!needs_apply(origin, true));
+        assert!(needs_apply(elsewhere, true));
+        assert!(needs_apply(origin, false));
+        // Pin at origin beside nothing lit still composes to origin: skip.
         let pin_at_origin = manual(&[("7", 0, 0)]);
-        assert!(needs_apply(origin, true, &later, &pin_at_origin));
-        assert!(needs_apply(origin, false, &later, &pin_at_origin));
-        // Manual with no pin for this slot is auto-row.
-        assert!(!needs_apply(origin, true, &first, &manual(&[])));
+        let first = [m(Some(7), 1920)];
+        let at = compose(&first, &pin_at_origin, &[])[0];
+        assert_eq!(at, origin);
+        assert!(!needs_apply(at, true));
+    }
+
+    /// Exclusive: slot 1 unpinned, slot 7 pinned at origin. Both members move —
+    /// applying only the pin stacks it on slot 1.
+    #[test]
+    fn compose_moves_the_unpinned_sibling_off_a_pin_at_origin() {
+        let members = [m(Some(1), 2560), m(Some(7), 1920)];
+        let out = compose(&members, &manual(&[("7", 0, 0)]), &[]);
+        assert_eq!(
+            out,
+            vec![Placement { x: 1920, y: 0 }, Placement { x: 0, y: 0 },]
+        );
+    }
+
+    /// Extend: a lone pin at origin sits past the lit physical, not on it.
+    #[test]
+    fn compose_shifts_a_pin_at_origin_past_a_lit_screen() {
+        let members = [m(Some(7), 1920)];
+        let out = compose(&members, &manual(&[("7", 0, 0)]), &[r(0, 3840)]);
+        assert_eq!(out, vec![Placement { x: 3840, y: 0 }]);
+        assert!(needs_apply(out[0], true));
+    }
+
+    /// Extend: the whole Manual group shifts as a rigid body.
+    #[test]
+    fn compose_shifts_the_manual_group_past_lit_screens() {
+        let members = [m(Some(1), 2560), m(Some(7), 1920)];
+        let out = compose(&members, &manual(&[("7", 0, 0)]), &[r(0, 3840)]);
+        assert_eq!(
+            out,
+            vec![Placement { x: 5760, y: 0 }, Placement { x: 3840, y: 0 },]
+        );
+    }
+
+    #[test]
+    fn compose_shifts_auto_row_past_lit_screens() {
+        let members = [m(Some(1), 2560), m(Some(2), 1920)];
+        let out = compose(&members, &Layout::default(), &[r(0, 3840)]);
+        assert_eq!(
+            out,
+            vec![Placement { x: 3840, y: 0 }, Placement { x: 6400, y: 0 },]
+        );
+    }
+
+    #[test]
+    fn compose_leaves_a_clear_pin_where_it_is() {
+        let members = [m(Some(7), 1920)];
+        let out = compose(&members, &manual(&[("7", 5000, 0)]), &[r(0, 3840)]);
+        assert_eq!(out, vec![Placement { x: 5000, y: 0 }]);
     }
 
     #[test]

@@ -1255,37 +1255,88 @@ pub(crate) fn enable_disabled_output(prefix: &str) -> Option<String> {
     Some(name)
 }
 
-/// Position the output identified by `uuid` at `(x, y)`. `false` → `kscreen-doctor`.
-pub(crate) fn set_position(uuid: &str, x: i32, y: i32) -> bool {
+/// Enabled non-managed outputs in compositor-logical space. Empty when
+/// output management is down (caller then has nothing to offset past).
+pub(crate) fn lit_physical_rects() -> Vec<crate::layout::Rect> {
+    let Ok(sess) = Session::open("lit_physicals") else {
+        return Vec::new();
+    };
+    sess.state
+        .devices
+        .values()
+        .filter(|d| {
+            d.enabled
+                && !d
+                    .name
+                    .as_deref()
+                    .is_some_and(|n| n.starts_with(MANAGED_PREFIX))
+        })
+        .filter_map(|d| sess.logical_rect(d))
+        .collect()
+}
+
+/// One output to place in a group apply. UUID wins; name is the fallback
+/// (`Entry` already keeps it). A supersede two-name collision prefers UUID.
+#[derive(Clone, Debug)]
+pub(crate) struct OutputPos {
+    pub uuid: Option<String>,
+    pub name: Option<String>,
+    pub x: i32,
+    pub y: i32,
+}
+
+/// Position every addressed output in one `kde_output_configuration_v2`.
+/// `false` → caller falls back to per-output `kscreen-doctor`.
+pub(crate) fn set_positions(positions: &[OutputPos]) -> bool {
+    if positions.is_empty() {
+        return true;
+    }
     let Ok(mut sess) = Session::open("position") else {
         return false;
     };
     let deadline = Instant::now() + OP_BUDGET;
-    let Some(dev) = sess
-        .state
-        .devices
-        .values()
-        .find(|d| d.uuid.as_deref() == Some(uuid))
-        .cloned()
-    else {
-        return false;
-    };
-    let Some(proxy) = dev.proxy.as_ref() else {
-        return false;
-    };
     let config = sess.new_config();
-    config.position(proxy, x, y);
+    let mut any = false;
+    for p in positions {
+        let Some(dev) = sess.state.devices.values().find(|d| {
+            p.uuid
+                .as_deref()
+                .is_some_and(|u| d.uuid.as_deref() == Some(u))
+                || p.name
+                    .as_deref()
+                    .is_some_and(|n| d.name.as_deref() == Some(n))
+        }) else {
+            continue;
+        };
+        let Some(proxy) = dev.proxy.as_ref() else {
+            continue;
+        };
+        config.position(proxy, p.x, p.y);
+        any = true;
+    }
+    if !any {
+        config.destroy();
+        return false;
+    }
     let ok = sess.apply(&config, deadline);
     config.destroy();
     if ok {
         tracing::info!(
-            uuid,
-            x,
-            y,
-            "KWin output management: placed output (in-process)"
+            count = positions.len(),
+            "KWin output management: placed group (in-process)"
         );
     }
     ok
+}
+
+/// Position the output identified by `uuid` at `(x, y)`. `false` → `kscreen-doctor`.
+pub(crate) fn set_position(uuid: &str, x: i32, y: i32) -> bool {
+    set_positions(&[OutputPos {
+        uuid: Some(uuid.to_string()),
+        name: None,
+        x,
+        y,
+    }])
 }
 
 /// Advertised mode proxy matching a captured `"WxH@Hz"` (Hz rounded). `None` if
@@ -1347,6 +1398,11 @@ mod tests {
     #[test]
     fn mode_event_opcode_is_two() {
         assert_eq!(DEVICE_MODE_EVENT_OPCODE, 2);
+    }
+
+    #[test]
+    fn an_empty_group_position_apply_does_not_need_the_compositor() {
+        assert!(set_positions(&[]));
     }
 
     /// Same hazard for the registry's `output` event (`finished` is 0, `output` is 1).
