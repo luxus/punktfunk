@@ -67,6 +67,11 @@ impl BasePaths {
         self.config.join("punktfunk/host.env")
     }
 
+    /// The host's settings store; the web console edits the same file.
+    pub fn host_settings(&self) -> PathBuf {
+        self.config.join("punktfunk/host-settings.json")
+    }
+
     pub fn read(&self, path: &Path) -> Option<String> {
         std::fs::read_to_string(path).ok()
     }

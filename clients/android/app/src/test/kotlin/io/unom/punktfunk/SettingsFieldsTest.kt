@@ -51,6 +51,25 @@ class SettingsFieldsTest {
         for (f in SettingsFields.ALL) assertNotEquals(f.name, f.get(a), f.get(b))
     }
 
+    /**
+     * A codec this device can't decode is dropped from the picker, and the one case where it
+     * can't be dropped — it is the stored value — says why it is not in effect (#1138).
+     */
+    @Test
+    fun anUndecodableStoredCodecSaysSo() {
+        val capable = codecOptionsFor("av1", av1Capable = true, pyrowaveCapable = true)
+        assertEquals(CODEC_OPTIONS, capable)
+
+        val bare = codecOptionsFor("hevc", av1Capable = false, pyrowaveCapable = false)
+        assertEquals(listOf("auto", "hevc", "h264"), bare.map { it.first })
+
+        val kept = codecOptionsFor("av1", av1Capable = false, pyrowaveCapable = false)
+        assertEquals(listOf("auto", "hevc", "h264", "av1"), kept.map { it.first })
+        val label = kept.first { it.first == "av1" }.second
+        assertNotEquals("AV1", label)
+        assert(label.contains("no hardware decoder")) { label }
+    }
+
     @Test
     fun thePresetOverlayRoundTripsEveryRow() {
         val want = moved()

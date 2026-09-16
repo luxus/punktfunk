@@ -98,15 +98,29 @@ fn rgb_becomes_limited_range_bt709_nv12() {
     display
         .write_packed(src, &bgra(0, 0, 255), row)
         .expect("upload red");
-    vpp.convert(&display, src, (W, H), true, false, dst)
-        .expect("convert red");
+    vpp.convert(
+        &display,
+        src,
+        (W, H),
+        true,
+        pf_vaapi::hevc::COLOUR_BT709,
+        dst,
+    )
+    .expect("convert red");
     near(centre_yuv(&display, dst), (63, 102, 240), "red");
 
     display
         .write_packed(src, &bgra(255, 255, 255), row)
         .expect("upload white");
-    vpp.convert(&display, src, (W, H), true, false, dst)
-        .expect("convert white");
+    vpp.convert(
+        &display,
+        src,
+        (W, H),
+        true,
+        pf_vaapi::hevc::COLOUR_BT709,
+        dst,
+    )
+    .expect("convert white");
     near(centre_yuv(&display, dst), (235, 128, 128), "white");
 
     // The same red through a dmabuf, exported here and imported back as `XR24`
@@ -151,8 +165,15 @@ fn rgb_becomes_limited_range_bt709_nv12() {
             planes: &exported.planes,
         };
         let imported = display.import_dmabuf(&source).expect("import the dmabuf");
-        vpp.convert(&display, imported, (W, H), true, false, dst)
-            .expect("convert the import");
+        vpp.convert(
+            &display,
+            imported,
+            (W, H),
+            true,
+            pf_vaapi::hevc::COLOUR_BT709,
+            dst,
+        )
+        .expect("convert the import");
         near(centre_yuv(&display, dst), (63, 102, 240), "red via dmabuf");
         display.destroy_surface(imported);
     }
@@ -209,8 +230,15 @@ fn a_larger_source_is_scaled_into_the_picture() {
     display
         .write_packed(src, &picture, sw as usize * 4)
         .expect("upload the split picture");
-    vpp.convert(&display, src, (sw, sh), true, false, dst)
-        .expect("scale and convert");
+    vpp.convert(
+        &display,
+        src,
+        (sw, sh),
+        true,
+        pf_vaapi::hevc::COLOUR_BT709,
+        dst,
+    )
+    .expect("scale and convert");
     near(
         yuv_at(&display, dst, W as usize / 4, H as usize / 2),
         (63, 102, 240),
@@ -251,8 +279,15 @@ fn a_cropped_source_keeps_only_its_rectangle() {
         .write_packed(src, &picture, sw as usize * 4)
         .expect("upload the banded picture");
     vpp.crop = Some([W, 0, W * 2, sh]);
-    vpp.convert(&display, src, (sw, sh), true, false, dst)
-        .expect("crop, scale and convert");
+    vpp.convert(
+        &display,
+        src,
+        (sw, sh),
+        true,
+        pf_vaapi::hevc::COLOUR_BT709,
+        dst,
+    )
+    .expect("crop, scale and convert");
     near(
         yuv_at(&display, dst, 4, H as usize / 2),
         (63, 102, 240),
@@ -286,8 +321,15 @@ fn ten_bit_rgb_becomes_limited_range_bt2020_p010() {
     display
         .write_packed(src, &red, W as usize * 4)
         .expect("upload red");
-    vpp.convert(&display, src, (W, H), true, true, dst)
-        .expect("convert red");
+    vpp.convert(
+        &display,
+        src,
+        (W, H),
+        true,
+        pf_vaapi::hevc::COLOUR_BT2020_PQ,
+        dst,
+    )
+    .expect("convert red");
     let (y, cb, cr) = centre_yuv10(&display, dst);
     println!("ten-bit red: Y {y} Cb {cb} Cr {cr}");
     for (got, want, name) in [(y, 294u16, "Y"), (cb, 387, "Cb"), (cr, 960, "Cr")] {

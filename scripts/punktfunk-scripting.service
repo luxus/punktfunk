@@ -96,13 +96,14 @@ BindReadOnlyPaths=-%h/.local/share/lutris -%h/.config/lutris -%h/.config/heroic
 BindReadOnlyPaths=-%h/.local/bin/punktfunk-scripting -%h/.local/lib/punktfunk-scripting
 BindReadOnlyPaths=-%h/.local/share/punktfunk-scripting
 ReadWritePaths=/tmp
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-# Free for a JS runtime that only talks HTTP and reads files. Two are absent on purpose:
-# MemoryDenyWriteExecute because bun JITs, and PrivateDevices because a plugin's vendor binary
-# integrates with hardware already on this box (VirtualHere forwards USB).
-ProtectKernelTunables=yes
+# AF_NETLINK brings up a sandbox's loopback; the sandbox's seccomp filter keeps it from the plugin.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+# Free for a JS runtime that only talks HTTP and reads files. Absent on purpose:
+# MemoryDenyWriteExecute (bun JITs), PrivateDevices (VirtualHere forwards USB), and
+# ProtectKernelTunables, which refuses bwrap a fresh /proc; the sandbox binds /proc/sys read-only.
 ProtectControlGroups=yes
-RestrictNamespaces=yes
+# Exactly the namespaces each plugin's bwrap sandbox is built from; `yes` starts no plugin.
+RestrictNamespaces=user mnt pid net ipc uts cgroup
 SystemCallArchitectures=native
 CapabilityBoundingSet=
 

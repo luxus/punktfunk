@@ -1633,7 +1633,7 @@ fn spawn_audio(
                 }
                 player.push(buf);
             };
-            let mut gaps = punktfunk_core::audio::AudioGapTracker::new();
+            let mut gaps = punktfunk_core::audio::AudioGapTracker::new_at_frame_us(frame_us);
             let mut frame_samples = 0usize;
             let mut av = punktfunk_core::audio::AvSync::new_at_rate(channels, rate_hz);
             if !av_sync_enabled {

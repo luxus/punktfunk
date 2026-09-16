@@ -897,7 +897,7 @@ struct GamepadSettingsView: View {
             choiceRow(
                 id: "codec", tab: .video, field: "codec", icon: "film", label: "Video codec",
                 detail: "A preference — the host falls back if it can't encode it.",
-                options: SettingsOptions.codecs, current: codec
+                options: SettingsOptions.codecs(current: codec), current: codec
             ) { codec = $0 },
             toggleRow(
                 id: "hdr", tab: .video, field: "hdr_enabled", icon: "sun.max", label: "10-bit HDR",

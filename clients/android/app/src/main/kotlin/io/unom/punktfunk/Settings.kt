@@ -900,17 +900,26 @@ val CODEC_OPTIONS = listOf(
  * advertises is a setting that does nothing. [stored] is the currently persisted value, which is
  * always kept selectable so the selection can be rendered (the don't-clobber rule: a codec chosen
  * on another device, or by a newer build, must survive being looked at here).
+ *
+ * A kept row says why it is not in effect. Reading plain "AV1" while every session streams HEVC
+ * is the whole of #1138: the picker is the only place that can say the Hello never asked for it.
  */
 fun codecOptionsFor(
     stored: String,
     av1Capable: Boolean,
     pyrowaveCapable: Boolean,
 ): List<Pair<String, String>> =
-    CODEC_OPTIONS.filter { (v, _) ->
-        when (v) {
-            "av1" -> av1Capable || stored == "av1"
-            "pyrowave" -> pyrowaveCapable || stored == "pyrowave"
+    CODEC_OPTIONS.mapNotNull { (v, label) ->
+        val capable = when (v) {
+            "av1" -> av1Capable
+            "pyrowave" -> pyrowaveCapable
             else -> true
+        }
+        when {
+            capable -> v to label
+            stored != v -> null
+            v == "av1" -> v to "AV1 — no hardware decoder here; HEVC is used"
+            else -> v to "PyroWave — this GPU can't decode it; HEVC is used"
         }
     }
 

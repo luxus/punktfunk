@@ -24,6 +24,8 @@ The patches here add the missing half, and nothing else. See
 | `0011-headless-support-adaptive-sync-paint-on-the-game-s-c.patch` | `CHeadlessConnector` advertises VRR (`SupportsVRR()` true; `IsVRRActive()` = `cv_adaptive_sync` — no scanout cycle to honor, so "supported" and "active" collapse into "asked for"), making `--adaptive-sync` paint — and publish to PipeWire — on the game's commit instead of the synthetic vblank tick. `PacesPresents()` (new, default true, headless false) keeps the VRR framerate limiter armed when the target equals the refresh: that skip defers to a display's own pacing, and a display that paces nothing must not be deferred to | **Yes** — a headless output is the ideal adaptive-sync display (its vblank is a fiction), and the tick-quantization loss it removes is measurable by any PipeWire consumer |
 | `0012-steamcompmgr-persist-the-CLI-framerate-limit.patch` | Seed `--framerate-limit` into both screen types' persistent overrides without enabling refresh switching. Later Steam requests can replace or clear the limit | **Yes** — a CLI limit must survive the refresh-policy update in every paint |
 | `0013-pipewire-repaint-the-capture-on-the-Steam-overlay-s-.patch` | `paint_pipewire` pushes a frame when the Steam overlay commits, not only when the game does, and a focus window with no finished commit shows the scanout's held base (refitted to the capture size) instead of nothing | **Yes** — a game that stops presenting under the overlay left the node without the overlay, or with the overlay over black |
+| `0014-pipewire-pace-the-capture-push-to-the-consumer-s-max.patch` | `paint_pipewire` pushes at most `maxFramerate` frames a second — the consumer's wire rate — and leaves a skipped change pending for the next vblank, so a game at 190 fps no longer costs two 4K composites per wire frame under adaptive sync | **Yes** — upstream pushes on every commit whatever the consumer negotiated |
+| `0015-pipewire-offer-a-P010-capture-format-BT.2020-PQ-4-2-0.patch` | Offer SPA `P010_10LE` (MANDATORY BT.2020 + PQ, MANDATORY BT.2020 limited matrix) after the packed 10-bit formats, and write it with a new `cs_rgb_to_p010` pass: the PQ codes through the BT.2020 matrix into R16/RG16 plane views. An HDR consumer whose encoder takes 4:2:0 (VAAPI Main 10, Vulkan Video) then pays no conversion of its own | **Yes** — the 10-bit twin of the NV12 offer upstream already has |
 
 ### Why the headless patch matters
 
@@ -110,6 +112,9 @@ The number is a **monotonic patch-set revision**, so one probe answers every cap
 | `+pfhdr8` | …and the seat's keyboard carries the `XKB_DEFAULT_*` keymap, so the session follows the box's configured layout |
 | `+pfhdr9` | …and headless adaptive sync paints on game commits, with software pacing at the refresh rate |
 | `+pfhdr10` | …and `--framerate-limit` persists across paints without changing refresh; Steam can still replace or clear it |
+| `+pfhdr11` | …and the Steam overlay repaints the capture on its own commits (no new capability) |
+| `+pfhdr12` | …and the capture push honours the consumer's `maxFramerate` |
+| `+pfhdr13` | …and a `P010` capture format (BT.2020 PQ, 4:2:0) |
 
 Require `+pfhdr10` for headless `--adaptive-sync` with a CLI cap: `+pfhdr9` clears that cap
 on the first paint unless Steam or a control command supplies an override. The Arch package is

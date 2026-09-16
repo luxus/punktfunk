@@ -386,6 +386,7 @@ mod tests {
             deck,
             fallback_ui: false,
             pyrowave_ok: true,
+            av1_ok: true,
             device_name: "t",
             t: 0.0,
         }

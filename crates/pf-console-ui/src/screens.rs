@@ -65,6 +65,9 @@ pub struct Ctx<'a> {
     /// This device decodes PyroWave ([`crate::shell::ConsoleOptions::pyrowave_ok`]).
     /// False marks the codec row's PyroWave value unsupported.
     pub pyrowave_ok: bool,
+    /// This device decodes AV1 in hardware ([`crate::shell::ConsoleOptions::av1_ok`]).
+    /// False marks the codec row's AV1 value unsupported: the Hello never asks for it.
+    pub av1_ok: bool,
     /// Name the host stores this client under when pairing.
     pub device_name: &'a str,
     /// Shell clock in seconds (spinners, pulses).

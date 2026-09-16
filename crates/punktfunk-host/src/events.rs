@@ -383,11 +383,17 @@ pub enum EventKind {
     #[serde(rename = "store.changed")]
     /// Payload-free: the store is a join. Re-read `GET /api/v1/store/catalog` / `…/installed`.
     StoreChanged,
+    /// The operator changed host settings. Re-read `GET /api/v1/host/settings`.
+    #[serde(rename = "settings.changed")]
+    SettingsChanged {
+        /// Setting ids the write named.
+        ids: Vec<String>,
+    },
     /// Emitted on ACCEPT, and again if the executor later fails. A succeeded power
     /// action ends this process, so "accepted with no later failure" is success.
     #[serde(rename = "action.invoked")]
     ActionInvoked {
-        /// `power.sleep`, `power.reboot`, `power.shutdown`.
+        /// `power.sleep`, `power.reboot`, `power.shutdown`, `host.restart`.
         id: String,
         /// Cert-lane invoker; absent for the operator console (admin lane).
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -426,6 +432,7 @@ impl EventKind {
             EventKind::UpdateApplied { .. } => "update.applied",
             EventKind::PluginsChanged { .. } => "plugins.changed",
             EventKind::StoreChanged => "store.changed",
+            EventKind::SettingsChanged { .. } => "settings.changed",
             EventKind::ActionInvoked { .. } => "action.invoked",
             EventKind::HostStarted { .. } => "host.started",
             EventKind::HostStopping => "host.stopping",

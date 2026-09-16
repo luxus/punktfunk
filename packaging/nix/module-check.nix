@@ -278,9 +278,11 @@ let
         && has appliance "punktfunk-scripting" "ProtectSystem=strict"
         && has appliance "punktfunk-scripting" "ReadWritePaths=/tmp"
         && has appliance "punktfunk-scripting" "RestrictAddressFamilies=AF_UNIX"
-        && has appliance "punktfunk-scripting" "ProtectKernelTunables=true"
+        # bwrap needs netlink and a fresh /proc; the sandbox takes both back from the plugin.
+        && !(has appliance "punktfunk-scripting" "ProtectKernelTunables=true")
+        && has appliance "punktfunk-scripting" "AF_NETLINK"
         && has appliance "punktfunk-scripting" "ProtectControlGroups=true"
-        && has appliance "punktfunk-scripting" "RestrictNamespaces=true"
+        && has appliance "punktfunk-scripting" "RestrictNamespaces=user mnt pid net ipc uts cgroup"
         && has appliance "punktfunk-scripting" "SystemCallArchitectures=native"
         && has appliance "punktfunk-scripting" "CapabilityBoundingSet=";
     }

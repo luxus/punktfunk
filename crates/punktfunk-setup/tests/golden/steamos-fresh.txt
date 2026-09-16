@@ -9,12 +9,12 @@
   + [ -d ~/punktfunk/.git ] || git clone https://git.unom.io/unom/punktfunk ~/punktfunk
   !! the build runs on this device — it asks for your sudo password first, then takes about 20 minutes on a first run (about a minute on a re-run) and prints nothing until it finishes
   + bash ~/punktfunk/scripts/steamdeck/install.sh
-  ok would set PUNKTFUNK_CLIPBOARD=on in /box/config/punktfunk/host.env
+  ok would set clipboard="files" in /box/config/punktfunk/host-settings.json
 ==> Checking for Sunshine / Apollo / Vibeshine
   ok No conflicting game-streaming host detected.
-==> Options (host.env — everything here is off by default and reversible)
+==> Options (each one can be changed later)
   ok would set PUNKTFUNK_UI_BIND=127.0.0.1 in /box/config/punktfunk/host.env
-  ok would set PUNKTFUNK_CLIPBOARD=on in /box/config/punktfunk/host.env
+  ok would set clipboard="files" in /box/config/punktfunk/host-settings.json
 ==> Starting at boot with nobody logged in
   + sudo loginctl enable-linger "$USER"
 ==> Controller access

@@ -26,6 +26,7 @@ import io.unom.punktfunk.matches
 import io.unom.punktfunk.runSpeedTest
 import io.unom.punktfunk.kit.Gamepad
 import io.unom.punktfunk.kit.NativeBridge
+import io.unom.punktfunk.kit.VideoDecoders
 import io.unom.punktfunk.kit.discovery.DiscoveredHost
 import io.unom.punktfunk.kit.discovery.HostDiscovery
 import io.unom.punktfunk.kit.discovery.Presence
@@ -227,6 +228,9 @@ object SkiaConsole {
             // The touch shell exists as a fallback on phones/tablets but not on a TV —
             // gates the console's own "Controller-optimized UI" off switch.
             .put("fallback_ui", !io.unom.punktfunk.isTvDevice(app))
+            // The same MediaCodec answer the Hello advertises by: without a real AV1
+            // decoder the codec row marks AV1 unsupported instead of offering a dead pick.
+            .put("av1_ok", VideoDecoders.decodableCodecBits() and 4 != 0)
             .put("settings", ConsoleJson.settings(initial, base))
             .put("presets", JSONArray(ConsoleJson.presets(presets)))
             .put("known_hosts", JSONObject(ConsoleJson.knownHosts(knownHostStore.all())))

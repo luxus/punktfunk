@@ -204,7 +204,8 @@ in
         description = ''
           `host.env` key/value pairs passed to the service via `EnvironmentFile`. See
           `''${package}/share/punktfunk-host/host.env.example` for the full surface. Booleans render
-          as `1`/`0`. Leave empty to rely on the host's per-connect auto-detection of the
+          as `1`/`0`. A key the web console also offers (Host → Settings) is locked there while it
+          is set here. Leave empty to rely on the host's per-connect auto-detection of the
           compositor + input backend. Secrets are REFUSED here (this renders to a world-readable
           store path) — use `environmentFile`, or let the host generate them.
         '';
@@ -857,18 +858,20 @@ in
           ];
           # Puts back the write bit ProtectSystem=strict takes away from the real /tmp above.
           ReadWritePaths = [ "/tmp" ];
-          # Free for a JS runtime that only talks HTTP and reads files. Two are absent on purpose:
-          # MemoryDenyWriteExecute because bun JITs, and PrivateDevices because a plugin's vendor
-          # binary integrates with hardware already on this box (VirtualHere forwards USB).
-          ProtectKernelTunables = true;
+          # Free for a JS runtime that only talks HTTP and reads files. Absent on purpose:
+          # MemoryDenyWriteExecute (bun JITs), PrivateDevices (VirtualHere forwards USB), and
+          # ProtectKernelTunables, which refuses bwrap a fresh /proc; the sandbox binds /proc/sys ro.
           ProtectControlGroups = true;
-          RestrictNamespaces = true;
+          # Exactly the namespaces each plugin's bwrap sandbox is built from; `true` starts no plugin.
+          RestrictNamespaces = "user mnt pid net ipc uts cgroup";
           SystemCallArchitectures = "native";
           CapabilityBoundingSet = "";
+          # AF_NETLINK brings up a sandbox's loopback; its seccomp filter keeps it from the plugin.
           RestrictAddressFamilies = [
             "AF_UNIX"
             "AF_INET"
             "AF_INET6"
+            "AF_NETLINK"
           ];
         };
       };

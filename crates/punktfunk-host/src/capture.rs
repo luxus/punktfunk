@@ -60,6 +60,7 @@ fn zero_copy_policy(
         // Only the direct-SDK NVENC backend takes a packed 10-bit PQ CUDA payload.
         // Without it HDR capture stays on the CPU path.
         hdr_cuda_ok: pf_encode::linux_hdr_cuda_ok(),
+        nvenc_raw_dmabuf: pf_encode::linux_nvenc_raw_dmabuf_ok(),
     }
 }
 
@@ -171,6 +172,7 @@ pub fn capture_virtual_output(
         want.gpu,
         want.chroma_444,
         want.hdr,
+        want.ten_bit_sdr,
         zero_copy_policy(want.pyrowave, want.nv12_native),
         vout.expect_exact_dims,
         kwin,

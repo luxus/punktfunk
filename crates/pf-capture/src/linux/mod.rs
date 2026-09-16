@@ -45,6 +45,10 @@ struct CaptureOpts {
     /// Offer only 10-bit PQ/BT.2020 as LINEAR dmabufs. SHM cannot: Mutter's
     /// SHM path paints 8-bit ARGB32, and the tiled EGL blit is 8-bit.
     want_hdr: bool,
+    /// 10-bit SDR: keep packed RGB (skip the NV12 convert) so direct-NVENC widens 8→10. A
+    /// planar 8-bit surface fails a 10-bit NVENC session; packed RGB is the only 8-bit input
+    /// it accepts there.
+    ten_bit_sdr: bool,
     /// Skip buffers until negotiated size matches `preferred` — KWin virtual
     /// outputs birth a sacrificial mode then renegotiate (`kwin.rs` `create`).
     /// `false` elsewhere: Mutter sizes from negotiation; gamescope fixates.
@@ -96,6 +100,12 @@ struct CaptureSignals {
     /// Packed `(w << 32) | h`; `0` until `param_changed`. Gamescope cursor
     /// maps root-space into frame space (`-w/-h` vs `-W/-H` are independent).
     frame_size: Arc<std::sync::atomic::AtomicU64>,
+    /// NVIDIA zero-copy importer, usually the isolated worker. The loop thread
+    /// fills it after negotiation; the consumer imports held frames through it
+    /// ([`PortalCapturer::import_held`]) and retires it on a LINEAR failure.
+    importer: Arc<std::sync::Mutex<Option<pf_zerocopy::Importer>>>,
+    /// `importer` is `Some`. Read per frame on the loop thread without the lock.
+    has_importer: Arc<AtomicBool>,
 }
 
 impl CaptureSignals {
@@ -111,6 +121,8 @@ impl CaptureSignals {
             gpu_dmabuf_offer: Arc::new(AtomicBool::new(false)),
             cursor_live: Arc::new(std::sync::Mutex::new(None)),
             frame_size: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            importer: Arc::new(std::sync::Mutex::new(None)),
+            has_importer: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -130,6 +142,13 @@ pub struct PortalCapturer {
     /// [`NegotiationPlan`](pipewire::NegotiationPlan) — never re-derived.
     /// A failed offer latches [`pf_zerocopy::note_raw_dmabuf_negotiation_failed`].
     vaapi_dmabuf: bool,
+    /// CUDA import choices for held frames ([`Self::import_held`]).
+    import_policy: pipewire::ImportPolicy,
+    /// Held frames pass through as dmabufs: the NVENC encoder's worker converts them. A
+    /// failed offer latches the same raw-dmabuf latch the VAAPI passthrough uses.
+    raw_for_encoder: bool,
+    /// This consumer's import memory (LINEAR NV12 latch, tiled failure streak).
+    import_state: pipewire::ImportState,
     /// One-shot: this capture's dmabuf offer negotiated; retry budget credited.
     negotiation_confirmed: bool,
     /// HDR offer. A failed negotiation latches SDR for [`Self::hdr_source`]
@@ -246,6 +265,7 @@ impl PortalCapturer {
                 allow_zerocopy: true,
                 want_444: false,
                 want_hdr,
+                ten_bit_sdr: false,
                 expect_exact_dims: false,
                 // Portal-monitor is Mutter's stale-meta id-0 contract. KWin
                 // portal capture would rewrite per buffer; nothing routes
@@ -274,6 +294,7 @@ impl PortalCapturer {
         allow_zerocopy: bool,
         want_444: bool,
         want_hdr: bool,
+        ten_bit_sdr: bool,
         policy: ZeroCopyPolicy,
         expect_exact_dims: bool,
         cursor_id0_hides: bool,
@@ -304,6 +325,7 @@ impl PortalCapturer {
                 allow_zerocopy,
                 want_444,
                 want_hdr,
+                ten_bit_sdr,
                 expect_exact_dims,
                 cursor_id0_hides,
                 producer_is_gamescope,
@@ -328,6 +350,10 @@ struct PwHandles {
     signals: CaptureSignals,
     vaapi_dmabuf: bool,
     hdr_offer: bool,
+    /// Copied from the plan: what the consumer's import of a held frame does.
+    import_policy: pipewire::ImportPolicy,
+    /// Held frames pass through as dmabufs: the NVENC encoder converts them itself.
+    raw_for_encoder: bool,
     quit: ::pipewire::channel::Sender<()>,
     join: thread::JoinHandle<()>,
 }
@@ -348,6 +374,9 @@ impl PwHandles {
             signals: self.signals,
             stall_since: None,
             vaapi_dmabuf: self.vaapi_dmabuf,
+            import_policy: self.import_policy,
+            raw_for_encoder: self.raw_for_encoder,
+            import_state: pipewire::ImportState::default(),
             negotiation_confirmed: false,
             hdr_offer: self.hdr_offer,
             hdr_source,
@@ -420,8 +449,12 @@ fn spawn_pipewire(
         // Default ON; `=0` (any falsy spelling, shared parser) restores packed RGB.
         native_nv12_env_on: pf_host_config::env_on("PUNKTFUNK_PIPEWIRE_NV12").unwrap_or(true),
         hdr_cuda_ok: policy.hdr_cuda_ok,
+        nv12_env_on: pf_zerocopy::nv12_enabled(),
+        nvenc_raw: policy.nvenc_raw_dmabuf,
     });
     let vaapi_dmabuf = plan.vaapi_passthrough;
+    let import_policy = plan.import_policy;
+    let raw_for_encoder = plan.nvenc_raw;
     let join = thread::Builder::new()
         .name("punktfunk-pipewire".into())
         .spawn(move || {
@@ -448,6 +481,8 @@ fn spawn_pipewire(
         signals,
         vaapi_dmabuf,
         hdr_offer: want_hdr,
+        import_policy,
+        raw_for_encoder,
         quit: quit_tx,
         join,
     })
@@ -700,14 +735,74 @@ impl PortalCapturer {
         }
     }
 
-    fn take_frame(&self) -> Option<CapturedFrame> {
-        self.slot.lock().ok().and_then(|mut s| s.take())
+    fn take_frame(&mut self) -> Option<CapturedFrame> {
+        let frame = self.slot.lock().ok().and_then(|mut s| s.take())?;
+        if self.vaapi_dmabuf
+            || self.raw_for_encoder
+            || !matches!(frame.payload, FramePayload::Dmabuf(_))
+        {
+            return Some(frame);
+        }
+        self.import_held(frame)
+    }
+
+    /// CUDA-import a held dmabuf at the consumer's tick. The hold, and with it
+    /// the producer's buffer, returns when `frame` drops here, import or not. A
+    /// LINEAR failure retires the importer: later arrivals take the CPU path.
+    fn import_held(&mut self, frame: CapturedFrame) -> Option<CapturedFrame> {
+        let CapturedFrame {
+            width,
+            height,
+            pts_ns,
+            format,
+            payload,
+            cursor,
+            provenance,
+        } = frame;
+        let FramePayload::Dmabuf(held) = payload else {
+            return None;
+        };
+        let cell = self.signals.importer.clone();
+        let mut guard = cell.lock().unwrap_or_else(|e| e.into_inner());
+        let importer = guard.as_mut()?;
+        let plane = pf_zerocopy::DmabufPlane {
+            fd: std::os::fd::AsRawFd::as_raw_fd(&held.fd),
+            offset: held.offset,
+            stride: held.stride,
+        };
+        match pipewire::gpu_import(
+            importer,
+            self.import_policy,
+            &mut self.import_state,
+            &self.signals,
+            format,
+            width,
+            height,
+            plane,
+            held.modifier,
+        ) {
+            pipewire::ImportOutcome::Frame(buf, format) => Some(CapturedFrame {
+                width,
+                height,
+                pts_ns,
+                format,
+                payload: FramePayload::Cuda(buf),
+                cursor,
+                provenance,
+            }),
+            pipewire::ImportOutcome::Dropped => None,
+            pipewire::ImportOutcome::ImporterLost => {
+                *guard = None;
+                self.signals.has_importer.store(false, Ordering::Relaxed);
+                None
+            }
+        }
     }
 
     /// Credit the dmabuf negotiation retry budget. Once per capture: the
     /// budget counts consecutive failed builds, not frames.
     fn note_negotiation_confirmed(&mut self) {
-        if self.vaapi_dmabuf && !self.negotiation_confirmed {
+        if (self.vaapi_dmabuf || self.raw_for_encoder) && !self.negotiation_confirmed {
             self.negotiation_confirmed = true;
             pf_zerocopy::note_raw_dmabuf_negotiation_ok();
         }

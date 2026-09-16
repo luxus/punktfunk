@@ -31,6 +31,7 @@ pub mod ids {
     pub const VDISPLAY_DRIVER: &str = "vdisplay_driver";
     pub const PAD_AUDIO: &str = "pad_audio";
     pub const PLUGIN_SANDBOX: &str = "plugin_sandbox";
+    pub const RESTART_PENDING: &str = "restart_pending";
 }
 
 /// Probe result. `Inapplicable` is not `Ok`: "never on this box" and "works here" are different

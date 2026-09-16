@@ -353,6 +353,27 @@ describe("supervision", () => {
 		await Effect.runPromise(Fiber.interrupt(fiber));
 	});
 
+	test("a plugin package without a manifest does not run while sandboxing is on", async () => {
+		const d = mkdirs("no-manifest");
+		const ran = path.join(d.dir, "ran.txt");
+		const pkg = path.join(d.pluginsDir, "node_modules", "punktfunk-plugin-bare");
+		write(
+			path.join(pkg, "package.json"),
+			JSON.stringify({ name: "punktfunk-plugin-bare", main: "index.js" }),
+		);
+		write(
+			path.join(pkg, "index.js"),
+			`import * as fs from "node:fs"; fs.writeFileSync(${JSON.stringify(ran)}, "1");`,
+		);
+		const logs: string[] = [];
+		const fiber = Effect.runFork(runner({ ...d, sandbox: "on", log: (l) => logs.push(l) }));
+		await waitFor(() => logs.some((l) => l.includes("not starting punktfunk-plugin-bare")));
+		await new Promise((r) => setTimeout(r, 200)); // would have imported by now
+		await Effect.runPromise(Fiber.interrupt(fiber));
+		expect(logs.some((l) => l.includes("starting punktfunk-plugin-bare ("))).toBe(false);
+		expect(fs.existsSync(ran)).toBe(false);
+	});
+
 	test("shutdown interrupts an Effect plugin STRUCTURALLY — its finalizer runs", async () => {
 		const server = mockHost();
 		const d = mkdirs("finalizer");

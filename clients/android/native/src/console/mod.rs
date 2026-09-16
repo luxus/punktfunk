@@ -45,6 +45,11 @@ struct CreateOptions {
     /// gates the console-off settings row. Default false: absent means don't offer it.
     #[serde(default)]
     fallback_ui: bool,
+    /// Whether a real `video/av01` decoder exists (Kotlin's `MediaCodecList` answer, the
+    /// same one that sets the `CODEC_AV1` advertisement bit). Absent means don't claim the
+    /// device lacks it, so the codec row stays unmarked.
+    #[serde(default = "yes")]
+    av1_ok: bool,
     /// The settings snapshot the shell starts from (`pf_client_core::trust::Settings` JSON).
     settings: pf_client_core::trust::Settings,
     /// The preset catalog as `[{id, name, overrides}, …]`.
@@ -56,6 +61,11 @@ struct CreateOptions {
     /// Where to start: `{"home": true}` or `{"library": <HostRow>}`.
     #[serde(default)]
     entry: EntryJson,
+}
+
+/// `#[serde(default)]` for a bool an older caller may omit and that must read `true`.
+fn yes() -> bool {
+    true
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -209,6 +219,10 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleCrea
             // The same probe that gates the `CODEC_PYROWAVE` advertisement, so the codec
             // row cannot offer a picture this GPU would never decode. Cached per process.
             pyrowave_ok: crate::pyro::available(),
+            // MediaCodec's answer, from the side that owns the enumeration: the NDK has no
+            // codec list. Marks the codec row's AV1 value on a device the Hello never
+            // advertises AV1 for.
+            av1_ok: opts.av1_ok,
             store: Some(store.clone()),
             platform: Platform::Android,
             gpu_cache_bytes: opts.gpu_cache_bytes.max(16 << 20),

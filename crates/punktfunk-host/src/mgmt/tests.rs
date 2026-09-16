@@ -233,7 +233,7 @@ async fn host_actions_follow_the_power_grant() {
     let (status, body) = send(&app, discover(guest_fp)).await;
     assert_eq!(status, StatusCode::OK);
     let rows = body["actions"].as_array().unwrap();
-    assert_eq!(rows.len(), 3, "{body}");
+    assert_eq!(rows.len(), 4, "{body}");
     assert!(
         rows.iter().all(|a| a["permitted"] == false),
         "a controller-only guest must not be offered power: {body}"
@@ -2037,6 +2037,10 @@ fn every_route_is_classified_for_the_plugin_and_cert_lanes() {
         ("GET", "/api/v1/store/runtime", false, false),
         ("POST", "/api/v1/store/runtime", false, false),
         // Updates: `apply` runs an installer / the root helper.
+        // Host settings: operator only. A plugin or a device must not reopen GameStream.
+        ("GET", "/api/v1/host/settings", false, false),
+        ("PATCH", "/api/v1/host/settings", false, false),
+        ("GET", "/api/v1/host/audio/apps", false, false),
         ("GET", "/api/v1/update/status", false, false),
         ("POST", "/api/v1/update/check", false, false),
         ("POST", "/api/v1/update/apply", false, false),
@@ -2379,6 +2383,91 @@ async fn display_settings_surface() {
         !enforced.contains(&"game_session") || cfg!(target_os = "linux"),
         "a dedicated game session is a headless gamescope spawn"
     );
+}
+
+/// `/host/settings`: a PATCH stores, `null` resets, and a refused value writes nothing and names
+/// the setting. Env beating the store is `pf-host-config`'s test, against a fake environment.
+/// Uses only restart-class rows, so a concurrent session test never sees a changed value.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn host_settings_surface() {
+    let dir = ConfigDirOverride::new();
+    pf_host_config::reload();
+    let app = test_app(test_state(), None);
+    let patch = |body: serde_json::Value| {
+        axum::http::Request::patch("/api/v1/host/settings")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    let row = |body: &serde_json::Value, id: &str| {
+        body["settings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == id)
+            .cloned()
+            .unwrap_or_else(|| panic!("no {id} row"))
+    };
+
+    let (status, body) = send(&app, get_req("/api/v1/host/settings")).await;
+    assert_eq!(status, StatusCode::OK);
+    let name = row(&body, "host_name");
+    assert_eq!(name["source"], "default");
+    assert_eq!(name["kind"], "text");
+    assert_eq!(name["apply"], "restart");
+    assert_eq!(name["env"], "PUNKTFUNK_HOST_NAME");
+    let ids: Vec<&str> = body["settings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["id"].as_str())
+        .collect();
+    assert_eq!(
+        ids.contains(&"max_fps"),
+        cfg!(target_os = "linux"),
+        "a row this host does not act on is absent, not disabled"
+    );
+
+    let (status, body) = send(
+        &app,
+        patch(serde_json::json!({"host_name": "Den", "webtransport": true})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(row(&body, "host_name")["value"], "Den");
+    assert_eq!(row(&body, "host_name")["source"], "store");
+    let file: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join("host-settings.json")).unwrap())
+            .unwrap();
+    assert_eq!(file["webtransport"], true);
+
+    let (status, err) = send(
+        &app,
+        patch(serde_json::json!({"webtransport": false, "host_name": "x".repeat(64)})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(err["error"].as_str().unwrap().contains("host_name"));
+    let (status, _) = send(&app, patch(serde_json::json!({"no_such_setting": 1}))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (_, body) = send(&app, get_req("/api/v1/host/settings")).await;
+    assert_eq!(
+        row(&body, "webtransport")["value"],
+        true,
+        "a refused patch writes nothing"
+    );
+
+    let (status, body) = send(
+        &app,
+        patch(serde_json::json!({"host_name": null, "webtransport": null})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(row(&body, "host_name")["source"], "default");
+    assert!(row(&body, "webtransport")["stored"].is_null());
+    drop(dir);
+    pf_host_config::reload();
 }
 
 /// The per-device overlay routes (`design/web-console-overhaul.md` §6.1).

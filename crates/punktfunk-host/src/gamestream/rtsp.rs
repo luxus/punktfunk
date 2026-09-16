@@ -404,18 +404,18 @@ enum EncOffer {
     Required,
 }
 
-/// Encryption offer from `PUNKTFUNK_GS_ENCRYPT`. Default is [`EncOffer::Supported`].
+/// Encryption offer from the `gamestream_encrypt` setting. Default is [`EncOffer::Supported`].
 /// `0` is plaintext; `video` drops the control offer; `require` also REQUESTS both.
 fn gs_video_encryption_offer() -> EncOffer {
     static ON: std::sync::OnceLock<EncOffer> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        match std::env::var("PUNKTFUNK_GS_ENCRYPT")
+        match pf_host_config::knob("PUNKTFUNK_GAMESTREAM_ENCRYPT")
             .as_deref()
             .map(str::trim)
         {
-            Ok("0") | Ok("off") | Ok("false") | Ok("no") => EncOffer::Off,
-            Ok("video") | Ok("video-only") => EncOffer::VideoOnly,
-            Ok("require") | Ok("required") => EncOffer::Required,
+            Some("0") | Some("off") | Some("false") | Some("no") => EncOffer::Off,
+            Some("video") | Some("video-only") => EncOffer::VideoOnly,
+            Some("require") | Some("required") => EncOffer::Required,
             // Unset, `1`, `supported`, or unknown: default.
             _ => EncOffer::Supported,
         }

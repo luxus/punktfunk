@@ -266,8 +266,7 @@ pub(crate) const DEFAULT_MAX_CONCURRENT: usize = 4;
 /// `PUNKTFUNK_IDLE_TIMEOUT_MS`; `None` (unset/invalid/zero) = core default (8 s). Clamped
 /// downstream to ≥1 s with a keep-alive that scales, so a live session never false-closes.
 pub(crate) fn idle_timeout_from_env() -> Option<std::time::Duration> {
-    std::env::var("PUNKTFUNK_IDLE_TIMEOUT_MS")
-        .ok()
+    pf_host_config::knob("PUNKTFUNK_IDLE_TIMEOUT_MS")
         .and_then(|s| s.trim().parse::<u64>().ok())
         .filter(|&ms| ms > 0)
         .map(std::time::Duration::from_millis)
@@ -979,8 +978,7 @@ fn audio_reserved_kbps(welcome: &punktfunk_core::quic::Welcome) -> u32 {
 /// `PUNKTFUNK_PYROWAVE_MAX_MBPS` (Mb/s) → kbps. `None` when unset/zero/invalid (no cap).
 /// Every PyroWave session, including an explicit client rate, goes through the pin.
 fn pyrowave_auto_pin_ceiling_kbps() -> Option<u32> {
-    std::env::var("PUNKTFUNK_PYROWAVE_MAX_MBPS")
-        .ok()
+    pf_host_config::knob("PUNKTFUNK_PYROWAVE_MAX_MBPS")
         .and_then(|s| s.trim().parse::<u32>().ok())
         .filter(|&m| m > 0)
         .map(|m| m.saturating_mul(1000))
@@ -2814,6 +2812,7 @@ mod tests {
         // SAFETY: this test is the only writer of this variable in the process; the only
         // reader is `resolve_bitrate_kbps_for` on this same thread.
         unsafe { std::env::set_var("PUNKTFUNK_PYROWAVE_MAX_MBPS", "4500") };
+        pf_host_config::reload();
         assert_eq!(
             resolve_bitrate_kbps_for(Codec::PyroWave, 0, &mode, ChromaFormat::Yuv444, 10),
             4_500_000
@@ -2835,6 +2834,7 @@ mod tests {
         );
         // SAFETY: same as the set above — single writer; readers run on this thread.
         unsafe { std::env::remove_var("PUNKTFUNK_PYROWAVE_MAX_MBPS") };
+        pf_host_config::reload();
     }
 
     #[test]
@@ -3253,12 +3253,14 @@ mod tests {
             fn drop(&mut self) {
                 // SAFETY: dropped while SESSION_TEST_LOCK is held; only the session path reads this.
                 unsafe { std::env::remove_var(self.0) };
+                pf_host_config::reload();
             }
         }
         let _env = EnvGuard("PUNKTFUNK_CLIPBOARD");
         // Operator policy on. Serialized on SESSION_TEST_LOCK; only the session path reads this.
         // SAFETY: writers serialized; only this session path reads the variable.
         unsafe { std::env::set_var("PUNKTFUNK_CLIPBOARD", "1") };
+        pf_host_config::reload();
 
         let host = std::thread::spawn(|| {
             run_ephemeral(Punktfunk1Options {

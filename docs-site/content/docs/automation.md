@@ -36,6 +36,7 @@ and nothing configured here runs anywhere near the streaming path.
 | `update.applied` | the new binary's first start after a successful update | `from`, `to` |
 | `plugins.changed` | a plugin's registration changes (registered, restarted, deregistered, or its lease expired) | plugin id |
 | `store.changed` | an install or uninstall finished, or a plugin catalog was refreshed | none — re-read `GET /api/v1/store/catalog` / `…/installed` |
+| `settings.changed` | the operator changed host settings in the console | the setting ids — re-read `GET /api/v1/host/settings` |
 | `host.started` / `host.stopping` | the serve planes come up / wind down | version, whether GameStream is enabled |
 
 Every event is a small JSON document with a monotonic `seq`, a `ts_ms` timestamp, a `schema`

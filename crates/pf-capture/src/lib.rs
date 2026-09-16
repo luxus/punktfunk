@@ -462,6 +462,10 @@ pub struct ZeroCopyPolicy {
     /// direct-SDK NVENC only). No other arm reads those 2:10:10:10 words as
     /// anything but garbage, so do not produce them unless this holds.
     pub hdr_cuda_ok: bool,
+    /// The NVENC encoder takes held dmabufs and lets its zero-copy worker convert them
+    /// straight into its input slots (`pf_encode::linux_nvenc_raw_dmabuf_ok`). The capture
+    /// then imports nothing; a producer that cannot be held keeps the import path.
+    pub nvenc_raw_dmabuf: bool,
 }
 
 /// Discovers gamescope's nested Xwayland cursor targets — `(DISPLAY, XAUTHORITY)`,
@@ -717,6 +721,7 @@ pub fn open_virtual_output(
     allow_zerocopy: bool,
     want_444: bool,
     want_hdr: bool,
+    ten_bit_sdr: bool,
     policy: ZeroCopyPolicy,
     expect_exact_dims: bool,
     cursor_id0_hides: bool,
@@ -732,6 +737,7 @@ pub fn open_virtual_output(
         allow_zerocopy,
         want_444,
         want_hdr && producer_is_gamescope && !hdr_capture_failed(HdrSource::VirtualOutput),
+        ten_bit_sdr,
         policy,
         expect_exact_dims,
         cursor_id0_hides,

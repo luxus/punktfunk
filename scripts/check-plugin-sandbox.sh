@@ -15,7 +15,7 @@
 set -u
 W=${PUNKTFUNK_REPO:-/w}
 apt-get update -qq >/dev/null 2>&1
-apt-get install -y -qq bubblewrap >/dev/null 2>&1 || { echo "FAIL: no bubblewrap"; exit 1; }
+apt-get install -y -qq bubblewrap iproute2 >/dev/null 2>&1 || { echo "FAIL: no bubblewrap"; exit 1; }
 
 cd "$W/sdk" || { echo "FAIL: no $W/sdk — mount the repo at /w"; exit 1; }
 bun install --ignore-scripts >/dev/null 2>&1
@@ -48,6 +48,9 @@ o.push(say("declared_ro", (() => { try { fs.writeFileSync(home + "/steamlike/w",
 o.push(say("state", (() => { try { fs.writeFileSync("/run/punktfunk/plugin-state/w", "x"); return "writable"; } catch { return "UNWRITABLE"; } })()));
 o.push(say("owntoken", (() => { try { fs.readFileSync("/run/punktfunk/plugin-token", "utf8"); return "present"; } catch { return "MISSING"; } })()));
 o.push(say("procs", fs.readdirSync("/proc").filter((d) => /^\d+$/.test(d)).length));
+const ip = (await import("node:child_process")).spawnSync("ip", ["-o", "link"]);
+o.push(say("netlink", ip.error ? "NO_IP" : ip.status === 0 ? "OPEN" : "refused"));
+o.push(say("tunables", (() => { try { fs.writeFileSync("/proc/sys/kernel/sysrq", "1"); return "WRITABLE"; } catch (e) { return e.code; } })()));
 o.push(say("cfgdir", process.env.PUNKTFUNK_CONFIG_DIR ?? "UNSET"));
 o.push(say("sock", process.env.PUNKTFUNK_MGMT_UNIX ?? "UNSET"));
 console.log("PROBE " + o.join(" "));
@@ -80,6 +83,9 @@ echo "== the namespace holds"
 # Exactly two: bwrap's own init as pid 1, the plugin as pid 2. The point is the count does not
 # grow with the host's process list — a shared /proc here would be hundreds.
 want "only the sandbox's own processes"  procs       2
+# The runner's unit allows both for bwrap's own setup; the plugin inside gets neither.
+want "netlink is refused"                netlink     refused
+want "kernel tunables are read-only"     tunables    EROFS
 
 echo "== the capability probe agrees with reality"
 if grep -q 'cannot be sandboxed' "$LOG"; then

@@ -771,6 +771,46 @@ impl EglImporter {
         })
     }
 
+    /// The Vulkan bridge, brought up on first use.
+    fn vk_bridge(&mut self) -> Result<&mut super::vulkan::VkBridge> {
+        if self.vk.is_none() {
+            self.vk = Some(super::vulkan::VkBridge::new()?);
+        }
+        Ok(self.vk.as_mut().expect("set above"))
+    }
+
+    /// The fused convert lane (`vulkan/convert.rs`): the host's NVENC slot, imported once.
+    pub fn register_slot(&mut self, id: u32, fd: std::os::fd::OwnedFd, size: u64) -> Result<()> {
+        self.vk_bridge()?.register_slot(id, fd, size)
+    }
+
+    pub fn forget_slots(&mut self) {
+        if let Some(vk) = self.vk.as_mut() {
+            vk.forget_slots();
+        }
+    }
+
+    pub fn set_cursor(&mut self, serial: u64, width: u32, height: u32, rgba: &[u8]) -> Result<()> {
+        self.vk_bridge()?.set_cursor(serial, width, height, rgba)
+    }
+
+    /// One fused pass: dmabuf (any modifier) + cursor → the registered slot. Returns the
+    /// timeline value the pass signals.
+    pub fn convert(
+        &mut self,
+        src: &super::proto::ConvertSrc,
+        slot: u32,
+        out: &super::proto::ConvertOut,
+        cursor: Option<super::proto::CursorRect>,
+    ) -> Result<u64> {
+        self.vk_bridge()?.convert(src, slot, out, cursor)
+    }
+
+    /// The convert timeline as an OPAQUE_FD for the host's CUDA import.
+    pub fn convert_timeline_fd(&mut self) -> Result<std::os::fd::OwnedFd> {
+        self.vk_bridge()?.convert_timeline_fd()
+    }
+
     /// Import a LINEAR dmabuf via the Vulkan bridge. NVIDIA EGL cannot sample LINEAR; CUDA
     /// rejects raw dmabuf fds. See [`super::vulkan`].
     pub fn import_linear(
@@ -836,6 +876,7 @@ impl EglImporter {
     pub fn forget_linear_fd(&mut self, fd: i32) {
         if let Some(vk) = self.vk.as_mut() {
             vk.forget_fd(fd);
+            vk.forget_src_image(fd);
         }
     }
 

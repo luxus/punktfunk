@@ -228,6 +228,10 @@ pub struct ConsoleOptions {
     /// client's `CODEC_PYROWAVE` advertisement: a row that offers what the Hello never
     /// asks for is a setting that silently does nothing.
     pub pyrowave_ok: bool,
+    /// This device decodes AV1 in hardware — the same answer that gates the client's
+    /// `CODEC_AV1` advertisement (`pf_client_core::video::av1_hardware_decodable`). A host
+    /// that learns it only once its GPU exists starts `true` and corrects it.
+    pub av1_ok: bool,
     /// Settings and preset catalog. `None` uses the desktop file store
     /// (`pf_client_core::trust`); every other host must supply one.
     pub store: Option<Arc<dyn SettingsStore>>,
@@ -248,6 +252,9 @@ impl ConsoleOptions {
             // The desktop probe reads the session's Vulkan device, which the console does
             // not own yet. A GPU that runs this shell is a Vulkan 1.3 one, so it is yes.
             pyrowave_ok: true,
+            // AV1 is not that safe an assumption, so the overlay corrects this from the
+            // presenter's device (`SkiaOverlay::init`) before the first frame.
+            av1_ok: true,
             store: None,
             platform: Platform::Desktop,
             gpu_cache_bytes: DEFAULT_GPU_CACHE_BYTES,
@@ -289,6 +296,7 @@ pub(crate) struct Shell {
     deck: bool,
     fallback_ui: bool,
     pyrowave_ok: bool,
+    pub(crate) av1_ok: bool,
     pub(crate) in_stream: bool,
     connecting: Option<Connecting>,
     launching: Option<Launching>,
@@ -402,6 +410,7 @@ impl Shell {
             deck: opts.deck,
             fallback_ui: opts.fallback_ui,
             pyrowave_ok: opts.pyrowave_ok,
+            av1_ok: opts.av1_ok,
             in_stream: false,
             connecting: None,
             launching: None,
@@ -644,6 +653,7 @@ impl Shell {
             deck: self.deck,
             fallback_ui: self.fallback_ui,
             pyrowave_ok: self.pyrowave_ok,
+            av1_ok: self.av1_ok,
             device_name: &self.device_name,
             t,
         };
@@ -1158,6 +1168,7 @@ impl Shell {
                 deck: self.deck,
                 fallback_ui: self.fallback_ui,
                 pyrowave_ok: self.pyrowave_ok,
+                av1_ok: self.av1_ok,
                 device_name: &self.device_name,
                 t: self.t0.elapsed().as_secs_f64(),
             };
@@ -1248,6 +1259,7 @@ impl Shell {
                 deck: self.deck,
                 fallback_ui: self.fallback_ui,
                 pyrowave_ok: self.pyrowave_ok,
+                av1_ok: self.av1_ok,
                 device_name: &self.device_name,
                 t: self.t0.elapsed().as_secs_f64(),
             };
@@ -1282,6 +1294,7 @@ impl Shell {
                 deck: self.deck,
                 fallback_ui: self.fallback_ui,
                 pyrowave_ok: self.pyrowave_ok,
+                av1_ok: self.av1_ok,
                 device_name: &self.device_name,
                 t: self.t0.elapsed().as_secs_f64(),
             };

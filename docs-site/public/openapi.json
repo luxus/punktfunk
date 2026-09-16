@@ -57,7 +57,7 @@
           {
             "name": "id",
             "in": "path",
-            "description": "Action id (`power.sleep`, `power.reboot`, `power.shutdown`)",
+            "description": "Action id (`power.sleep`, `power.reboot`, `power.shutdown`, `host.restart`)",
             "required": true,
             "schema": {
               "type": "string"
@@ -1716,6 +1716,130 @@
           },
           "401": {
             "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/host/audio/apps": {
+      "get": {
+        "tags": [
+          "host"
+        ],
+        "summary": "List apps playing audio",
+        "description": "Audio output streams on the host right now, by app. Empty on a host that cannot list them.",
+        "operationId": "getPlayingApps",
+        "responses": {
+          "200": {
+            "description": "Apps playing audio now",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PlayingApps"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/host/settings": {
+      "get": {
+        "tags": [
+          "host"
+        ],
+        "summary": "Get the host settings",
+        "description": "Every setting this host acts on, with the value in force and what set it.",
+        "operationId": "getHostSettings",
+        "responses": {
+          "200": {
+            "description": "The settings, in page order",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HostSettingsState"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "host"
+        ],
+        "summary": "Change host settings",
+        "description": "Partial: only the named settings change, and `null` resets one. Every value is checked\nbefore anything is written. Applies per setting's `apply`: the next session, or a restart.",
+        "operationId": "patchHostSettings",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HostSettingsPatch"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Stored; the new state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HostSettingsState"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "An unknown setting or a value it does not accept",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The settings file could not be written",
             "content": {
               "application/json": {
                 "schema": {
@@ -3682,7 +3806,7 @@
             }
           },
           "500": {
-            "description": "Settings could not be persisted",
+            "description": "Couldn't save the session settings",
             "content": {
               "application/json": {
                 "schema": {
@@ -7739,6 +7863,29 @@
           },
           {
             "type": "object",
+            "description": "The operator changed host settings. Re-read `GET /api/v1/host/settings`.",
+            "required": [
+              "ids",
+              "kind"
+            ],
+            "properties": {
+              "ids": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Setting ids the write named."
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "settings.changed"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
             "description": "Emitted on ACCEPT, and again if the executor later fails. A succeeded power\naction ends this process, so \"accepted with no later failure\" is success.",
             "required": [
               "id",
@@ -7759,7 +7906,7 @@
               },
               "id": {
                 "type": "string",
-                "description": "`power.sleep`, `power.reboot`, `power.shutdown`."
+                "description": "`power.sleep`, `power.reboot`, `power.shutdown`, `host.restart`."
               },
               "kind": {
                 "type": "string",
@@ -8511,6 +8658,47 @@
           "version": {
             "type": "string",
             "description": "`punktfunk-host` crate version."
+          }
+        }
+      },
+      "HostSettingsPatch": {
+        "type": "object",
+        "description": "Setting id → new value; `null` returns a setting to its default.",
+        "additionalProperties": {},
+        "propertyNames": {
+          "type": "string"
+        },
+        "example": {
+          "clipboard": "text",
+          "max_fps": null
+        }
+      },
+      "HostSettingsState": {
+        "type": "object",
+        "required": [
+          "settings",
+          "restart_pending",
+          "env_file"
+        ],
+        "properties": {
+          "env_file": {
+            "type": "string",
+            "description": "The file an operator edits to pin a setting.",
+            "example": "/home/me/.config/punktfunk/host.env"
+          },
+          "restart_pending": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Setting ids waiting for a restart."
+          },
+          "settings": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SettingState"
+            },
+            "description": "Rows this host acts on, in page order."
           }
         }
       },
@@ -9638,6 +9826,25 @@
           "native",
           "gamestream"
         ]
+      },
+      "PlayingApps": {
+        "type": "object",
+        "required": [
+          "apps"
+        ],
+        "properties": {
+          "apps": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Lowercased app names, as the voice-chat app list matches them.",
+            "example": [
+              "discord",
+              "firefox"
+            ]
+          }
+        }
       },
       "PluginLogBatch": {
         "type": "object",
@@ -10823,6 +11030,157 @@
             "type": "string",
             "description": "`auto` (env pin, else max dedicated VRAM) or `manual`.",
             "example": "manual"
+          }
+        }
+      },
+      "SettingApply": {
+        "type": "string",
+        "enum": [
+          "now",
+          "next_session",
+          "restart"
+        ]
+      },
+      "SettingGroup": {
+        "type": "string",
+        "enum": [
+          "streaming",
+          "video",
+          "audio",
+          "input",
+          "network",
+          "game_mode",
+          "session",
+          "system"
+        ]
+      },
+      "SettingKind": {
+        "type": "string",
+        "enum": [
+          "bool",
+          "int",
+          "enum",
+          "text",
+          "list"
+        ]
+      },
+      "SettingSource": {
+        "type": "string",
+        "enum": [
+          "default",
+          "store",
+          "env",
+          "flag"
+        ]
+      },
+      "SettingState": {
+        "type": "object",
+        "description": "One setting as the console renders it.",
+        "required": [
+          "id",
+          "group",
+          "kind",
+          "default",
+          "value",
+          "source",
+          "env",
+          "apply",
+          "advanced",
+          "title",
+          "docs",
+          "restart_pending"
+        ],
+        "properties": {
+          "advanced": {
+            "type": "boolean"
+          },
+          "apply": {
+            "$ref": "#/components/schemas/SettingApply"
+          },
+          "default": {},
+          "docs": {
+            "type": "string",
+            "description": "docs-site page slug under `/docs/`."
+          },
+          "env": {
+            "type": "string",
+            "description": "The name to set in `host.env` to pin this setting."
+          },
+          "group": {
+            "$ref": "#/components/schemas/SettingGroup"
+          },
+          "id": {
+            "type": "string",
+            "description": "Store key; the console's copy key is `setting_<id>`."
+          },
+          "kind": {
+            "$ref": "#/components/schemas/SettingKind"
+          },
+          "max": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "`int` only."
+          },
+          "max_len": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "`text` only.",
+            "minimum": 0
+          },
+          "min": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "`int` only."
+          },
+          "options": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "`enum` only, canonical spellings in display order."
+          },
+          "origin": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The env var or CLI flag that set `value` (`source` `env` or `flag`)."
+          },
+          "restart_pending": {
+            "type": "boolean",
+            "description": "Changed since the host started, and applies only after a restart."
+          },
+          "source": {
+            "$ref": "#/components/schemas/SettingSource"
+          },
+          "stored": {
+            "description": "The console's value, even while an env var or flag overrides it."
+          },
+          "title": {
+            "type": "string",
+            "description": "English label, for a setting the console has no copy for."
+          },
+          "unit": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`int` only, e.g. `fps`."
+          },
+          "value": {
+            "description": "The value in force."
           }
         }
       },

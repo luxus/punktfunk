@@ -342,7 +342,7 @@ pub fn touch_supported() -> bool {
 /// `PUNKTFUNK_PEN=0`. Welcome-time; clients without the bit fold pen into touch/pointer.
 #[cfg(target_os = "linux")]
 pub fn pen_supported() -> bool {
-    if std::env::var("PUNKTFUNK_PEN").as_deref() == Ok("0") {
+    if pf_host_config::knob("PUNKTFUNK_PEN").as_deref() == Some("0") {
         return false;
     }
     // SAFETY: 'static NUL-terminated path literal; `open` returns a fresh fd (or -1) and
@@ -366,7 +366,7 @@ pub fn pen_supported() -> bool {
 /// in 1809).
 #[cfg(target_os = "windows")]
 pub fn pen_supported() -> bool {
-    if std::env::var("PUNKTFUNK_PEN").as_deref() == Ok("0") {
+    if pf_host_config::knob("PUNKTFUNK_PEN").as_deref() == Some("0") {
         return false;
     }
     pen::synthetic_pen_available()

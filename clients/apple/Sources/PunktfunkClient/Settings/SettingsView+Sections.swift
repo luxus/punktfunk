@@ -316,7 +316,8 @@ extension SettingsView {
             described("A preference — the host falls back if it can't encode it.",
                       field: "codec") {
                 settingPicker(
-                    "Video codec", options: SettingsOptions.codecs,
+                    "Video codec",
+                    options: SettingsOptions.codecs(current: scoped(SettingsFields.codec).wrappedValue),
                     selection: scoped(SettingsFields.codec))
             }
             described("HDR10 when the host sends it and this display supports it. HEVC only.",

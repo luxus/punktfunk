@@ -355,6 +355,8 @@ fn is_management_cli(args: &[String]) -> bool {
         | Some("openapi")
         | Some("library")
         | Some("detect-conflicts")
+        // The per-app audio pin, run as the console user by the capture thread.
+        | Some("voice-route")
         // Prints the same list `refresh_capture_monitor_anchor` would log; skip host startup.
         | Some("list-monitors")
         | Some("-h")
@@ -424,6 +426,8 @@ fn real_main() -> Result<()> {
     match args.first().map(String::as_str) {
         Some("serve") => {
             let (mgmt_opts, native, gamestream) = parse_serve(&args[1..])?;
+            // Restart-class settings changed after this point wait for a restart.
+            pf_host_config::mark_started();
             // Must run before any new session touches the topology.
             windows::entry::serve_startup_recover();
             gamestream::serve(mgmt_opts, native, gamestream)
@@ -513,6 +517,10 @@ fn real_main() -> Result<()> {
             println!("{compositor:?} ready");
             Ok(())
         }
+        // `voice-route set|clear …`: the per-app output pin. The capture thread spawns it as the
+        // console user, because a SYSTEM caller writes SYSTEM's app preferences, not the user's.
+        #[cfg(target_os = "windows")]
+        Some("voice-route") => audio::voice_route_cli(&args[1..]),
         // Connector names `PUNKTFUNK_CAPTURE_MONITOR` takes — available before the mgmt API is up.
         #[cfg(target_os = "linux")]
         Some("list-monitors") => {
@@ -778,10 +786,21 @@ fn parse_serve(args: &[String]) -> Result<(mgmt::Options, native::NativeServe, b
     )
     .parse()
     .map_err(|_| anyhow::anyhow!("bad --webtransport-bind '{webtransport_host}' (want an IP)"))?;
-    // CLI or `PUNKTFUNK_GAMESTREAM`. Packaged units ship native-only ExecStart; env is the pin.
-    let gamestream = gamestream || pf_host_config::config().gamestream;
+    // A flag outranks env and the console's value; pinning it lets the console show why.
+    if gamestream {
+        pf_host_config::pin("gamestream", "--gamestream", serde_json::Value::Bool(true));
+    }
+    if webtransport {
+        pf_host_config::pin(
+            "webtransport",
+            "--webtransport",
+            serde_json::Value::Bool(true),
+        );
+    }
+    let gamestream = pf_host_config::config().gamestream;
     let native = native::NativeServe {
-        webtransport_bind: (webtransport || pf_host_config::config().webtransport)
+        webtransport_bind: pf_host_config::config()
+            .webtransport
             .then_some(webtransport_bind),
         ..native
     };

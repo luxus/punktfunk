@@ -81,6 +81,10 @@ const BASE_ARGV: readonly string[] = [
 	// `--unshare-pid` is what makes the rest hold: a fresh /proc has no host process in it.
 	"--proc",
 	"/proc",
+	// The unit cannot keep tunables read-only (ProtectKernelTunables refuses the mount above).
+	"--ro-bind",
+	"/proc/sys",
+	"/proc/sys",
 	"--dev",
 	"/dev",
 	"--tmpfs",
@@ -113,7 +117,8 @@ export const bwrapArgv = (
 	paths: SandboxPaths,
 	grants: readonly string[] = [],
 ): string[] => {
-	const argv = [...BASE_ARGV];
+	// The spawner hands `netlinkFilter()` over on fd 3.
+	const argv = [...BASE_ARGV, "--add-seccomp-fd", "3"];
 	// `--clearenv` empties the environment the child sees, so the spawn env never reaches it:
 	// every value has to be re-stated here. Without this a plugin has no HOME, cannot resolve
 	// its state dir, and cannot find the socket it reaches the host on.
@@ -139,6 +144,45 @@ export const bwrapArgv = (
 		if (path.isAbsolute(abs)) argv.push("--bind-try", abs, abs);
 	}
 	return argv;
+};
+
+/**
+ * A seccomp program refusing netlink sockets, as the bytes bwrap reads from `--add-seccomp-fd`.
+ *
+ * The runner's unit allows AF_NETLINK only because bwrap needs it to bring up the sandbox's
+ * loopback; bwrap loads this after that setup, so the plugin never gets it. Classic BPF over
+ * `seccomp_data`: a foreign architecture or any x32 call is refused outright, then `socket` with
+ * a netlink domain. `undefined` on an architecture with no table entry.
+ */
+export const netlinkFilter = (arch: string = process.arch): Buffer | undefined => {
+	// AUDIT_ARCH_* and __NR_socket.
+	const native = ({ x64: [0xc000003e, 41], arm64: [0xc00000b7, 198] } as const)[
+		arch as "x64" | "arm64"
+	];
+	if (!native) return undefined;
+	const [LOAD, JEQ, JGE, RET] = [0x20, 0x15, 0x35, 0x06];
+	const DENY = 0x00050000 | 97; // SECCOMP_RET_ERRNO | EAFNOSUPPORT
+	const ALLOW = 0x7fff0000;
+	// [code, jump-if-true, jump-if-false, k]; a jump skips that many instructions.
+	const program = [
+		[LOAD, 0, 0, 4], // arch
+		[JEQ, 0, 5, native[0]],
+		[LOAD, 0, 0, 0], // syscall number
+		[JGE, 3, 0, 0x40000000], // x32
+		[JEQ, 0, 3, native[1]],
+		[LOAD, 0, 0, 16], // low word of the first argument: the domain
+		[JEQ, 0, 1, 16], // AF_NETLINK
+		[RET, 0, 0, DENY],
+		[RET, 0, 0, ALLOW],
+	];
+	const out = Buffer.alloc(program.length * 8);
+	program.forEach(([code, jt, jf, k], i) => {
+		out.writeUInt16LE(code, i * 8);
+		out.writeUInt8(jt, i * 8 + 2);
+		out.writeUInt8(jf, i * 8 + 3);
+		out.writeUInt32LE(k, i * 8 + 4);
+	});
+	return out;
 };
 
 /** The environment inside: no inherited values, and nothing that is not needed there. */

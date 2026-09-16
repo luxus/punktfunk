@@ -1730,7 +1730,7 @@ fn gs_encoder_bps(bitrate_kbps: u32, fec_pct: u8, packet_size: usize) -> u64 {
 /// wire budget stay at their configured values for the whole session (the A/B lever).
 fn gs_adapt_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("PUNKTFUNK_GS_ADAPT").as_deref() != Ok("0"))
+    *ON.get_or_init(|| pf_host_config::knob("PUNKTFUNK_GAMESTREAM_ADAPT").as_deref() != Some("0"))
 }
 
 /// Loss-driven FEC percent and wire budget, stepped ~1 s from client `0x0201` reports.

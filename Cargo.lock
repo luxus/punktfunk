@@ -3172,6 +3172,7 @@ dependencies = [
  "futures-util",
  "image",
  "libc",
+ "pf-host-config",
  "punktfunk-core",
  "quinn",
  "tokio",
@@ -3286,6 +3287,10 @@ dependencies = [
 [[package]]
 name = "pf-host-config"
 version = "0.38.0"
+dependencies = [
+ "pf-paths",
+ "serde_json",
+]
 
 [[package]]
 name = "pf-inject"

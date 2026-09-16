@@ -4,6 +4,7 @@ import { describe, expect, test } from "bun:test";
 import {
 	bwrapArgv,
 	expandHome,
+	netlinkFilter,
 	type PluginManifest,
 	sandboxEnv,
 	sandboxProbe,
@@ -55,6 +56,9 @@ describe("bwrapArgv", () => {
 		expect(joined).toContain("--setenv PUNKTFUNK_CONFIG_DIR /run/punktfunk");
 		expect(binds(argv, "--proc")).toBeDefined();
 		expect(argv.join(" ")).toContain("--proc /proc");
+		// The unit allows netlink and writable tunables for bwrap's setup; the plugin gets neither.
+		expect(joined).toContain("--add-seccomp-fd 3");
+		expect(binds(argv, "--ro-bind")).toContainEqual(["/proc/sys", "/proc/sys"]);
 	});
 
 	test("binds the plugin's own things, and the home only through what it declared", () => {
@@ -128,5 +132,48 @@ describe("sandboxProbe", () => {
 		expect(!missing.ok && missing.reason).toContain("bubblewrap");
 		const denied = sandboxProbe(() => ({ status: 1 }), "linux");
 		expect(!denied.ok && denied.reason).toContain("user namespaces");
+	});
+});
+
+describe("netlinkFilter", () => {
+	/** Run the program over one `seccomp_data`: arch, syscall number, first argument. */
+	const verdict = (prog: Buffer, arch: number, nr: number, arg0: number): number => {
+		const data = Buffer.alloc(64);
+		data.writeUInt32LE(nr, 0);
+		data.writeUInt32LE(arch, 4);
+		data.writeUInt32LE(arg0, 16);
+		let acc = 0;
+		for (let pc = 0; pc * 8 < prog.length; pc++) {
+			const [code, jt, jf, k] = [
+				prog.readUInt16LE(pc * 8),
+				prog.readUInt8(pc * 8 + 2),
+				prog.readUInt8(pc * 8 + 3),
+				prog.readUInt32LE(pc * 8 + 4),
+			];
+			if (code === 0x06) return k;
+			if (code === 0x20) acc = data.readUInt32LE(k);
+			else if (code === 0x15) pc += acc === k ? jt : jf;
+			else if (code === 0x35) pc += acc >= k ? jt : jf;
+			else throw new Error(`opcode ${code}`);
+		}
+		throw new Error("fell off the end");
+	};
+	const ALLOW = 0x7fff0000;
+	const DENY = 0x00050000 | 97;
+
+	test("refuses a netlink socket and nothing else a plugin needs", () => {
+		for (const [arch, audit, socket] of [
+			["x64", 0xc000003e, 41],
+			["arm64", 0xc00000b7, 198],
+		] as const) {
+			const prog = netlinkFilter(arch) as Buffer;
+			expect(verdict(prog, audit, socket, 16)).toBe(DENY); // AF_NETLINK
+			expect(verdict(prog, audit, socket, 2)).toBe(ALLOW); // AF_INET
+			expect(verdict(prog, audit, socket, 1)).toBe(ALLOW); // AF_UNIX
+			expect(verdict(prog, audit, 0, 16)).toBe(ALLOW); // another syscall, same argument
+			expect(verdict(prog, audit, 0x40000000 + socket, 16)).toBe(DENY); // x32
+			expect(verdict(prog, 0x40000003, 102, 16)).toBe(DENY); // i386 socketcall
+		}
+		expect(netlinkFilter("riscv64")).toBeUndefined();
 	});
 });

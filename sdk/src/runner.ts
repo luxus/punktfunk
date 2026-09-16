@@ -25,6 +25,7 @@ import { spawn, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { Writable } from "node:stream";
 import { pathToFileURL } from "node:url";
 import { PunktfunkHost } from "./client.js";
 import { layer as hostLayer } from "./effect.js";
@@ -33,6 +34,7 @@ import { connect, type PluginDef } from "./index.js";
 import {
 	bwrapArgv,
 	grantedRoots,
+	netlinkFilter,
 	type PluginManifest,
 	readManifest,
 	sandboxEnv,
@@ -52,7 +54,7 @@ export interface RunnerOptions {
 	connect?: ConnectOptions;
 	/** Restart backoff base (test seam). Default 1 s, capped at 60 s, jittered. */
 	restartBase?: Duration.Input;
-	/** `"off"` runs plugins in-process, as before. Set from `PUNKTFUNK_PLUGIN_SANDBOX`. */
+	/** `"off"` runs plugins in-process. Default: `PUNKTFUNK_PLUGIN_SANDBOX` on Linux, off elsewhere. */
 	sandbox?: "on" | "off";
 	/** The pinned fetch the sandbox proxy forwards with (test seam). */
 	sandboxFetch?: typeof globalThis.fetch;
@@ -81,8 +83,8 @@ export interface Unit {
 	file: string;
 	/** The installed package's directory — absent for a loose script. */
 	packageDir?: string;
-	/** Its `punktfunk` block, when it declared one. A plugin without it gets no sandbox and no
-	 * host-run commands: it is the declaration that says what either would allow. */
+	/** Its `punktfunk` block, when it declared one. A plugin package without it gets no host-run
+	 * commands, and does not run at all while sandboxing is on. */
 	manifest?: PluginManifest;
 }
 
@@ -467,6 +469,11 @@ const runSandboxed = (
 			);
 			return;
 		}
+		const filter = netlinkFilter();
+		if (!filter) {
+			resume(Effect.fail(new Error(`no sandbox syscall filter for ${process.arch}`)));
+			return;
+		}
 		const runtime = process.env.XDG_RUNTIME_DIR ?? "/tmp";
 		const socket = path.join(runtime, "punktfunk", `plugin-${id}.sock`);
 		const proxy = serveHostProxy({
@@ -497,8 +504,11 @@ const runSandboxed = (
 		];
 		const child = spawn("bwrap", argv, {
 			env: sandboxEnv(os.homedir()),
-			stdio: ["ignore", "inherit", "inherit"],
+			// fd 3 is `--add-seccomp-fd 3`.
+			stdio: ["ignore", "inherit", "inherit", "pipe"],
 		});
+		// A bwrap that dies before reading surfaces through `exit`, not an EPIPE here.
+		(child.stdio[3] as Writable).on("error", () => {}).end(filter);
 		child.on("error", (e) => {
 			proxy.close();
 			resume(Effect.fail(e));
@@ -666,20 +676,30 @@ export const runner = (options: RunnerOptions = {}): Effect.Effect<void> => {
 	const log = options.log ?? defaultLog;
 	return Effect.scoped(
 		Effect.gen(function* () {
-			const sandboxed = options.sandbox ?? sandboxMode();
-			if (sandboxed === "off") {
+			// bwrap is the Linux sandbox. Windows confines the whole runner with its own account.
+			const linux = process.platform === "linux";
+			const sandbox = options.sandbox ?? (linux ? sandboxMode() : "off");
+			if (sandbox === "off" && linux) {
 				log(
 					"[runner] PUNKTFUNK_PLUGIN_SANDBOX=off — plugins run in this process, with your account's access",
 					"warn",
 				);
-			} else {
+			} else if (sandbox === "on") {
 				const probe = sandboxProbe();
 				if (!probe.ok) {
 					log(`[runner] plugins cannot be sandboxed: ${probe.reason}`, "error");
 					log("[runner] refusing to run plugins unsandboxed — set PUNKTFUNK_PLUGIN_SANDBOX=off to accept that", "error");
 				}
 			}
-			const units = discoverUnits(options, log);
+			// A package with no manifest has nothing to build its sandbox from, so it does not run.
+			const units = discoverUnits(options, log).filter((unit) => {
+				if (sandbox === "off" || !unit.packageDir || unit.manifest) return true;
+				log(
+					`[runner] not starting ${unit.name}: no punktfunk manifest to sandbox it with — update the plugin`,
+					"error",
+				);
+				return false;
+			});
 			if (units.length === 0) {
 				log(
 					"[runner] nothing to run — add scripts to the scripts dir or install punktfunk-plugin-* packages",
@@ -687,7 +707,7 @@ export const runner = (options: RunnerOptions = {}): Effect.Effect<void> => {
 			}
 			for (const unit of units) {
 				log(`[runner] starting ${unit.name} (${unit.file})`);
-				yield* Effect.forkScoped(superviseUnit(unit, options));
+				yield* Effect.forkScoped(superviseUnit(unit, { ...options, sandbox }));
 			}
 			yield* Effect.never; // interruption (shutdown) collapses the scope → all units
 		}),

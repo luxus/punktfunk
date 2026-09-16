@@ -606,6 +606,7 @@ mod tests {
             deck: false,
             fallback_ui: false,
             pyrowave_ok: true,
+            av1_ok: true,
             device_name: "test",
             t: 0.0,
         };
@@ -992,6 +993,7 @@ mod tests {
             deck: false,
             fallback_ui: false,
             pyrowave_ok: true,
+            av1_ok: true,
             device_name: "test",
             t: 0.0,
         };

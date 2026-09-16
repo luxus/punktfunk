@@ -129,7 +129,11 @@ enum SettingsOptions {
     /// `AV1.hardwareDecodeSupported` gate SessionModel advertises by) — elsewhere it would be a
     /// dead setting the host could never honor. Ordered by the host's resolve precedence
     /// (HEVC > AV1 > H.264).
-    static let codecs: [(label: String, tag: String)] = {
+    ///
+    /// [current] is the stored value, kept listed even when this device can't decode it — a
+    /// preset made on another device carries one here — and then labelled with the reason.
+    /// Dropping it silently leaves a blank picker over a session that streams HEVC.
+    static func codecs(current: String) -> [(label: String, tag: String)] {
         var options: [(label: String, tag: String)] = [
             ("Automatic", "auto"),
             ("HEVC (H.265)", "hevc"),
@@ -137,6 +141,8 @@ enum SettingsOptions {
         ]
         if AV1.hardwareDecodeSupported {
             options.insert(("AV1", "av1"), at: 2)
+        } else if current == "av1" {
+            options.insert(("AV1 — no hardware decoder here; HEVC is used", "av1"), at: 2)
         }
         // PyroWave is the opt-in wired-LAN low-latency codec (100–400 Mbps all-intra wavelet,
         // 8-bit SDR): selecting it advertises + prefers it for the session. Offered only when
@@ -144,9 +150,11 @@ enum SettingsOptions {
         // host could never emit it.
         if MetalWaveletDecoder.supported {
             options.append(("PyroWave (wired LAN)", "pyrowave"))
+        } else if current == "pyrowave" {
+            options.append(("PyroWave — this GPU can't decode it; HEVC is used", "pyrowave"))
         }
         return options
-    }()
+    }
 
     // MARK: - Bitrate
 
