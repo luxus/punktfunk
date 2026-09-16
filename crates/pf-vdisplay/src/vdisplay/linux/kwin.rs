@@ -452,6 +452,7 @@ impl VirtualDisplay for KwinDisplay {
             Box::new(StopGuard { stop }),
         );
         out.expect_exact_dims = expect_exact_dims;
+        out.input_output = Some(our_prefix);
         Ok(out)
     }
 }

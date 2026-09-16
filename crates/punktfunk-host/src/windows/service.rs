@@ -78,9 +78,11 @@ pub fn main(args: &[String]) -> Result<()> {
             eprintln!(
                 "punktfunk-host service — Windows service control\n\n\
                  USAGE:\n\
-                 \x20   punktfunk-host service install [--gamestream=on|off]\n\
+                 \x20   punktfunk-host service install [--gamestream=on|off] [--web-bind=ADDR]\n\
                  \x20                                      register the auto-start service + firewall rules\n\
-                 \x20                                      (--gamestream sets host.env's PUNKTFUNK_HOST_CMD)\n\
+                 \x20                                      (--gamestream sets host.env's PUNKTFUNK_HOST_CMD;\n\
+                 \x20                                       --web-bind sets PUNKTFUNK_UI_BIND, the console's\n\
+                 \x20                                       address: 127.0.0.1, 0.0.0.0, or one of yours)\n\
                  \x20   punktfunk-host service uninstall   stop + remove the service + firewall rules\n\
                  \x20   punktfunk-host service start       start the service now\n\
                  \x20   punktfunk-host service stop        stop the service\n\
@@ -906,6 +908,35 @@ fn read_env_file_value(path: &Path) -> Option<String> {
     (!value.is_empty()).then(|| value.to_string())
 }
 
+/// The console password line as the env name it must keep plus its value. `web-password` carries
+/// `PUNKTFUNK_UI_PASSWORD_HASH` once the console has migrated it, and the clear-text key only
+/// until then — forwarding either under the other's name hands the console a hash to compare as a
+/// password. The value stays as written; the console strips the quotes the hash is stored in.
+fn read_password_env(path: &Path) -> Option<(&'static str, String)> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    let mut hash = None;
+    let mut clear = None;
+    for line in contents.lines() {
+        let Some((key, value)) = line.trim().split_once('=') else {
+            continue;
+        };
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        match key.trim() {
+            "PUNKTFUNK_UI_PASSWORD_HASH" => hash = Some(value.to_string()),
+            "PUNKTFUNK_UI_PASSWORD" => clear = Some(value.to_string()),
+            _ => {}
+        }
+    }
+    // Clear text wins, the rule the console's own compare follows: writing one back beside a hash
+    // is how a password is reset, and the console hashes it again on the next sign-in.
+    clear
+        .map(|v| ("PUNKTFUNK_UI_PASSWORD", v))
+        .or_else(|| hash.map(|v| ("PUNKTFUNK_UI_PASSWORD_HASH", v)))
+}
+
 /// This process's env plus `overrides` (case-insensitive win) as a double-NUL UTF-16 block.
 /// Same serialization as `interactive::merged_env_block`; the base is ours, not a user token.
 fn env_block_with(overrides: &[(&str, String)]) -> Vec<u16> {
@@ -933,10 +964,12 @@ fn spawn_web(cfg: &WebConfig, data: &Path, job: HANDLE) -> Result<Child> {
         .filter(|v| !v.trim().is_empty())
         .or_else(|| read_env_file_value(&data.join("mgmt-token")))
         .context("read mgmt-token")?;
+    let pw_path = data.join("web-password");
     let password = std::env::var("PUNKTFUNK_UI_PASSWORD")
         .ok()
         .filter(|v| !v.trim().is_empty())
-        .or_else(|| read_env_file_value(&data.join("web-password")));
+        .map(|v| ("PUNKTFUNK_UI_PASSWORD", v))
+        .or_else(|| read_password_env(&pw_path));
     // Env-over-file; `mgmt::publish_endpoint` rewrites the file each `serve`. Default 47990 is
     // last-resort — a Sunshine fork often owns that port as its web UI.
     let mgmt_url = std::env::var("PUNKTFUNK_MGMT_URL")
@@ -947,7 +980,9 @@ fn spawn_web(cfg: &WebConfig, data: &Path, job: HANDLE) -> Result<Child> {
 
     let mut overrides: Vec<(&str, String)> = vec![
         ("PORT", "47992".into()),
-        ("HOST", "0.0.0.0".into()),
+        // No HOST override: the bind is host.env's PUNKTFUNK_UI_BIND, which `load_host_env` has
+        // already put in this process's environment, and the console defaults to loopback without
+        // it. Overriding here would out-rank the file the operator edits.
         // Proxy hop to the host's loopback HTTPS mgmt API. Self-signed cert is accepted
         // per-request, never process-wide.
         ("PUNKTFUNK_MGMT_URL", mgmt_url),
@@ -963,9 +998,15 @@ fn spawn_web(cfg: &WebConfig, data: &Path, job: HANDLE) -> Result<Child> {
         ),
         ("PUNKTFUNK_UI_SECURE", "1".into()),
         ("PUNKTFUNK_MGMT_TOKEN", token),
+        // The file the console rewrites when it turns a clear-text password into a salted hash.
+        // It is reached through this name, not %ProgramData%, so the console needs no path rules.
+        (
+            "PUNKTFUNK_UI_PASSWORD_FILE",
+            pw_path.to_string_lossy().into_owned(),
+        ),
     ];
-    if let Some(pw) = password {
-        overrides.push(("PUNKTFUNK_UI_PASSWORD", pw));
+    if let Some((key, pw)) = password {
+        overrides.push((key, pw));
     }
     let env = env_block_with(&overrides);
 
@@ -1076,6 +1117,14 @@ fn install(args: &[String]) -> Result<()> {
         },
         None => None,
     };
+    // Where the web console listens. Address only — the port is the console's own.
+    let web_bind = match args.iter().find_map(|a| a.strip_prefix("--web-bind=")) {
+        Some(v) => match v.parse::<std::net::IpAddr>() {
+            Ok(ip) => Some(ip),
+            Err(_) => bail!("--web-bind must be an IP address (got '{v}')"),
+        },
+        None => None,
+    };
 
     let exe = std::env::current_exe().context("current_exe")?;
     let manager = ServiceManager::local_computer(
@@ -1157,6 +1206,9 @@ fn install(args: &[String]) -> Result<()> {
     // Before the rules below: the mgmt rule reads its port back from host.env.
     if let Some(addr) = mgmt_bind {
         set_host_env_line("PUNKTFUNK_MGMT_BIND", &addr.to_string())?;
+    }
+    if let Some(ip) = web_bind {
+        set_host_env_line("PUNKTFUNK_UI_BIND", &ip.to_string())?;
     }
     // Remove prior rules first so an upgrade tightens scope instead of leaving a stale
     // all-profiles rule. Flag absent (upgrades) keeps the recorded choice.
@@ -1266,6 +1318,7 @@ fn ensure_default_host_env() -> Result<()> {
         // Re-lock the file: an owner can rewrite the DACL it inherited. `planted` files fall
         // through and are overwritten even if the rename-aside failed.
         pf_paths::restrict_existing_secret_file(&path);
+        keep_web_console_reach(&path);
         return Ok(());
     }
     let default = "# punktfunk host configuration (read by the Windows service).\n\
@@ -1289,6 +1342,10 @@ fn ensure_default_host_env() -> Result<()> {
         # Set to off to disable it:\n\
         # PUNKTFUNK_WEB_CONSOLE=off\n\
         \n\
+        # Where that console listens: 127.0.0.1 (this PC), 0.0.0.0 (your network), or one address,\n\
+        # e.g. a VPN interface. The plugin-UI origin on 47993 follows it.\n\
+        PUNKTFUNK_UI_BIND=127.0.0.1\n\
+        \n\
         # Force a specific render GPU by name substring (multi-GPU boxes only):\n\
         # PUNKTFUNK_RENDER_ADAPTER=4090\n\
         \n\
@@ -1300,6 +1357,36 @@ fn ensure_default_host_env() -> Result<()> {
         .with_context(|| format!("write {}", path.display()))?;
     println!("Wrote default config: {}", path.display());
     Ok(())
+}
+
+/// Name the console's bind in an existing host.env, once.
+///
+/// This file predates `PUNKTFUNK_UI_BIND`, and the console it configures answered on every
+/// interface. The new default is loopback, so an upgrade that said nothing would take the console
+/// off the LAN of every box already using it from another device. Write down the reach it has;
+/// `--web-bind` (applied after this) is how an operator changes it in the same run.
+fn keep_web_console_reach(path: &Path) {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return;
+    };
+    if text
+        .lines()
+        .any(|l| l.trim_start().starts_with("PUNKTFUNK_UI_BIND="))
+    {
+        return;
+    }
+    let mut next = text;
+    next.push_str(concat!(
+        "\n# Where the web console listens. This PC already served it on every interface, so that\n",
+        "# is preserved here. 127.0.0.1 keeps the console to this machine.\n",
+        "PUNKTFUNK_UI_BIND=0.0.0.0\n",
+    ));
+    match pf_paths::write_secret_file(path, next.as_bytes()) {
+        Ok(()) => println!("PUNKTFUNK_UI_BIND=0.0.0.0 (kept) → {}", path.display()),
+        Err(e) => {
+            tracing::warn!(error = %e, path = %path.display(), "name the console bind in host.env")
+        }
+    }
 }
 
 /// Write `PUNKTFUNK_HOST_CMD`. Only an absent line or `serve` / `serve --gamestream` is rewritten;

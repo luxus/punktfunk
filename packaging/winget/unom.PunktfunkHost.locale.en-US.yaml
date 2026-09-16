@@ -62,8 +62,10 @@ Agreements:
 InstallationNotes: |-
   Web management console:  https://<this-PC>:47992
     This install generated a login password and did not display it. Print it from an
-    ELEVATED PowerShell:   punktfunk-host web password
-    It is stored in %ProgramData%\punktfunk\web-password (edit that file to change it).
+    ELEVATED PowerShell, BEFORE your first sign-in:   punktfunk-host web password
+    The console then keeps only a salted hash in %ProgramData%\punktfunk\web-password, so a
+    forgotten password is reset: put a PUNKTFUNK_UI_PASSWORD=<your-password> line back in that
+    file and run  punktfunk-host service restart
 
   Configuration:  %ProgramData%\punktfunk\host.env
   Logs:           %ProgramData%\punktfunk\logs\

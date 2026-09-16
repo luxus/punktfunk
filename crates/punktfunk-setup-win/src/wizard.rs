@@ -21,7 +21,7 @@
 use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use punktfunk_setup::platform::windows::choices::NetworkAnswer;
+use punktfunk_setup::platform::windows::choices::{NetworkAnswer, LAN_BIND, LOOPBACK_BIND};
 use punktfunk_setup::platform::windows::demo::{sandbox_app_dir, WinDemoRunner, WinPreset};
 use punktfunk_setup::platform::windows::exec::{FakePayload, PayloadSource, Subst, WinExecutor};
 use punktfunk_setup::platform::windows::plan::{self, Artifact};
@@ -1111,6 +1111,57 @@ fn config_row(ctx: &Ctx, field: Field) -> Element {
                 .vertical_alignment(VerticalAlignment::Center)
                 .into()
         }
+        Editor::Bind(value) => {
+            // Four answers, one control pair. The address box stays beside the list rather than
+            // appearing on the fourth choice: a row that changes height as you open a dropdown
+            // reflows the whole column under the pointer. It is enabled only when it means
+            // something, so an address typed there is never quietly ignored.
+            const KEEP: usize = 0;
+            let selected = match value.as_deref() {
+                None => KEEP,
+                Some(LOOPBACK_BIND) => 1,
+                Some(LAN_BIND) => 2,
+                Some(_) => 3,
+            };
+            let typed = match (&value, selected) {
+                (Some(addr), 3) => addr.clone(),
+                _ => String::new(),
+            };
+            let pick = ctx.clone();
+            let edit = ctx.clone();
+            hstack((
+                ComboBox::new([
+                    "Leave host.env alone",
+                    "This PC only",
+                    "This local network",
+                    "A specific address",
+                ])
+                .selected_index(selected as i32)
+                .on_selection_changed(move |i: i32| {
+                    let mut s = pick.screen.clone();
+                    s.set_bind(match i {
+                        0 => None,
+                        1 => Some(LOOPBACK_BIND.to_string()),
+                        2 => Some(LAN_BIND.to_string()),
+                        _ => Some(String::new()),
+                    });
+                    pick.set_screen.call(s);
+                })
+                .vertical_alignment(VerticalAlignment::Center),
+                TextBox::new(typed)
+                    .placeholder_text("e.g. 100.64.0.3")
+                    .enabled(selected == 3)
+                    .min_width(160.0)
+                    .on_text_changed(move |addr: String| {
+                        let mut s = edit.screen.clone();
+                        s.set_bind(Some(addr));
+                        edit.set_screen.call(s);
+                    }),
+            ))
+            .spacing(6.0)
+            .vertical_alignment(VerticalAlignment::Center)
+            .into()
+        }
         Editor::Password(value) => {
             // WinUI's own eye only appears while the user types, so a pre-generated password
             // would never be revealable — this toggle drives the reveal mode instead.
@@ -1158,10 +1209,10 @@ fn config_row(ctx: &Ctx, field: Field) -> Element {
             .foreground(ThemeRef::SecondaryText),
     ))
     .spacing(1.0);
-    // The password editor is wider than a section column's Auto slot leaves room for: side
-    // by side, the label column collapses to nothing and the wrapped hint explodes in
-    // height. That row stacks instead.
-    if field == Field::Password {
+    // The password and bind editors are wider than a section column's Auto slot leaves room
+    // for: side by side, the label column collapses to nothing and the wrapped hint explodes
+    // in height. Those rows stack instead.
+    if field == Field::Password || field == Field::WebBind {
         return vstack((words, editor.margin(edges(0.0, 8.0, 0.0, 0.0))))
             .spacing(2.0)
             .into();

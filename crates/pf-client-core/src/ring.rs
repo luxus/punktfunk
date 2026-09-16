@@ -41,6 +41,9 @@ pub enum RingCommand {
     TapButton(u32),
     /// Flip [`RingFacts::pad_mouse_target`] between controller mouse and passthrough.
     TogglePadMouse,
+    /// Flip this client's own speakers ([`punktfunk_core::client::AUDIO_MUTE_LOCAL`]). Never
+    /// reaches the host, so a session joined to the same display keeps hearing the game.
+    ToggleStreamMute,
 }
 
 /// 100 % scale, client design units (px on Skia, dp/pt on phones). Shared so editors cannot drift.
@@ -95,6 +98,9 @@ pub struct RingFacts {
     pub stats_tier: String,
     pub mic_available: bool,
     pub mic_muted: bool,
+    /// Why the speakers are silent: `punktfunk_core::client::AUDIO_MUTE_LOCAL` |
+    /// `AUDIO_MUTE_HOST`. The slot toggles the local bit; the overlay names both.
+    pub audio_mute: u8,
     /// Wire pads the controller-mouse toggle acts on: the pad that opened the ring, else every
     /// live pad. `0` = no controller.
     pub pad_mouse_target: u16,

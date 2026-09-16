@@ -50,6 +50,9 @@ pub struct FrameCtx<'a> {
     /// Mic muted mid-stream. Independent of the stats tier so the badge still
     /// shows with chrome off. False when the session has no mic uplink.
     pub mic_muted: bool,
+    /// The stream's mute sentence ([`punktfunk_core::client::audio_mute_label`]); `None`
+    /// while it is audible. Standing, like the mic badge, and independent of the stats tier.
+    pub audio_mute: Option<&'a str>,
     /// Mid-stream Match-window resize in flight (`design/midstream-resolution-resize.md`).
     /// Draw a full-screen scrim and spinner until the new-resolution frame arrives.
     pub resizing: bool,

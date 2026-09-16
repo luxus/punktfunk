@@ -34,6 +34,7 @@ import {
 	getListPendingDevicesQueryKey,
 } from "@/api/gen/native/native";
 import { getGetPairingStatusQueryKey } from "@/api/gen/pairing/pairing";
+import { getGetRecentSessionsQueryKey } from "@/api/gen/session/session";
 import { getGetUpdateStatusQueryKey } from "@/api/gen/update/update";
 import { boostPluginPolling, PLUGINS_KEY } from "@/api/plugins";
 import { storeKeys } from "@/api/store";
@@ -51,12 +52,14 @@ function keysFor(kind: string): readonly (readonly unknown[])[] {
 		case "client.connected":
 		case "client.disconnected":
 		case "session.started":
-		case "session.ended":
 		case "stream.started":
 		case "stream.stopped":
 		case "game.running":
 		case "game.exited":
 			return status;
+		// Plus the summary card: a session that just ended is the one it exists to show.
+		case "session.ended":
+			return [...status, getGetRecentSessionsQueryKey()];
 		// A display appearing or going away changes the live list, and its policy card shows
 		// "in effect" values derived from the same state.
 		case "display.created":

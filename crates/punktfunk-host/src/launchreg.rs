@@ -104,6 +104,10 @@ struct Record {
     /// The host is ending this launch's game ([`ending`]). Held until
     /// [`ended`] or a newer claim; meanwhile a claim spawns, never adopts.
     ending: bool,
+    /// Workspace the streamed head gave this launch. Kept on the record, not
+    /// on the session: a reconnect focuses the game's workspace rather than
+    /// claiming a second one. `None` until a placed launch reports it.
+    workspace: Option<i64>,
 }
 
 impl Record {
@@ -119,6 +123,7 @@ impl Record {
             released_at: None,
             claim,
             ending: false,
+            workspace: None,
         }
     }
 }
@@ -267,6 +272,17 @@ pub fn ending(procs: &LiveProcs) {
     }
 }
 
+/// The launch died on the spot ([`crate::gamelease`]): un-launch the record so
+/// the next claim starts the title instead of adopting a corpse. Not a removal
+/// — an open [`Claim`] still has to find the record its [`Drop`] decrements.
+pub fn unlaunched(procs: &LiveProcs) {
+    let mut recs = reg().records.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(r) = recs.iter_mut().find(|r| Arc::ptr_eq(&r.procs, procs)) {
+        r.launched = false;
+        r.ending = false;
+    }
+}
+
 /// The ladder is through: drop the record so the next claim starts the
 /// title. Same identity as [`ending`], so a record a newer session took
 /// over meanwhile stays that session's.
@@ -297,6 +313,7 @@ pub fn claim(
             plan: Plan::Spawn,
             stamp: fresh_stamp,
             procs: None,
+            adopted: None,
         };
     };
     let reg = reg();
@@ -330,6 +347,7 @@ pub fn claim(
                 plan: Plan::Adopt,
                 stamp,
                 procs: Some(procs),
+                adopted: Some(live),
             };
         }
         // Reset in place so `holders` survives: an older session may
@@ -339,6 +357,8 @@ pub fn claim(
         rec.procs = Arc::new(Mutex::new(Vec::new()));
         rec.launched = false;
         rec.ending = false;
+        // New launch, new placement: the old workspace is the dead copy's.
+        rec.workspace = None;
         rec.holders += 1;
         rec.released_at = None;
         rec.claim = id;
@@ -361,6 +381,7 @@ pub fn claim(
         plan: Plan::Spawn,
         stamp: fresh_stamp,
         procs: Some(procs),
+        adopted: None,
     }
 }
 
@@ -372,11 +393,22 @@ pub struct Claim {
     plan: Plan,
     stamp: Option<f64>,
     procs: Option<LiveProcs>,
+    /// What liveness said when this claim chose [`Plan::Adopt`]. `None` for a
+    /// spawn — the session is about to find out for itself.
+    adopted: Option<Liveness>,
 }
 
 impl Claim {
     pub fn must_spawn(&self) -> bool {
         matches!(self.plan, Plan::Spawn)
+    }
+
+    /// What this claim adopted against, for the outcome the client is told
+    /// ([`punktfunk_core::quic::LaunchOutcome`]). `None` on a spawn.
+    /// [`Liveness::Unknown`] is the case the player is owed a word about: the
+    /// host reused a launch it cannot see.
+    pub fn adopted(&self) -> Option<Liveness> {
+        self.adopted
     }
 
     /// Stamp the lease must adopt ([`crate::gamelease::LeaseRequest::launch_stamp`]).
@@ -408,6 +440,25 @@ impl Claim {
         self.with_record(|r| {
             if r.claim == self.id {
                 r.launched = true;
+            }
+        });
+    }
+
+    /// Workspace an earlier session gave this launch, for [`Plan::Adopt`] to
+    /// focus again. `None` when nothing was placed, or the backend cannot.
+    pub fn workspace(&self) -> Option<i64> {
+        let mut found = None;
+        self.with_record(|r| found = r.workspace);
+        found
+    }
+
+    /// Record the workspace this launch was placed on. Same claim check as
+    /// [`Claim::launched`]: a newer session's placement is not ours to
+    /// overwrite.
+    pub fn placed(&self, workspace: i64) {
+        self.with_record(|r| {
+            if r.claim == self.id {
+                r.workspace = Some(workspace);
             }
         });
     }
@@ -476,6 +527,7 @@ mod tests {
             released_at,
             claim: 1,
             ending: false,
+            workspace: None,
         }
     }
 
@@ -756,5 +808,33 @@ mod tests {
         let next = claim(fp, app, false, Some(900.0));
         assert!(next.must_spawn());
         next.abandon();
+    }
+
+    /// A launch that died on the spot must not be adopted by the retry that
+    /// follows it seconds later — that is the whole in-flight window, and the
+    /// reason the player used to need a host restart.
+    #[test]
+    fn a_launch_that_died_on_the_spot_is_started_again_not_adopted() {
+        let (fp, app) = (Some("fp-early"), Some("custom:early"));
+        let first = claim(fp, app, false, Some(100.0));
+        assert!(first.must_spawn());
+        first.launched();
+        let procs = first.procs().expect("recorded");
+
+        // Control: inside the window this launch still covers.
+        let adopting = claim(fp, app, false, Some(200.0));
+        assert!(!adopting.must_spawn());
+        drop(adopting);
+
+        unlaunched(&procs);
+        let retry = claim(fp, app, false, Some(900.0));
+        assert!(
+            retry.must_spawn(),
+            "the next attempt must start the title, not adopt the launch that died"
+        );
+        assert_eq!(retry.stamp(), Some(900.0));
+        // The record survived, so the first session's hold still has one to release.
+        retry.abandon();
+        drop(first);
     }
 }

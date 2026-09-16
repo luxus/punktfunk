@@ -35,19 +35,22 @@ struct PadCadence {
 }
 
 impl PadCadence {
-    fn record(&mut self, now: Instant) {
+    /// `true` when the gap was a stall, for the session-total counter — the threshold stays
+    /// defined here, not at the call site.
+    fn record(&mut self, now: Instant) -> bool {
         let Some(prev) = self.last.replace(now) else {
-            return;
+            return false;
         };
         let gap = now.saturating_duration_since(prev);
         if gap >= STALL_GAP {
             self.stalls = self.stalls.saturating_add(1);
-            return;
+            return true;
         }
         let us = gap.as_micros() as u32;
         self.max_us = self.max_us.max(us);
         self.gaps = self.gaps.saturating_add(1);
         self.hist[bucket(us)] += 1;
+        false
     }
 
     /// Exclusive upper bound (µs) of the bucket holding the `q`-quantile.
@@ -95,10 +98,11 @@ impl MotionCadence {
         }
     }
 
-    pub(super) fn record(&mut self, pad: u8, now: Instant) {
-        if let Some(p) = self.pads.get_mut(pad as usize) {
-            p.record(now);
-        }
+    /// `true` when this arrival closed a stall — what the session summary counts.
+    pub(super) fn record(&mut self, pad: u8, now: Instant) -> bool {
+        self.pads
+            .get_mut(pad as usize)
+            .is_some_and(|p| p.record(now))
     }
 
     /// One `info` line per pad that carried motion. Call once, at session end.
@@ -161,17 +165,18 @@ mod tests {
     }
 
     /// A multi-second silence is a stall. Folding it into `hist` would make a 4 ms
-    /// feed report as a multi-second one.
+    /// feed report as a multi-second one. The verdict is also what `record` returns,
+    /// which is what the session summary's stall count is built from.
     #[test]
     fn a_stall_is_counted_separately_from_the_cadence() {
         let t0 = Instant::now();
         let mut c = MotionCadence::new();
         for i in 0..50u64 {
-            c.record(0, at(t0, i * 4));
+            assert!(!c.record(0, at(t0, i * 4)), "a 4 ms gap is cadence");
         }
-        c.record(0, at(t0, 5_000));
+        assert!(c.record(0, at(t0, 5_000)), "5 s of silence is a stall");
         for i in 0..50u64 {
-            c.record(0, at(t0, 5_000 + i * 4));
+            assert!(!c.record(0, at(t0, 5_000 + i * 4)));
         }
         assert_eq!(c.pads[0].stalls, 1);
         assert_eq!(

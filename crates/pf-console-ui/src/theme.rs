@@ -489,6 +489,8 @@ enum Para {
     Leading,
     /// Left-aligned, one ellipsized line.
     Heading,
+    /// Left-aligned, three lines then an ellipsis.
+    Title,
 }
 
 impl Para {
@@ -497,6 +499,7 @@ impl Para {
             Para::Centered => (TextAlign::Center, None),
             Para::Leading => (TextAlign::Left, None),
             Para::Heading => (TextAlign::Left, Some(1)),
+            Para::Title => (TextAlign::Left, Some(3)),
         }
     }
 }
@@ -667,11 +670,13 @@ impl Fonts {
         self.frame.set(self.frame.get().wrapping_add(1));
     }
 
-    /// Draw a cached paragraph. `at` is top-left and is not part of the key.
+    /// Draw a cached paragraph and return its laid-out height. `at` is top-left and
+    /// is not part of the key. With no canvas it only shapes, for a caller placing
+    /// a block by a title's height before drawing it.
     #[allow(clippy::too_many_arguments)]
     fn draw_paragraph(
         &self,
-        canvas: &Canvas,
+        canvas: Option<&Canvas>,
         text: &str,
         kind: Para,
         w: W,
@@ -679,7 +684,7 @@ impl Fonts {
         color: Color4f,
         max_w: f64,
         at: Point,
-    ) {
+    ) -> f64 {
         let frame = self.frame.get();
         // Owned key: a hit still allocates a `String`. Cheap next to a reshape.
         let key = ParaKey {
@@ -701,11 +706,15 @@ impl Fonts {
             used: frame,
         });
         entry.used = frame;
-        entry.para.paint(canvas, at);
+        if let Some(canvas) = canvas {
+            entry.para.paint(canvas, at);
+        }
+        let height = f64::from(entry.para.height());
         // Reap entries not drawn this frame or the last (`used + 1 >= frame`).
         if cache.len() > PARA_CACHE_MAX {
             cache.retain(|_, c| c.used + 1 >= frame);
         }
+        height
     }
 
     /// Centered wrapping paragraph; `y` is the top edge (CJK fallback).
@@ -722,7 +731,16 @@ impl Fonts {
         max_w: f64,
     ) {
         let at = Point::new((cx - max_w / 2.0) as f32, y as f32);
-        self.draw_paragraph(canvas, text, Para::Centered, w, size, color, max_w, at);
+        self.draw_paragraph(
+            Some(canvas),
+            text,
+            Para::Centered,
+            w,
+            size,
+            color,
+            max_w,
+            at,
+        );
     }
 
     /// Left-aligned twin of [`centered`](Self::centered). Same paragraph path (CJK
@@ -740,7 +758,32 @@ impl Fonts {
         max_w: f64,
     ) {
         let at = Point::new(x as f32, y as f32);
-        self.draw_paragraph(canvas, text, Para::Leading, w, size, color, max_w, at);
+        self.draw_paragraph(Some(canvas), text, Para::Leading, w, size, color, max_w, at);
+    }
+
+    /// Left-aligned title at `(x, y)` top edge, at most three lines then an ellipsis.
+    /// Returns the laid-out height so the lines under it follow the wrap.
+    #[allow(clippy::too_many_arguments)]
+    pub fn title(
+        &self,
+        canvas: &Canvas,
+        text: &str,
+        w: W,
+        size: f64,
+        color: Color4f,
+        x: f64,
+        y: f64,
+        max_w: f64,
+    ) -> f64 {
+        let at = Point::new(x as f32, y as f32);
+        self.draw_paragraph(Some(canvas), text, Para::Title, w, size, color, max_w, at)
+    }
+
+    /// The height [`title`](Self::title) draws at `max_w`, without drawing it. Same
+    /// cache entry, so measuring before drawing shapes once.
+    pub fn title_height(&self, text: &str, w: W, size: f64, color: Color4f, max_w: f64) -> f64 {
+        let at = Point::new(0.0, 0.0);
+        self.draw_paragraph(None, text, Para::Title, w, size, color, max_w, at)
     }
 
     /// Left-aligned heading at `(x, y)`, one ellipsized line at `max_w`. A wrap would
@@ -758,7 +801,7 @@ impl Fonts {
         max_w: f64,
     ) {
         let at = Point::new(x as f32, y as f32);
-        self.draw_paragraph(canvas, text, Para::Heading, w, size, color, max_w, at);
+        self.draw_paragraph(Some(canvas), text, Para::Heading, w, size, color, max_w, at);
     }
 
     /// One line, ellipsized to `max_w`, at a baseline. For titles that exceed their tile.

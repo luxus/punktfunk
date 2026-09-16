@@ -49,6 +49,7 @@ pub enum Field {
     PublicFw,
     StartService,
     Tray,
+    WebBind,
     Password,
     DesktopIcon,
 }
@@ -61,6 +62,8 @@ pub enum Editor {
     Toggle(bool),
     TriState(Option<bool>),
     Password(Option<String>),
+    /// The console's listen address. `None` is the upgrade face: pass nothing, keep host.env's.
+    Bind(Option<String>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -115,6 +118,7 @@ impl WinScreen {
                     Field::PublicFw,
                     Field::StartService,
                     Field::Tray,
+                    Field::WebBind,
                 ];
                 if self.fresh() && !self.facts.web_password_present {
                     rows.push(Field::Password);
@@ -140,7 +144,7 @@ impl WinScreen {
             group("Drivers", &[Field::Driver, Field::Gamepad, Field::HdrLayer]),
             group("Network", &[Field::Gamestream, Field::PublicFw]),
             group("After install", &[Field::StartService, Field::Tray]),
-            group("Web console", &[Field::Password]),
+            group("Web console", &[Field::WebBind, Field::Password]),
             group("Shortcuts", &[Field::DesktopIcon]),
         ]
         .into_iter()
@@ -162,6 +166,7 @@ impl WinScreen {
             Field::PublicFw => Editor::TriState(c.allow_public_fw),
             Field::StartService => Editor::Toggle(c.start_service),
             Field::Tray => Editor::Toggle(c.tray_autostart),
+            Field::WebBind => Editor::Bind(c.web_bind.clone()),
             Field::Password => Editor::Password(c.web_password.clone()),
             Field::DesktopIcon => Editor::Toggle(c.desktop_icon),
         }
@@ -176,6 +181,7 @@ impl WinScreen {
             Field::PublicFw => "Public-network firewall rules",
             Field::StartService => "Start the service",
             Field::Tray => "Tray autostart",
+            Field::WebBind => "Web console reachable from",
             Field::Password => "Web console password",
             Field::DesktopIcon => "Desktop shortcut",
         }
@@ -201,6 +207,9 @@ impl WinScreen {
             }
             Field::StartService => "Start streaming as soon as the install finishes.".into(),
             Field::Tray => "The status icon next to the clock, for every user.".into(),
+            Field::WebBind => {
+                "Where the console answers: this PC only, your local network, or one address such as a VPN interface. It is how you pair devices and change every setting.".into()
+            }
             Field::Password => {
                 "Generated for you — keep it or type your own. It signs you into the web console and is shown again on the finish page.".into()
             }
@@ -256,7 +265,7 @@ impl WinScreen {
             Field::StartService => c.start_service = on,
             Field::Tray => c.tray_autostart = on,
             Field::DesktopIcon => c.desktop_icon = on,
-            Field::Password => {}
+            Field::WebBind | Field::Password => {}
         }
     }
 
@@ -271,6 +280,12 @@ impl WinScreen {
 
     pub fn set_password(&mut self, password: String) {
         self.choices.web_password = Some(password);
+    }
+
+    /// The bind row. `None` is the upgrade's "keep what host.env says"; anything else is written
+    /// through `--web-bind`, and the plan validates nothing, so a free-typed address lands as-is.
+    pub fn set_bind(&mut self, bind: Option<String>) {
+        self.choices.web_bind = bind;
     }
 
     pub fn set_network(&mut self, answer: NetworkAnswer) {
@@ -353,7 +368,7 @@ mod tests {
         let s = screen_of(fresh_facts(), Artifact::Host);
         let rows = s.rows();
         assert_eq!(rows.last(), Some(&Field::Password));
-        assert_eq!(rows.len(), 8);
+        assert_eq!(rows.len(), 9);
         assert!(matches!(s.editor(Field::Gamestream), Editor::Toggle(false)));
     }
 
@@ -363,6 +378,21 @@ mod tests {
         assert!(!s.rows().contains(&Field::Password));
         assert_eq!(s.editor(Field::Gamestream), Editor::TriState(None));
         assert_eq!(s.editor(Field::PublicFw), Editor::TriState(None));
+    }
+
+    // The bind row survives an upgrade, unlike the password: it is how an operator opens or
+    // closes the console later, and `None` is the "keep what host.env says" face it needs.
+    #[test]
+    fn the_bind_row_is_on_every_host_run_and_defaults_to_loopback_when_fresh() {
+        let fresh = screen_of(fresh_facts(), Artifact::Host);
+        assert!(fresh.rows().contains(&Field::WebBind));
+        assert_eq!(
+            fresh.editor(Field::WebBind),
+            Editor::Bind(Some("127.0.0.1".into()))
+        );
+        let upgrade = screen_of(upgrade_facts(), Artifact::Host);
+        assert!(upgrade.rows().contains(&Field::WebBind));
+        assert_eq!(upgrade.editor(Field::WebBind), Editor::Bind(None));
     }
 
     // Every row belongs to exactly one section, in row order — the wizard shows nothing

@@ -126,6 +126,12 @@ pub const CLIENT_CAP_AUDIO_HIRES: u8 = 0x10;
 /// host-global wiring, so any live session that asked wins until it ends.
 pub const CLIENT_CAP_KEEP_HOST_AUDIO: u8 = 0x20;
 
+/// [`Hello::client_caps`]: the client parses the tagged extension block after Welcome's
+/// frozen positional layout ([`EXT_TAG_PADDING`](super::EXT_TAG_PADDING)). The host
+/// appends a block only toward this bit, so a client that leaves it clear still gets the
+/// Welcome byte-identical to today's. `0x80` is the last free `client_caps` bit.
+pub const CLIENT_CAP_EXT: u8 = 0x40;
+
 /// [`Welcome::host_caps`]: the session is on the lossless audio plane
 /// ([`AUDIO_PCM_MAGIC`](super::datagram::AUDIO_PCM_MAGIC), `0xD3`). A wire statement, not
 /// an offer: the client must open from
@@ -149,6 +155,11 @@ pub const HOST_CAP2_REPEAT_MARK: u8 = 0x01;
 /// `PT_TOUCH`. Without the bit a passthrough client falls back to trackpad — otherwise
 /// contacts vanish with no error (`design/touch-client-overlay.md`).
 pub const HOST_CAP2_TOUCH: u8 = 0x02;
+
+/// [`Welcome::host_caps2`](crate::quic::Welcome::host_caps2): the host parses the tagged
+/// extension block after `Start`'s 6 bytes. The client appends one only after seeing this
+/// bit — Hello is first contact, with no host capability known yet, and stays frozen.
+pub const HOST_CAP2_EXT: u8 = 0x04;
 
 /// [`Hello::video_codecs`]: H.264 / AVC. The software encode path emits H.264, so a client
 /// that wants to stream from a GPU-less host must advertise this.

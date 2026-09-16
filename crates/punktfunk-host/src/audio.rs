@@ -69,6 +69,12 @@ pub trait AudioCapturer: Send {
         CHANNELS as u32
     }
 
+    /// `node.name` of the sink this capturer reads, for a `join` session to tap.
+    /// `None` where capture follows the default output.
+    fn sink_name(&self) -> Option<&str> {
+        None
+    }
+
     /// Rate the backend is actually delivering, not the one it was asked for
     /// (`design/hi-res-audio.md`). WASAPI AUTOCONVERTPCM and PipeWire's monitor
     /// resampler both succeed at a request they then interpolate. Report the granted
@@ -144,8 +150,8 @@ pub fn open_audio_capture(channels: u32, rate_hz: u32) -> Result<Box<dyn AudioCa
 
 /// [`open_audio_capture`] pinned to a sink `node.name` (`design/gamescope-multiuser.md`):
 /// gamescope apps get `PULSE_SINK` and we capture that sink's monitor. `None` =
-/// [`open_audio_capture`]. `tap` captures a sink another session owns, without minting or
-/// claiming it. Non-Linux ignores the name.
+/// [`open_audio_capture`]. `tap` captures a sink another session owns without minting it,
+/// holding the default-sink claim on it until this session ends. Non-Linux ignores the name.
 pub fn open_audio_capture_named(
     channels: u32,
     rate_hz: u32,

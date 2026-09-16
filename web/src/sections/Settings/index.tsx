@@ -1,8 +1,9 @@
 import Section from "@unom/ui/section";
 import { toast } from "@unom/ui/toast";
-import { Languages, LogOut, PanelLeft, UserRound } from "lucide-react";
+import { Globe, Languages, LogOut, PanelLeft, UserRound } from "lucide-react";
 import type { FC } from "react";
 import { pluginIcon, uiPlugins, usePlugins } from "@/api/plugins";
+import { useUiConfig } from "@/api/uiConfig";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -60,6 +61,8 @@ export const SectionSettings: FC = () => {
 
 				<AppearanceCard />
 
+				<ReachCard />
+
 				<NavigationCard />
 
 				<Card className="max-w-lg">
@@ -78,6 +81,36 @@ export const SectionSettings: FC = () => {
 				</Card>
 			</div>
 		</Section>
+	);
+};
+
+/**
+ * Who can reach this console, but only when that is more than this machine.
+ *
+ * The bind is the server's to know (`PUNKTFUNK_UI_BIND`), not the browser's: reaching the page
+ * over the LAN proves it, while opening it on the host proves nothing either way. The URL shown
+ * is this tab's own, which is an address that demonstrably works.
+ */
+const ReachCard: FC = () => {
+	const { data } = useUiConfig();
+	if (!data?.reachableFromNetwork) return null;
+	return (
+		<Card className="max-w-lg">
+			<CardHeader>
+				<CardTitle className="flex items-center gap-2">
+					<Globe className="size-4" />
+					{m.settings_reach_title()}
+				</CardTitle>
+			</CardHeader>
+			<CardContent className="space-y-2">
+				<p className="text-sm">
+					{m.settings_reach_lan({ url: window.location.origin })}
+				</p>
+				<p className="text-sm text-muted-foreground">
+					{m.settings_reach_change()}
+				</p>
+			</CardContent>
+		</Card>
 	);
 };
 

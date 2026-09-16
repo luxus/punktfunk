@@ -11,7 +11,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use punktfunk_setup::choices::{Action, Choices, Pins};
+use punktfunk_setup::choices::{Action, Choices, Pins, LAN_BIND, LOOPBACK_BIND};
 use punktfunk_setup::exec::{Executor, Opts};
 use punktfunk_setup::facts::{Facts, Family, Floor, DOCS};
 use punktfunk_setup::plan;
@@ -52,6 +52,7 @@ usage: punktfunk-setup [options]
   --omarchy-idle | --no-omarchy-idle     keep the screen awake while a stream runs
   --omarchy-theme | --no-omarchy-theme   follow the Omarchy theme in the console
   --mgmt-port N         port to move the management API to if Sunshine/Apollo holds 47990 (default 47991)
+  --web-bind ADDR       where the web console listens: localhost (default), lan, or one address
   --no-start            install and configure, but don't enable the services
   -v, --verbose         echo every command instead of collapsing to a progress line
   --uninstall           stop the services and remove the packages + repo (config stays)
@@ -64,10 +65,25 @@ usage: punktfunk-setup [options]
 Every option has an environment twin for scripted installs: PUNKTFUNK_INSTALL_YES=1,
 PUNKTFUNK_INSTALL_CHANNEL, PUNKTFUNK_INSTALL_GAMESTREAM, PUNKTFUNK_INSTALL_CLIPBOARD,
 PUNKTFUNK_INSTALL_PUNKTFUNK_GROUP, PUNKTFUNK_INSTALL_LINGER, PUNKTFUNK_INSTALL_CONSOLE_CERT,
-PUNKTFUNK_INSTALL_OMARCHY_SETUP, PUNKTFUNK_INSTALL_MGMT_PORT (1/0 for the flags)."#;
+PUNKTFUNK_INSTALL_OMARCHY_SETUP, PUNKTFUNK_INSTALL_MGMT_PORT, PUNKTFUNK_INSTALL_WEB_BIND
+(1/0 for the flags)."#;
 
 /// 2 is bad usage, matching the sh installer's contract.
 const BAD_USAGE: u8 = 2;
+
+/// `--web-bind` / its env twin. `lan` is the friendly spelling of 0.0.0.0; anything else has to
+/// parse as an address, so a typo cannot quietly leave the console somewhere nobody is listening.
+fn web_bind(raw: &str) -> Result<String, (u8, String)> {
+    match raw.trim() {
+        "localhost" | "loopback" => Ok(LOOPBACK_BIND.to_string()),
+        "lan" | "any" => Ok(LAN_BIND.to_string()),
+        v if v.parse::<std::net::IpAddr>().is_ok() => Ok(v.to_string()),
+        _ => Err((
+            BAD_USAGE,
+            "--web-bind must be an address, or 'localhost' or 'lan'".to_string(),
+        )),
+    }
+}
 
 struct Cli {
     pins: Pins,
@@ -102,6 +118,10 @@ fn parse(args: Vec<String>, env: &Env) -> Result<Cli, (u8, String)> {
             mgmt_port: env
                 .get("PUNKTFUNK_INSTALL_MGMT_PORT")
                 .map(|v| v.parse().unwrap_or(0)),
+            web_bind: match env.get("PUNKTFUNK_INSTALL_WEB_BIND") {
+                Some(v) => Some(web_bind(v)?),
+                None => None,
+            },
             ..Pins::default()
         },
         yes: env.get("PUNKTFUNK_INSTALL_YES") == Some("1"),
@@ -157,6 +177,10 @@ fn parse(args: Vec<String>, env: &Env) -> Result<Cli, (u8, String)> {
                     raw.parse()
                         .map_err(|_| (BAD_USAGE, "--mgmt-port must be a number".to_string()))?,
                 );
+            }
+            "--web-bind" => {
+                let raw = value().unwrap_or_default();
+                cli.pins.web_bind = Some(web_bind(&raw)?);
             }
             "--no-start" => cli.pins.no_start = true,
             "--uninstall" => cli.pins.action = Action::Uninstall,
@@ -320,6 +344,15 @@ fn main() -> ExitCode {
             let ip = facts.ip.clone().unwrap_or_else(|| "this box".to_string());
             choices.web_password =
                 tui.web_password(&format!("https://{ip}:47992"), report::PASSWORD_READ);
+        }
+        // Right after it, for the same reason: the console is the whole product surface, and who
+        // can reach it is the one thing a host install must not decide behind the user's back.
+        // `--web-bind` pins it, and then there is nothing to ask.
+        if action == Action::Install && choices.components.host && cli.pins.web_bind.is_none() {
+            let ip = facts.ip.clone().unwrap_or_else(|| "this box".to_string());
+            if let Some(bind) = tui.web_bind(&ip, &choices.web_bind) {
+                choices.web_bind = bind;
+            }
         }
     } else {
         report::choices_summary(ui, &choices);

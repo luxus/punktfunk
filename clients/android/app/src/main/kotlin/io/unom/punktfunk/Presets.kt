@@ -124,6 +124,14 @@ data class SettingsOverlay(
         return j
     }
 
+    /** The overrides as the console document spells them — what its settings rows draw
+     *  their preset markers from. Modelled fields only. */
+    internal fun toConsoleJson(): JSONObject {
+        val j = JSONObject()
+        SettingsFields.PRESET.forEach { it.overlayToConsoleJson(this, j) }
+        return j
+    }
+
     companion object {
         /** The width/height pair, which one control drives — the reset alias, as on every client. */
         const val FIELD_RESOLUTION = SettingsFields.FIELD_RESOLUTION

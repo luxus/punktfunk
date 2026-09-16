@@ -96,6 +96,14 @@ pub fn open_portal_monitor(
     anyhow::bail!("portal capture requires Linux (xdg-desktop-portal + PipeWire)")
 }
 
+/// Streamed head's mode for the pointer warp (`pf_inject::set_stream_extent`), in pixels.
+/// A display mode never exceeds `u16`; anything that does is not one, so it publishes nothing.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn head_extent(mode: Option<(u32, u32, u32)>) -> Option<(u16, u16)> {
+    let (w, h, _) = mode?;
+    Some((u16::try_from(w).ok()?, u16::try_from(h).ok()?))
+}
+
 /// Capturer from an already-created [`crate::vdisplay::VirtualOutput`].
 /// The compositor flags carry PipeWire producer contracts that node ids and
 /// remote fds cannot reveal. The capturer owns the output keepalive.
@@ -121,11 +129,11 @@ pub fn capture_virtual_output(
     // `want.hdr` offers 10-bit PQ/BT.2020. Handshake already resolved it through
     // [`capturer_supports_hdr_for`]; only gamescope off `pipewire-hdr` is HDR.
 
-    // Aim wlr absolute mapping at THIS head. EXTEND backends (Hyprland, sway)
-    // sit beside the operator's screen; without this, abs samples never enter
-    // the stream. `None` (KWin/Mutter/gamescope) CLEARS a stale name — e.g.
-    // Game-Mode switching Hyprland → gamescope, after which `PF-…` is gone.
-    crate::inject::set_stream_output(vout.output_name.clone());
+    // Aim absolute input at THIS head: EXTEND backends sit beside the operator's
+    // screens. `None` (Mutter/gamescope) CLEARS a stale name, e.g. after a Game-Mode
+    // switch Hyprland → gamescope has removed `PF-…`.
+    crate::inject::set_stream_output(vout.output_name.clone().or(vout.input_output.clone()));
+    crate::inject::set_stream_extent(head_extent(vout.preferred_mode));
     // Direct capture first where the compositor has it: the portal's re-request timer
     // halves the rate above ~140 Hz. GPU consumers only — this delivers dmabufs, and a
     // software encoder wants the portal's CPU pixels. Any failure falls through.
@@ -277,6 +285,7 @@ pub fn capture_virtual_output(
         target.adapter_luid,
         target.target_id,
     )));
+    crate::inject::set_stream_extent(head_extent(vout.preferred_mode));
     let pref = vout.preferred_mode;
     let keep = vout.keepalive;
     // Resolve the pf-vdisplay control device once and wrap its cursor IOCTLs for the

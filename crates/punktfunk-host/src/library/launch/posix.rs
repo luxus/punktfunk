@@ -22,6 +22,8 @@ pub(super) fn launch_target(
         launcher: entry.role == GameRole::Launcher,
         detect: entry.detect,
         command: Some(command),
+        own_workspace: entry.on_window.own_workspace(),
+        on_window: entry.on_window,
     })
 }
 
@@ -143,6 +145,41 @@ pub struct SpawnedLaunch {
     /// A non-leader must never be signalled by negative pid
     /// ([`crate::gamelease::OwnedChild::group_leader`]).
     pub group_leader: bool,
+    /// Workspace this launch owns on the streamed head. Hand it to the lease:
+    /// the claim ends with the game, not with this call.
+    pub workspace: Option<crate::vdisplay::WorkspaceClaim>,
+}
+
+/// Aim the streamed head at this launch, and — when `own` and the backend can
+/// place — at a workspace of its own there.
+///
+/// Head first: a workspace id nothing owns is minted on whichever monitor
+/// holds focus. `want` is the workspace an earlier session already claimed for
+/// this launch, so a keep-alive reconnect goes back to the game instead of
+/// opening a second empty one.
+#[cfg(target_os = "linux")]
+fn focus_and_claim(
+    compositor: crate::vdisplay::Compositor,
+    own: bool,
+    want: Option<i64>,
+) -> Option<crate::vdisplay::WorkspaceClaim> {
+    let out = crate::inject::stream_output()?;
+    if crate::vdisplay::focus_streamed_output(compositor, &out) {
+        tracing::debug!(output = %out, "claimed focus for the streamed head before launching");
+    }
+    own.then(|| crate::vdisplay::claim_workspace(compositor, &out, want))
+        .flatten()
+}
+
+/// Keep-alive reconnect: put the streamed head back on the running game's
+/// workspace. The claim belongs to the launch, so this session re-focuses
+/// `want` instead of taking a second workspace for a game already placed.
+#[cfg(target_os = "linux")]
+pub fn adopt_launch_workspace(
+    compositor: crate::vdisplay::Compositor,
+    want: i64,
+) -> Option<crate::vdisplay::WorkspaceClaim> {
+    focus_and_claim(compositor, true, Some(want))
 }
 
 /// Host-resolved command into the live Linux session, after capture is up.
@@ -152,9 +189,10 @@ pub struct SpawnedLaunch {
 /// * **KWin / Mutter** — session env already retargeted, virtual output is
 ///   primary; a plain spawn lands on the stream.
 /// * **Hyprland / wlroots (sway)** — EXTEND-only: the streamed head sits
-///   beside the operator's. [`crate::vdisplay::focus_streamed_output`] claims
-///   it here; capture also focused it, but portal handshake / encoder / first
-///   frame sit in between and can steal focus back.
+///   beside the operator's. [`focus_and_claim`] claims it here, and with
+///   `own_workspace` an empty workspace on it; capture also focused the head,
+///   but portal handshake / encoder / first frame sit in between and can steal
+///   focus back.
 /// * **gamescope (managed / SteamOS / attach)** — spawn inside the running
 ///   session ([`crate::vdisplay::launch_into_gamescope_session`]). `steam
 ///   steam://…` also forwards over Steam's pipe.
@@ -166,17 +204,14 @@ pub fn launch_session_command(
     compositor: crate::vdisplay::Compositor,
     cmd: &str,
     seat: Option<&str>,
+    own_workspace: bool,
 ) -> Result<SpawnedLaunch> {
     use std::os::unix::process::CommandExt;
     let cmd = cmd.trim();
     anyhow::ensure!(!cmd.is_empty(), "empty command");
-    // Focus the streamed head first (no-op off EXTEND). Same slot as the
-    // absolute-input pointer, so focus and cursor share one head.
-    if let Some(out) = crate::inject::stream_output() {
-        if crate::vdisplay::focus_streamed_output(compositor, &out) {
-            tracing::debug!(output = %out, "claimed focus for the streamed head before launching");
-        }
-    }
+    // Before the spawn, so the game's first window maps where it belongs. Same
+    // head as the absolute-input pointer, so focus and cursor share one.
+    let workspace = focus_and_claim(compositor, own_workspace, None);
     let (child, group_leader) = match compositor {
         crate::vdisplay::Compositor::Gamescope => (
             crate::vdisplay::launch_into_gamescope_session(cmd, seat)?,
@@ -219,6 +254,7 @@ pub fn launch_session_command(
     Ok(SpawnedLaunch {
         child,
         group_leader,
+        workspace,
     })
 }
 

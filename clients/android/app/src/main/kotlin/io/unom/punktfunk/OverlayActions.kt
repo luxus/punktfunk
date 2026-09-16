@@ -34,6 +34,9 @@ sealed class SlotId {
 
     /** Controller mouse: the pad drives the host pointer instead of its virtual pad. */
     object PadMouse : SlotId()
+
+    /** Silence this device's speakers. Local: the host keeps playing for anyone joined to it. */
+    object StreamMute : SlotId()
     data class Host(val actionId: String) : SlotId()
     data class Shortcut(val shortcutId: String) : SlotId()
 
@@ -51,6 +54,7 @@ sealed class SlotId {
             Guide -> "guide"
             Qam -> "qam"
             PadMouse -> "pad_mouse"
+            StreamMute -> "stream_mute"
             is Host -> "host:$actionId"
             is Shortcut -> "shortcut:$shortcutId"
         }
@@ -69,6 +73,7 @@ sealed class SlotId {
             "guide" -> Guide
             "qam" -> Qam
             "pad_mouse" -> PadMouse
+            "stream_mute" -> StreamMute
             else -> when {
                 s.startsWith("host:") && s.length > 5 -> Host(s.substring(5))
                 s.startsWith("shortcut:") && s.length > 9 -> Shortcut(s.substring(9))

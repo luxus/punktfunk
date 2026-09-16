@@ -120,9 +120,22 @@ if (!tls && secureFlag) {
 	process.exit(1);
 }
 
+// Where BOTH listeners bind. `PUNKTFUNK_UI_BIND` (host.env, the file every other host setting
+// lives in) first, then whatever a launcher set, then loopback. A console the LAN can reach is a
+// decision the operator makes, not the default it used to be; the plugin-UI origin inherits this
+// through `listenerOptions`, so 47993 is never wider than 47992.
+const bind =
+	process.env.PUNKTFUNK_UI_BIND?.trim() ||
+	process.env.NITRO_HOST ||
+	process.env.HOST ||
+	"127.0.0.1";
+// Read back by the app (server/routes/_auth/ui-config.get.ts) so Settings can say when the console
+// is reachable from the network. Set here, never trusted from the environment we started with.
+process.env.PUNKTFUNK_UI_BIND_ACTIVE = bind;
+
 /** The shared `Bun.serve` options both listeners use — only the port and the stamped lane differ. */
 const listenerOptions = (lane) => ({
-	host: process.env.NITRO_HOST || process.env.HOST,
+	host: bind,
 	// Bun defaults this to 10 s, which is SHORTER than the host's 15 s SSE keep-alive comment — so a
 	// proxied `/api/v1/events` stream (or any other quiet long-lived response) gets cut by us and
 	// reconnects on a loop. 120 s is comfortably above any keep-alive we forward; still overridable.
@@ -170,7 +183,19 @@ const listenerOptions = (lane) => ({
 
 const consolePort = Number(process.env.NITRO_PORT || process.env.PORT || 3000);
 const server = Bun.serve({ ...listenerOptions("console"), port: consolePort });
-console.log(`punktfunk web console listening on ${server.url} (tls=${!!tls})`);
+console.log(
+	`punktfunk web console listening on ${server.url} (tls=${!!tls}, bind=${bind})`,
+);
+// Name the bind out loud on a loopback listener. A console that answers only here looks exactly
+// like one that is down when you try it from another device, and this line is the difference
+// between "it broke" and "it is configured that way". Same rule as `isLoopbackBind`
+// (server/util/pluginOrigin.ts), which decides whether Settings shows the network notice.
+if (/^(127\.|::1$|localhost$)/.test(bind)) {
+	console.log(
+		"punktfunk web console: this machine only. To reach it from your network, put " +
+			"PUNKTFUNK_UI_BIND=0.0.0.0 in host.env and restart the console.",
+	);
+}
 
 // The plugin-UI origin. Its own port, everything else identical.
 //

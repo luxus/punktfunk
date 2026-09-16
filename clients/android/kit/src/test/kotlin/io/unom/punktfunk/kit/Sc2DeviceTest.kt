@@ -131,9 +131,10 @@ class Sc2DeviceTest {
     }
 
     /**
-     * The two initialization feature reports, byte for byte — the Apple client sends the
-     * identical 64-byte zero-padded frames (`Sc2Device.disableLizard` / its USB
-     * `normalizeJoysticks`), and the firmware accepts the padded form.
+     * Every feature report the capture writes, byte for byte: the two it opens with and the
+     * lizard restore it closes with. The Apple client sends the identical 64-byte zero-padded
+     * frames (`Sc2Device.disableLizard` / its USB `normalizeJoysticks`), and the firmware
+     * accepts the padded form.
      */
     @Test
     fun `feature command bytes verbatim`() {
@@ -150,9 +151,17 @@ class Sc2DeviceTest {
             byteArrayOf(0x01, 0x87.toByte(), 0x03, 0x2E, 0x00, 0x00),
             Sc2Device.NORMALIZE_JOYSTICKS.copyOf(6),
         )
-        // Both are pure padding past the command — a stray byte would be sent to the firmware.
+        // The release frame is the same setting with a non-zero value — the pad goes back to
+        // driving the OS with its kb/mouse the moment the capture lets go.
+        assertEquals(64, Sc2Device.ENABLE_LIZARD.size)
+        assertArrayEquals(
+            byteArrayOf(0x01, 0x87.toByte(), 0x03, 0x09, 0x01, 0x00),
+            Sc2Device.ENABLE_LIZARD.copyOf(6),
+        )
+        // All three are pure padding past the command — a stray byte would reach the firmware.
         assertTrue(Sc2Device.DISABLE_LIZARD.drop(6).all { it == 0.toByte() })
         assertTrue(Sc2Device.NORMALIZE_JOYSTICKS.drop(6).all { it == 0.toByte() })
+        assertTrue(Sc2Device.ENABLE_LIZARD.drop(6).all { it == 0.toByte() })
     }
 
     // ---- BLE framing: the rules Valve's vendor service actually applies, mirrored pair for
@@ -192,6 +201,29 @@ class Sc2DeviceTest {
         val buzzWrite = Sc2Device.outputWrite(buzz)!!
         assertEquals("100f6cb7-1735-4313-b402-38567131e5f3", buzzWrite.charUuid)
         assertArrayEquals(byteArrayOf(0x03, 0x01, 0xFF.toByte()), buzzWrite.payload)
+    }
+
+    @Test
+    fun `a rumble frame lands on the offsets the host reads back`() {
+        // `triton_proto::parse_triton_rumble` reads left.speed at 4 and right.speed at 7 of a
+        // 10-byte frame — the gain byte between them is what makes the two offsets uneven.
+        val frame = Sc2Device.rumbleFrame(0x1234, 0x5678)
+        assertEquals(10, frame.size)
+        assertEquals(0x80, frame[0].toInt() and 0xFF)
+        assertEquals(0x34, frame[4].toInt() and 0xFF)
+        assertEquals(0x12, frame[5].toInt() and 0xFF)
+        assertEquals(0x78, frame[7].toInt() and 0xFF)
+        assertEquals(0x56, frame[8].toInt() and 0xFF)
+        // Zero speeds are the stop frame: same id and intensity, both motors at rest.
+        val stop = Sc2Device.rumbleFrame(0, 0)
+        assertEquals(0x80, stop[0].toInt() and 0xFF)
+        assertArrayEquals(ByteArray(6), stop.copyOfRange(4, 10))
+        // Full length declared, so the BLE leg writes all nine payload bytes to B5.
+        val write = Sc2Device.outputWrite(frame)!!
+        assertEquals("100f6cb5-1735-4313-b402-38567131e5f3", write.charUuid)
+        assertEquals(9, write.payload.size)
+        // And the USB leg coalesces it, because a level supersedes the level before it.
+        assertEquals(OutReportQueue.KEY_RUMBLE, Sc2Device.outputCoalesceKey(frame))
     }
 
     @Test

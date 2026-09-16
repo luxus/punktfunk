@@ -301,6 +301,7 @@ impl VirtualDisplay for WlrootsDisplay {
             // Absolute input aims at this `wl_output.name`; with real heads the
             // HEADLESS-* sits beside them.
             output_name: Some(name),
+            input_output: None,
             seat: None,
             pid: None,
         })
@@ -407,6 +408,203 @@ pub(crate) fn focus_output(name: &str) {
 /// shape logs rather than succeeding silently (`hyprctl` would exit 0).
 fn focus_argv(name: &str) -> [&str; 3] {
     ["focus", "output", name]
+}
+
+/// Windows on output `name`, or on every output when `name` is `None`.
+///
+/// Empty on any failure — this list is never worth an error. The tree already
+/// nests output → workspace → containers, so one read answers the whole shape.
+pub(crate) fn toplevels(name: Option<&str>) -> Vec<crate::toplevels::Toplevel> {
+    match swaymsg_query("get_tree") {
+        Ok(tree) => {
+            let mut out = Vec::new();
+            walk_tree(&tree, name, "", "", &mut out);
+            out
+        }
+        Err(e) => {
+            tracing::debug!(output = ?name, error = %format!("{e:#}"), "wlroots: no window list");
+            Vec::new()
+        }
+    }
+}
+
+/// Descend `get_tree`, collecting leaf containers — on output `want`, or on
+/// every output when it is `None`.
+///
+/// `output`/`workspace` are the names of the enclosing nodes, threaded down —
+/// sway states each only at its own level. A leaf is a `con` with no children:
+/// a split or tabbed container is a `con` too, and holds windows, not pixels.
+fn walk_tree(
+    node: &serde_json::Value,
+    want: Option<&str>,
+    output: &str,
+    workspace: &str,
+    out: &mut Vec<crate::toplevels::Toplevel>,
+) {
+    let kind = node.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    let name = node.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    let (output, workspace) = match kind {
+        "output" => (name, workspace),
+        "workspace" => (output, name),
+        _ => (output, workspace),
+    };
+    let kids: Vec<&serde_json::Value> = ["nodes", "floating_nodes"]
+        .iter()
+        .filter_map(|k| node.get(*k))
+        .filter_map(|v| v.as_array())
+        .flatten()
+        .collect();
+    // A scratchpad window's output is `__i3`, and it is on no screen, so it is
+    // never in a list even when every output is wanted.
+    let on_screen = want.map_or(output != "__i3", |w| output == w);
+    if kids.is_empty() && matches!(kind, "con" | "floating_con") && on_screen {
+        if let Some(id) = node.get("id").and_then(|v| v.as_i64()) {
+            out.push(crate::toplevels::Toplevel {
+                id: id.to_string(),
+                title: name.to_string(),
+                app_id: app_id_of(node),
+                pid: node
+                    .get("pid")
+                    .and_then(|v| v.as_i64())
+                    .and_then(|p| u32::try_from(p).ok()),
+                focused: node
+                    .get("focused")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+                // 0 none, 1 full-screen on its workspace, 2 across outputs.
+                fullscreen: node
+                    .get("fullscreen_mode")
+                    .and_then(|v| v.as_i64())
+                    .is_some_and(|m| m != 0),
+                workspace: workspace.to_string(),
+                output: output.to_string(),
+            });
+        }
+    }
+    for kid in kids {
+        walk_tree(kid, want, output, workspace, out);
+    }
+}
+
+/// `app_id` on a Wayland window; an Xwayland one has none and carries an X11
+/// class instead. Empty when neither is readable.
+fn app_id_of(node: &serde_json::Value) -> String {
+    node.get("app_id")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            node.get("window_properties")
+                .and_then(|p| p.get("class"))
+                .and_then(|v| v.as_str())
+        })
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Carry con `id` onto output `dest`. Best-effort: the game stays where it
+/// opened on a refusal.
+pub(crate) fn move_to_output(id: &str, dest: &str) -> Result<()> {
+    let con: i64 = id
+        .parse()
+        .map_err(|_| anyhow!("window id {id} is not ours"))?;
+    swaymsg(&[&format!("[con_id={con}]"), "move", "to", "output", dest]).map(|_| ())
+}
+
+/// Run one window verb on con `id`.
+///
+/// The id is re-parsed as a number before it reaches a criteria string: the
+/// caller already checked it against the live list, and this keeps anything
+/// else out of `[con_id=…]` whatever a future caller does.
+pub(crate) fn window_action(verb: crate::toplevels::WindowVerb, id: &str) -> Result<()> {
+    use crate::toplevels::WindowVerb;
+    let con: i64 = id
+        .parse()
+        .map_err(|_| anyhow!("window id {id} is not ours"))?;
+    let sel = format!("[con_id={con}]");
+    let argv = match verb {
+        WindowVerb::Focus => vec![sel.as_str(), "focus"],
+        WindowVerb::Fullscreen => vec![sel.as_str(), "fullscreen", "enable"],
+        WindowVerb::Close => vec![sel.as_str(), "kill"],
+    };
+    swaymsg(&argv).map(|_| ())
+}
+
+/// Workspace this launch gets on output `name`, as `(claimed, restore)`.
+///
+/// `want` re-focuses the workspace an earlier session claimed for the same
+/// launch (keep-alive adopt); otherwise [`crate::routing::pick_workspace`]
+/// chooses. `None` when the output shows no numbered workspace or the switch
+/// is refused — the launch then opens where the output already looks.
+pub(crate) fn claim_workspace(name: &str, want: Option<i64>) -> Option<(i64, i64)> {
+    let parsed = swaymsg_query("get_workspaces").ok()?;
+    let restore = visible_workspace(&parsed, name)?;
+    let id = want.unwrap_or_else(|| {
+        crate::routing::pick_workspace(&workspace_slots(&parsed, name), restore)
+    });
+    if id == restore {
+        return Some((id, restore));
+    }
+    match focus_workspace(id) {
+        Ok(()) => Some((id, restore)),
+        Err(e) => {
+            tracing::warn!(
+                workspace = id, output = %name, error = %format!("{e:#}"),
+                "wlroots: workspace switch refused — this launch opens beside whatever the \
+                 streamed output is already showing"
+            );
+            None
+        }
+    }
+}
+
+/// `swaymsg -t get_workspaces` reduced to the pick. sway reports no window
+/// count, so emptiness is `representation` (the layout tree rendering, null on
+/// an empty workspace); anything unreadable reads as occupied, which costs a
+/// free number and never the operator's windows. Unnumbered workspaces
+/// (`num: -1`) are dropped — `workspace number` cannot name one.
+fn workspace_slots(parsed: &serde_json::Value, output: &str) -> Vec<crate::routing::WsSlot> {
+    let Some(arr) = parsed.as_array() else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|w| {
+            let id = w.get("num")?.as_i64().filter(|n| *n >= 1)?;
+            Some(crate::routing::WsSlot {
+                id,
+                on_head: w.get("output").and_then(|o| o.as_str()) == Some(output),
+                empty: w
+                    .get("representation")
+                    .is_some_and(|r| r.is_null() || r.as_str() == Some("")),
+            })
+        })
+        .collect()
+}
+
+/// Numbered workspace `output` is showing — the restore target. `None` when
+/// the output shows a workspace with no number, which `workspace number`
+/// cannot switch back to.
+fn visible_workspace(parsed: &serde_json::Value, output: &str) -> Option<i64> {
+    parsed
+        .as_array()?
+        .iter()
+        .find(|w| {
+            w.get("output").and_then(|o| o.as_str()) == Some(output)
+                && w.get("visible").and_then(|v| v.as_bool()) == Some(true)
+        })?
+        .get("num")?
+        .as_i64()
+        .filter(|n| *n >= 1)
+}
+
+/// Switch to workspace `id`. A number sway does not have yet is created here,
+/// empty, on the focused output.
+pub(crate) fn focus_workspace(id: i64) -> Result<()> {
+    swaymsg(&workspace_argv(&id.to_string())).map(|_| ())
+}
+
+/// `workspace number <n>` — `number` so sway matches the digit, not a
+/// workspace literally named `4`. Split so a test pins the shape.
+fn workspace_argv(n: &str) -> [&str; 3] {
+    ["workspace", "number", n]
 }
 
 /// `topology: primary` has no expression here: Wayland has no primary output, and
@@ -987,6 +1185,93 @@ fn portal_thread(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Real `swaymsg -t get_tree` shape: root → output → workspace → cons, with
+    /// a split container, a floating con, and an Xwayland window.
+    const TREE: &str = r#"{"id":1,"name":"root","type":"root","nodes":[
+      {"id":2,"name":"eDP-1","type":"output","nodes":[
+        {"id":3,"name":"1","type":"workspace","nodes":[
+          {"id":4,"name":"Private call — Ada","type":"con","app_id":"discord",
+           "pid":7,"focused":false,"fullscreen_mode":0}
+        ],"floating_nodes":[]}
+      ],"floating_nodes":[]},
+      {"id":10,"name":"HEADLESS-1","type":"output","nodes":[
+        {"id":11,"name":"3","type":"workspace","nodes":[
+          {"id":12,"name":"split","type":"con","nodes":[
+            {"id":13,"name":"Dota 2","type":"con","pid":4242,"focused":true,
+             "fullscreen_mode":1,"window_properties":{"class":"steam_app_570"}},
+            {"id":14,"name":"kitty","type":"con","app_id":"kitty","pid":50,
+             "focused":false,"fullscreen_mode":0}
+          ],"floating_nodes":[]}
+        ],"floating_nodes":[
+          {"id":15,"name":"Steam - News","type":"floating_con","app_id":"steam",
+           "pid":99,"focused":false,"fullscreen_mode":0}
+        ]}
+      ],"floating_nodes":[]}
+    ],"floating_nodes":[]}"#;
+
+    /// Only the streamed output's leaves leave the walk: the split container is
+    /// not a window, and the operator's own head carries titles a guest must
+    /// never be handed.
+    #[test]
+    fn a_window_list_holds_the_streamed_output_and_nothing_else() {
+        let tree: serde_json::Value = serde_json::from_str(TREE).unwrap();
+        let mut out = Vec::new();
+        walk_tree(&tree, Some("HEADLESS-1"), "", "", &mut out);
+        assert_eq!(
+            out.iter().map(|w| w.id.as_str()).collect::<Vec<_>>(),
+            ["13", "14", "15"],
+            "three leaves; the split con holds windows, it is not one"
+        );
+        let game = &out[0];
+        assert_eq!(game.title, "Dota 2");
+        // Xwayland: no `app_id`, so the X11 class stands in.
+        assert_eq!(game.app_id, "steam_app_570");
+        assert_eq!(game.pid, Some(4242));
+        assert_eq!(game.workspace, "3");
+        assert_eq!(game.output, "HEADLESS-1");
+        assert!(game.focused);
+        assert!(game.fullscreen);
+        assert_eq!(out[2].app_id, "steam", "a floating con is still a window");
+        assert!(!out.iter().any(|w| w.title.contains("Private")));
+    }
+
+    /// A criteria string only ever carries a number, whatever it is handed.
+    #[test]
+    fn a_window_verb_refuses_an_id_that_is_not_a_con_number() {
+        use crate::toplevels::WindowVerb;
+        assert!(window_action(WindowVerb::Close, "12] kill; [con_id=99").is_err());
+        assert!(window_action(WindowVerb::Focus, "").is_err());
+    }
+
+    /// Real `swaymsg -t get_workspaces` shape, trimmed to the fields read here.
+    const WORKSPACES: &str = r#"[
+      {"num":1,"name":"1","output":"eDP-1","visible":true,"focused":true,
+       "representation":"H[firefox kitty]"},
+      {"num":2,"name":"2","output":"eDP-1","visible":false,"representation":null},
+      {"num":3,"name":"3","output":"HEADLESS-1","visible":true,"representation":"H[steam]"},
+      {"num":-1,"name":"scratch","output":"HEADLESS-1","visible":false,"representation":null}
+    ]"#;
+
+    /// The streamed output's own workspaces decide, and an unnumbered one is
+    /// never the answer — `workspace number` cannot name it.
+    #[test]
+    fn a_launch_lands_on_an_empty_workspace_of_the_streamed_output() {
+        let parsed: serde_json::Value = serde_json::from_str(WORKSPACES).unwrap();
+        assert_eq!(visible_workspace(&parsed, "HEADLESS-1"), Some(3));
+        let slots = workspace_slots(&parsed, "HEADLESS-1");
+        // Only 3 is ours and it holds the last game: the next free number.
+        assert_eq!(crate::routing::pick_workspace(&slots, 3), 4);
+        // The operator's own head already has an empty 2.
+        let slots = workspace_slots(&parsed, "eDP-1");
+        assert_eq!(crate::routing::pick_workspace(&slots, 1), 2);
+    }
+
+    /// `number` keeps sway matching the digit, not a workspace named `4`.
+    #[test]
+    fn a_workspace_switch_names_the_number() {
+        assert_eq!(workspace_argv("4"), ["workspace", "number", "4"]);
+    }
 
     /// `focus output <name>` — noun second. `output focus <name>` is rejected, and
     /// the only symptom is apps opening on the operator's monitor.

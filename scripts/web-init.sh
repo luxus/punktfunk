@@ -3,7 +3,9 @@
 #
 #   1. generate the login password once, in the streaming user's config dir, and surface it to
 #      the journal;
-#   2. wait for the host's first-run artifacts, so the console is not started before the files it
+#   2. name the console's bind in host.env once, so the default can change without taking a
+#      running install's console off the LAN with it;
+#   3. wait for the host's first-run artifacts, so the console is not started before the files it
 #      cannot start without exist.
 #
 # The mgmt token is NOT created here — the host owns it (~/.config/punktfunk/mgmt-token); this
@@ -16,7 +18,13 @@ DIR="${XDG_CONFIG_HOME:-$HOME/.config}/punktfunk"
 mkdir -p "$DIR"
 chmod 700 "$DIR" 2>/dev/null || true
 PWFILE="$DIR/web-password"
+# Captured BEFORE the password is generated below: this file is what tells a first start apart
+# from an upgrade, and generating it would erase the answer.
+[ -s "$PWFILE" ] && CONSOLE_RAN_HERE=1 || CONSOLE_RAN_HERE=0
 
+# The generated password is written in clear and read back ONCE. The console salts and hashes it
+# the first time it signs someone in and rewrites this file with the hash alone, so the window to
+# read it is between this line and that sign-in; after it, a forgotten password is reset, not read.
 if [ ! -s "$PWFILE" ]; then
     # URL/shell-safe password (no /+= so it's a clean EnvironmentFile value).
     PW=$(head -c 18 /dev/urandom | base64 | tr -d '/+=' | cut -c1-20)
@@ -25,12 +33,33 @@ if [ ! -s "$PWFILE" ]; then
     # Do NOT echo the password itself. Anything this script prints is captured by systemd into
     # the PERSISTENT journal, which on Debian/Ubuntu is readable by the `adm` and
     # `systemd-journal` groups — so printing it published a 0600 secret to every member of them,
-    # permanently, and the .deb postinst then documented `journalctl` as the way to read it
-    # (2026-08-05 review L-18). Point at the file instead: it is the same one command, it is
-    # correctly 0600, and it stays readable only by the user who owns the console.
+    # permanently. Point at the file instead: it is correctly 0600, and it stays readable only by
+    # the user who owns the console.
     echo "punktfunk web console login password generated."
-    echo "Read it with:  cut -d= -f2- $PWFILE"
-    echo "(then open https://<host-ip>:47992 and log in)"
+    echo "Read it NOW, before your first sign-in:  sed -n 's/^PUNKTFUNK_UI_PASSWORD=//p' $PWFILE"
+    echo "(then open https://<host-ip>:47992 and log in — the console stores a hash after that)"
+fi
+
+# ------------------------------------------------------------------------- name the bind, once
+#
+# The console binds loopback unless PUNKTFUNK_UI_BIND says otherwise, and until 0.38 it bound
+# 0.0.0.0 with no way to say so. An upgrade that just took the new default would drop every
+# console its operator reaches from another device, silently and with nothing to read. So write
+# the line the box is already living by: 0.0.0.0 where a console has run here before, loopback on
+# a first start. Once the line exists this never runs again, and the operator owns the value.
+#
+# Runs before punktfunk-web.service reads host.env as an EnvironmentFile — that ordering is what
+# punktfunk-web-init.service is for.
+HOST_ENV="$DIR/host.env"
+if ! grep -q '^[[:space:]]*PUNKTFUNK_UI_BIND=' "$HOST_ENV" 2>/dev/null; then
+    if [ "$CONSOLE_RAN_HERE" = 1 ]; then
+        printf '\n# Where the web console listens. This box ran a console that answered on every\n# interface, so that is preserved here. 127.0.0.1 keeps it to this machine.\nPUNKTFUNK_UI_BIND=0.0.0.0\n' >> "$HOST_ENV"
+        echo "host.env: kept this console on your network (PUNKTFUNK_UI_BIND=0.0.0.0)."
+        echo "To reach it from this machine only, set PUNKTFUNK_UI_BIND=127.0.0.1 there and restart punktfunk-web."
+    else
+        printf '\n# Where the web console listens: 127.0.0.1 (this machine), 0.0.0.0 (your network),\n# or one address, e.g. a VPN interface.\nPUNKTFUNK_UI_BIND=127.0.0.1\n' >> "$HOST_ENV"
+        echo "host.env: the web console answers on this machine only (PUNKTFUNK_UI_BIND=127.0.0.1)."
+    fi
 fi
 
 # ---------------------------------------------------------------- wait for the host's first run

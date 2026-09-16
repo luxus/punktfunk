@@ -1618,6 +1618,26 @@ pub fn show_scoped(
         );
     });
 
+    // ---- Storage ----
+    let clear_art_row = adw::ActionRow::builder()
+        .title("Clear cached art")
+        .subtitle("Posters are kept on this device so a library opens before the host answers")
+        .activatable(true)
+        .build();
+    clear_art_row.add_suffix(&crate::lucide::row_icon("trash-2"));
+    {
+        let dialog = dialog.downgrade();
+        clear_art_row.connect_activated(move |_| {
+            let toast = match pf_client_core::art_cache::clear() {
+                Ok(()) => "Cached art cleared".to_string(),
+                Err(e) => format!("Couldn't clear the cached art — {e}"),
+            };
+            if let Some(d) = dialog.upgrade() {
+                d.add_toast(adw::Toast::new(&toast));
+            }
+        });
+    }
+
     // ---- Input ----
     let touch_row = ChoiceRow::new(
         &dialog,
@@ -2348,6 +2368,13 @@ pub fn show_scoped(
     stats_group.add(&stats_docs_row);
     general.add(&session_group);
     general.add(&stats_group);
+    // Device-level like auto-wake: what this machine keeps on its own disk is never a
+    // property of a preset.
+    if !preset_mode {
+        let storage_group = group("Storage", "");
+        storage_group.add(&clear_art_row);
+        general.add(&storage_group);
+    }
 
     let display = page("Display", "video-display-symbolic");
     let resolution_group = group("Resolution", "");

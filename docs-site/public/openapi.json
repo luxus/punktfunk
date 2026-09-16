@@ -1439,7 +1439,7 @@
           "session"
         ],
         "summary": "End waiting games",
-        "description": "Ends games waiting out the reconnect window. Does not touch a live session\n(`DELETE /session` plus `game_on_session_end`).",
+        "description": "Ends games waiting out the reconnect window. With `streaming` and an\n`app_id`, also ends that title where it is still on a live session — the\nmove a player has after a launch that never produced a game. The session\nitself stays up (`DELETE /session` plus `game_on_session_end`).",
         "operationId": "endGame",
         "requestBody": {
           "content": {
@@ -1765,7 +1765,7 @@
           "library"
         ],
         "summary": "List every title this host knows, sorted by title.",
-        "description": "Plugin-synced entries plus custom ones. Local-file art is rewritten to this API's art\nproxy; remote URLs pass through. `?provider=` / `?platform=` (case-insensitive) narrow.\n\nThe operator lane sees hidden titles (`hidden: true`) so the console can un-hide them.\nEvery other lane is filtered upstream and cannot tell they exist.",
+        "description": "Plugin-synced entries plus custom ones. Art the host can serve is rewritten to this API's\nart proxy, local paths and remote URLs alike; a URL the proxy already refused passes\nthrough. `?provider=` / `?platform=` (case-insensitive) narrow.\n\nThe operator lane sees hidden titles (`hidden: true`) so the console can un-hide them.\nEvery other lane is filtered upstream and cannot tell they exist.",
         "operationId": "getLibrary",
         "parameters": [
           {
@@ -1820,7 +1820,7 @@
           "library"
         ],
         "summary": "Stream one cover-art image for a library entry.",
-        "description": "Resolves `kind` (`portrait` | `hero` | `logo` | `header`) for a catalog id and returns\nthe local file bytes. Unknown id or kind is 404 so the client can try the next candidate.\nRemote `http(s)` art is fetched by the client; this proxy exists for launcher cover\ncaches on the host disk.",
+        "description": "Resolves `kind` (`portrait` | `hero` | `logo` | `header`) for a catalog id and returns the\nbytes: a launcher's cover cache on the host disk, or a remote URL the host fetches once on\nthe first miss and then serves from its own store. Unknown id or kind is 404 so the client\ncan try the next candidate, and so is a URL the fetch refused — `GET /library` advertises\nthat one verbatim again. The response carries `Cache-Control` and an `ETag` of the bytes; a\nrequest whose `If-None-Match` names that tag gets 304 with no body.",
         "operationId": "getLibraryArt",
         "parameters": [
           {
@@ -1840,6 +1840,18 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "If-None-Match",
+            "in": "header",
+            "description": "An `ETag` from an earlier response",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
           }
         ],
         "responses": {
@@ -1848,6 +1860,9 @@
             "content": {
               "image/jpeg": {}
             }
+          },
+          "304": {
+            "description": "The tag in `If-None-Match` is current"
           },
           "401": {
             "description": "Missing or invalid credentials",
@@ -3557,6 +3572,38 @@
         }
       }
     },
+    "/api/v1/session/last": {
+      "get": {
+        "tags": [
+          "session"
+        ],
+        "summary": "Recently finished sessions",
+        "description": "What each session came to — mode, codec, bitrate, frames, bring-up, and why it ended\n— newest first, at most the last eight. This is the whole of what the host knows, so\nthe answer is what a bug report should carry.\n\nA host that has not streamed since it started answers with an empty list.",
+        "operationId": "getRecentSessions",
+        "responses": {
+          "200": {
+            "description": "Finished sessions, newest first; empty if none",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecentSessions"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/session/settings": {
       "get": {
         "tags": [
@@ -3636,6 +3683,444 @@
           },
           "500": {
             "description": "Settings could not be persisted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/session/{id}": {
+      "delete": {
+        "tags": [
+          "session"
+        ],
+        "summary": "Stop one session",
+        "description": "Same deliberate stop as `DELETE /session`, for the one id. Every other live\nsession keeps streaming.",
+        "operationId": "stopOneSession",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Session id from `GET /status`",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Session stopped"
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No live session with that id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/session/{id}/access": {
+      "put": {
+        "tags": [
+          "session"
+        ],
+        "summary": "Change one session's access level",
+        "description": "Re-points the LIVE grant set — the mask the input thread already checks every\nevent against — so a guest gets the pad, or loses it, without reconnecting.\nThe pairing's stored access is untouched, and a later edit to it wins.\n\nThe ceiling is the pairing's own mask: what is asked for is ANDed with it, so this\nroute can narrow or restore, never grant a device something it was not paired for.\nThe applied mask comes back, which is how a caller sees the clamp.",
+        "operationId": "setSessionAccess",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Session id from `GET /status`",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionAccessRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Applied mask, after the pairing clamp",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionAccess"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "No level or grants, an unknown level, or reserved bits",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No live session with that id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/session/{id}/audio": {
+      "put": {
+        "tags": [
+          "session"
+        ],
+        "summary": "Mute or unmute one session",
+        "description": "Drops this session's audio at the wire, nothing else: the capturer and the sink\nstay up, so a session sharing the display keeps hearing. The client is told, so\nits overlay can name the silence instead of the player guessing.",
+        "operationId": "setSessionAudio",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Session id from `GET /status`",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionAudioRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Applied"
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No live session with that id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/session/{id}/idr": {
+      "post": {
+        "tags": [
+          "session"
+        ],
+        "summary": "Request a keyframe on one session",
+        "operationId": "requestSessionIdr",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Session id from `GET /status`",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Keyframe requested"
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No live session with that id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/session/{id}/pads": {
+      "get": {
+        "tags": [
+          "session"
+        ],
+        "summary": "Watch this session's pads (SSE)",
+        "description": "One frame per pad state the host applies — what it injects, not what the client\nsays it sent — so a controller question is answered from the host's own hand\ninstead of an evdev dump. `data:` is a [`PadFrame`]; `event:` is `pad.state`.\nAttaching replays every live pad, so a button already held draws at once.\n\nConsole lane only, like the window routes: a paired certificate is not bound to\na session id, and this is the operator's own machine watching its own input.\n\nNothing is published while nobody is attached, so a console on another page —\nor none at all — costs the input thread one atomic load per pad event.",
+        "operationId": "streamSessionPads",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Session id from `GET /status`",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "SSE stream; each frame's `data:` is one PadFrame",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "$ref": "#/components/schemas/PadFrame"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No live session with that id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Concurrent event-stream cap reached — retry shortly",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/session/{id}/windows": {
+      "get": {
+        "tags": [
+          "session"
+        ],
+        "summary": "List this session's windows",
+        "description": "The toplevels on the head this session streams, so a client in a full-screen\ngame can see what is behind it. Free to every session: those windows are\nalready in the pixels it receives. The operator's other monitors are not in\nthe payload, whatever the caller's access.",
+        "operationId": "getSessionWindows",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Session id from `GET /status`",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Windows on this session's head",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Toplevel"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No live session with that id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/session/{id}/windows/{window}": {
+      "post": {
+        "tags": [
+          "session"
+        ],
+        "summary": "Act on one of this session's windows",
+        "description": "Focus, full-screen or close by id, gated on the session's LIVE grants — the\nsame mask the input thread checks every event against. A view-only guest is\nrefused all three; a controller-only guest raises a window but never closes\none. An id this session's head does not currently hold is a 404, so a stale\nid cannot act on whatever now answers to it.",
+        "operationId": "actOnSessionWindow",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Session id from `GET /status`",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "window",
+            "in": "path",
+            "description": "Window id from `GET /session/{id}/windows`",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WindowActionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "The compositor accepted the verb"
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "This session's access does not cover the verb",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such session, or no such window on its head",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The compositor refused the verb",
             "content": {
               "application/json": {
                 "schema": {
@@ -4871,12 +5356,9 @@
             "description": "`native` or `gamestream`."
           },
           "session_id": {
-            "type": [
-              "integer",
-              "null"
-            ],
+            "type": "integer",
             "format": "int64",
-            "description": "Streaming session; `null` while waiting out the reconnect window.",
+            "description": "Streaming session; `null` while waiting out the reconnect window. Pass it to\n`DELETE /session/{id}` to stop that one session.",
             "minimum": 0
           },
           "state": {
@@ -5290,6 +5772,47 @@
           }
         }
       },
+      "AudioEgress": {
+        "type": "object",
+        "description": "Audio egress for the whole session. Absent when the session had no audio plane.",
+        "required": [
+          "sent",
+          "infilled",
+          "late",
+          "max_late_ms",
+          "reanchors"
+        ],
+        "properties": {
+          "infilled": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Frames synthesized over a capture hole. Wire continuity is not captured continuity.",
+            "minimum": 0
+          },
+          "late": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Departures a whole frame or more behind their slot.",
+            "minimum": 0
+          },
+          "max_late_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "reanchors": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Times the pacer fell far enough behind to forgive its debt and re-anchor.",
+            "minimum": 0
+          },
+          "sent": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
       "AudioWiring": {
         "type": "object",
         "description": "Windows audio wiring: which endpoint carries each role. Names are the Sound-settings friendly names.",
@@ -5359,6 +5882,40 @@
           },
           "label": {
             "type": "string"
+          }
+        }
+      },
+      "BitrateSpan": {
+        "type": "object",
+        "description": "What the encoder's target did over the session. Absent when no encoder opened.",
+        "required": [
+          "min_kbps",
+          "avg_kbps",
+          "max_kbps",
+          "adaptive_steps"
+        ],
+        "properties": {
+          "adaptive_steps": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Times the target moved after the opening rate: adaptive-bitrate decisions, plus a\nrebuild re-resolving what it actually encodes.",
+            "minimum": 0
+          },
+          "avg_kbps": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Mean of the targets the session ran at, NOT weighted by how long each held.\nA rate held for a second counts as much as one held for an hour.",
+            "minimum": 0
+          },
+          "max_kbps": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "min_kbps": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
           }
         }
       },
@@ -6022,6 +6579,10 @@
                   }
                 ]
               },
+              "on_window": {
+                "$ref": "#/components/schemas/OnWindow",
+                "description": "Which workspace this title opens on ([`crate::library::OnWindow`]).\nAbsent follows the host's display policy."
+              },
               "prep": {
                 "type": "array",
                 "items": {
@@ -6094,6 +6655,17 @@
                   },
                   {
                     "$ref": "#/components/schemas/LaunchSpec"
+                  }
+                ]
+              },
+              "on_window": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/OnWindow",
+                    "description": "Absent on an update keeps the stored placement, as with `prep`."
                   }
                 ]
               },
@@ -6370,6 +6942,10 @@
             },
             "description": "Connectors that stay lit while streaming, even under `exclusive`\n(`design/web-console-overhaul.md` §5.5).\n\nThe shared-desktop case the all-or-nothing topology axis cannot express: the\ncouch TV streams on the sole screen while the desk monitor stays usable. Only\nmeaningful under `exclusive` — nothing else turns a monitor off."
           },
+          "launch_workspace": {
+            "$ref": "#/components/schemas/WorkspacePlacement",
+            "description": "Default for a launch whose library entry names no `on_window.workspace`.\nOrthogonal to `preset`; `#[serde(default)]` is `own`, so an older\n`display-settings.json` opts in with the rest."
+          },
           "layout": {
             "$ref": "#/components/schemas/Layout"
           },
@@ -6521,6 +7097,10 @@
               "null"
             ],
             "description": "Store-qualified id (`steam:570`); omit to end every waiting game."
+          },
+          "streaming": {
+            "type": "boolean",
+            "description": "Also end `app_id` where it is on a live session, not only where it is\nwaiting out a reconnect window. Ignored without `app_id`."
           }
         }
       },
@@ -6620,6 +7200,7 @@
             "type": "object",
             "required": [
               "session",
+              "summary",
               "kind"
             ],
             "properties": {
@@ -6631,6 +7212,10 @@
               },
               "session": {
                 "$ref": "#/components/schemas/SessionRef"
+              },
+              "summary": {
+                "$ref": "#/components/schemas/SessionSummary",
+                "description": "Every number the host has for the finished session, including why it ended."
               }
             }
           },
@@ -6686,6 +7271,35 @@
                 "enum": [
                   "game.running"
                 ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Fires when the game's own window reaches the screen, which is often far\nlater than its process: a Proton prefix build, a splash on a black\nwindow, an emulator loading a ROM.",
+            "required": [
+              "game",
+              "title",
+              "app_id",
+              "kind"
+            ],
+            "properties": {
+              "app_id": {
+                "type": "string",
+                "description": "Wayland `app_id`, or the X11 class on an Xwayland window."
+              },
+              "game": {
+                "$ref": "#/components/schemas/GameRefPayload"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "game.window"
+                ]
+              },
+              "title": {
+                "type": "string",
+                "description": "Title the compositor reports for that window."
               }
             }
           },
@@ -7122,6 +7736,10 @@
                   }
                 ]
               },
+              "on_window": {
+                "$ref": "#/components/schemas/OnWindow",
+                "description": "Which workspace this title's windows open on, where the compositor can\nplace them ([`OnWindow`])."
+              },
               "provider": {
                 "type": [
                   "string",
@@ -7393,6 +8011,27 @@
                 "$ref": "#/components/schemas/ApiSelectedGpu"
               }
             ]
+          }
+        }
+      },
+      "GyroCadence": {
+        "type": "object",
+        "description": "Client gyro arrival counts. Absent when no pad ever sent motion.",
+        "required": [
+          "samples",
+          "stalls"
+        ],
+        "properties": {
+          "samples": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "stalls": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Gaps of 500 ms or more — the feed stopping, not jitter.",
+            "minimum": 0
           }
         }
       },
@@ -7788,6 +8427,42 @@
           "per-client",
           "per-client-mode"
         ]
+      },
+      "InputCounts": {
+        "type": "object",
+        "description": "Client datagrams this session took, by class.\n\nCounted up to the moment the session was summarized: the reader task ends with the\nconnection, which closes after this, so a last straggler can fall outside.",
+        "required": [
+          "events",
+          "mic",
+          "rich",
+          "dropped"
+        ],
+        "properties": {
+          "dropped": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Offers the input queue refused because it was full. Not a wire loss.",
+            "minimum": 0
+          },
+          "events": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Keyboard, pointer and touch events.",
+            "minimum": 0
+          },
+          "mic": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Opus microphone frames.",
+            "minimum": 0
+          },
+          "rich": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Gamepad and stylus batches.",
+            "minimum": 0
+          }
+        }
       },
       "InstallRequest": {
         "type": "object",
@@ -8352,6 +9027,43 @@
           }
         }
       },
+      "OnWindow": {
+        "type": "object",
+        "description": "Per-entry window placement, applied once when the game's own window first\nreaches the screen. Absent keys take the defaults below; `workspace` alone\nfalls back to the host's `launch_workspace` display policy.",
+        "properties": {
+          "focus": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Raise it. Default on: the player launched it, so it is what they want\nin front — a launcher that steals focus back leaves them on the desk."
+          },
+          "fullscreen": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Make it full-screen. Default off: most games set their own mode, and\nforcing it fights a title that wanted a window."
+          },
+          "move_to_stream_output": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Move it onto the streamed head if it opened elsewhere. Default on: a\ngame the player cannot see is the whole failure this stage exists for."
+          },
+          "workspace": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/WorkspacePlacement"
+              }
+            ]
+          }
+        }
+      },
       "OperatorGameEntry": {
         "allOf": [
           {
@@ -8368,6 +9080,90 @@
           }
         ],
         "description": "A library entry plus the operator's view of it — whether they hid it.\n\nA field on [`GameEntry`] would leak onto every lane: `GET /library` returns\n`Vec<GameEntry>` except on the operator's lane, so a hidden flag cannot\nreach a paired client. `flatten` keeps the wire a plain entry plus one key."
+      },
+      "PadFrame": {
+        "type": "object",
+        "description": "One pad's whole state as the host holds it — the `data:` of one SSE frame.\n\nWhole state, not a delta: a page that attaches mid-press draws what is held without\nreplaying history, and the console derives its event log by diffing consecutive frames.",
+        "required": [
+          "pad",
+          "ts_ms",
+          "device",
+          "present",
+          "buttons",
+          "left_trigger",
+          "right_trigger",
+          "ls_x",
+          "ls_y",
+          "rs_x",
+          "rs_y"
+        ],
+        "properties": {
+          "buttons": {
+            "type": "integer",
+            "format": "int32",
+            "description": "`punktfunk_core::input::gamepad::BTN_*` mask, as applied.",
+            "minimum": 0
+          },
+          "declared": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "What the client declared at arrival, when it declared one. Differs from `device`\nwhere the build cannot construct that kind and folded it into one it can."
+          },
+          "device": {
+            "type": "string",
+            "description": "The virtual controller the host built: `xbox360`, `dualsense`, `steamdeck`, …"
+          },
+          "left_trigger": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "ls_x": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "ls_y": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "pad": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Wire index — the number this client gave the pad.",
+            "minimum": 0
+          },
+          "present": {
+            "type": "boolean",
+            "description": "`false` is the unplug frame: the host holds no device at this index any more."
+          },
+          "right_trigger": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "rs_x": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "rs_y": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "slot": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Host-wide OS slot — the identity every per-pad host resource is named by\n(mailbox, `SwDeviceCreate` instance, pairing MAC). Absent before the first\nframe builds the device.",
+            "minimum": 0
+          },
+          "ts_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix milliseconds ([`crate::events::HostEvent`] convention).",
+            "minimum": 0
+          }
+        }
       },
       "PairedClient": {
         "type": "object",
@@ -8864,6 +9660,10 @@
                   }
                 ]
               },
+              "on_window": {
+                "$ref": "#/components/schemas/OnWindow",
+                "description": "Which workspace the title opens on; absent follows the host's display policy."
+              },
               "prep": {
                 "type": "array",
                 "items": {
@@ -8929,6 +9729,21 @@
               "$ref": "#/components/schemas/RunningTitle"
             },
             "description": "Complete running set, not a delta: anything absent is reported as stopped."
+          }
+        }
+      },
+      "RecentSessions": {
+        "type": "object",
+        "required": [
+          "sessions"
+        ],
+        "properties": {
+          "sessions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SessionSummary"
+            },
+            "description": "Newest first. Bounded in memory and lost on a host restart — this is the last\nfew sessions, not a history."
           }
         }
       },
@@ -9039,13 +9854,14 @@
           "paired_clients",
           "native_paired_clients",
           "active_sessions",
+          "sessions",
           "games"
         ],
         "properties": {
           "active_sessions": {
             "type": "integer",
             "format": "int32",
-            "description": "Live sessions on both planes. Native admits concurrent sessions so this can exceed 1;\n`session`/`stream` are one representative.",
+            "description": "Live sessions on both planes. Native admits concurrent sessions so this can exceed 1;\n`session`/`stream` are one representative and `sessions` is the list.",
             "minimum": 0
           },
           "audio": {
@@ -9103,9 +9919,22 @@
               },
               {
                 "$ref": "#/components/schemas/SessionInfo",
-                "description": "GameStream launch if present, else the first live native session. `null` when idle."
+                "description": "GameStream launch if present, else the first live native session. `null` when idle.\n`session_id` says which row of `sessions` this is."
               }
             ]
+          },
+          "session_id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Which `sessions` row `session`/`stream` describe. `null` when idle, or when the\nrepresentative is the GameStream stream (the compat plane has no id).",
+            "minimum": 0
+          },
+          "sessions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SessionRow"
+            },
+            "description": "Every live session, one row each — what the per-session routes take an id from."
           },
           "stream": {
             "oneOf": [
@@ -9114,7 +9943,7 @@
               },
               {
                 "$ref": "#/components/schemas/StreamInfo",
-                "description": "Active stream parameters. `null` when idle."
+                "description": "Active stream parameters of that same session. `null` when idle."
               }
             ]
           },
@@ -9214,6 +10043,69 @@
           }
         }
       },
+      "SessionAccess": {
+        "type": "object",
+        "required": [
+          "grants",
+          "level"
+        ],
+        "properties": {
+          "grants": {
+            "type": "integer",
+            "format": "int32",
+            "description": "What now governs the session — the request ANDed with the pairing's mask.",
+            "minimum": 0
+          },
+          "level": {
+            "type": "string",
+            "description": "`full` | `controller` | `view` | `custom`, derived from `grants`."
+          }
+        }
+      },
+      "SessionAccessRequest": {
+        "type": "object",
+        "properties": {
+          "grants": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Exact `GRANT_*` mask, for a level the three names do not cover. Reserved bits are 400.",
+            "example": 1,
+            "minimum": 0
+          },
+          "level": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`full` | `controller` | `view`. Ignored when `grants` is present.",
+            "example": "controller"
+          }
+        }
+      },
+      "SessionAudioRequest": {
+        "type": "object",
+        "required": [
+          "muted"
+        ],
+        "properties": {
+          "muted": {
+            "type": "boolean",
+            "description": "`true` stops audio leaving for this session."
+          }
+        }
+      },
+      "SessionEndReason": {
+        "type": "string",
+        "description": "Why a session ended, in the client's own words\n([`punktfunk_core::client::PunktfunkEndReason`]) so both ends name the same end the\nsame way. The bytes match that ABI where the two overlap.\n\n[`Self::StoppedByOperator`] is the one a client cannot see: the host closes it as\ncode 0, which every client reads as `host_ended`.",
+        "enum": [
+          "local",
+          "game_exited",
+          "host_ended",
+          "host_error",
+          "lost",
+          "stopped_by_operator"
+        ]
+      },
       "SessionInfo": {
         "type": "object",
         "required": [
@@ -9278,6 +10170,70 @@
           }
         }
       },
+      "SessionRow": {
+        "type": "object",
+        "description": "One live session as the Dashboard lists it: who, where, since when, and the state\nthe per-session routes change.",
+        "required": [
+          "plane",
+          "client",
+          "mode",
+          "hdr",
+          "join",
+          "muted",
+          "uptime_s"
+        ],
+        "properties": {
+          "access_level": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`full` | `controller` | `view` | `custom`, live — not the pairing's stored level.\n`null` on the compat plane, which is ungoverned."
+          },
+          "client": {
+            "type": "string",
+            "description": "Fingerprint prefix, or peer IP for an anonymous client."
+          },
+          "client_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Display name (trust store, else the name the client sent). `null` if nameless."
+          },
+          "hdr": {
+            "type": "boolean"
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Pass to `DELETE /session/{id}` and friends. `null` on the compat plane, which\nhas no per-session handle — stop it with the host-wide `DELETE /session`.",
+            "minimum": 0
+          },
+          "join": {
+            "type": "boolean",
+            "description": "Sharing another session's display rather than owning one. Which session it joined\nis not reported yet — the two registries do not share ids (issue #1095)."
+          },
+          "mode": {
+            "type": "string",
+            "description": "`WxH@Hz`.",
+            "example": "3840x2160@120"
+          },
+          "muted": {
+            "type": "boolean",
+            "description": "Audio is held back for this session alone (`PUT /session/{id}/audio`)."
+          },
+          "plane": {
+            "$ref": "#/components/schemas/Plane"
+          },
+          "uptime_s": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Seconds since the stream started.",
+            "minimum": 0
+          }
+        }
+      },
       "SessionSettings": {
         "type": "object",
         "properties": {
@@ -9324,6 +10280,149 @@
           },
           "settings": {
             "$ref": "#/components/schemas/SessionSettings"
+          }
+        }
+      },
+      "SessionSummary": {
+        "type": "object",
+        "description": "Everything the host knows about one finished session.\n\nThe `session.ended` payload AND the body of `GET /api/v1/session/last`: one struct,\nso a screenshot of the console card is the API answer a bug report would have carried.\nA number the host does not accumulate per session is absent rather than zero.",
+        "required": [
+          "id",
+          "client",
+          "started_unix",
+          "duration_s",
+          "mode",
+          "hdr",
+          "join",
+          "codec",
+          "bit_depth",
+          "chroma",
+          "bitrate_kbps",
+          "input",
+          "bringup_ms",
+          "ended"
+        ],
+        "properties": {
+          "audio": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AudioEgress",
+                "description": "Absent when the session ran no audio plane (synthetic source, or the thread never started)."
+              }
+            ]
+          },
+          "bit_depth": {
+            "type": "integer",
+            "format": "int32",
+            "description": "8 or 10. Independent of `hdr` — 10-bit SDR is a mode.",
+            "minimum": 0
+          },
+          "bitrate": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/BitrateSpan",
+                "description": "What the encoder's target did. Absent on a session that opened no encoder."
+              }
+            ]
+          },
+          "bitrate_kbps": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The encoder's target when the session ended, kbps. `bitrate` has the span.",
+            "minimum": 0
+          },
+          "bringup_ms": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Hello → first video packet, ms. `0` if no packet ever left.",
+            "minimum": 0
+          },
+          "chroma": {
+            "type": "string",
+            "description": "`4:2:0` or `4:4:4`."
+          },
+          "client": {
+            "type": "string",
+            "description": "Cert-fingerprint prefix, or peer IP for an anonymous client."
+          },
+          "client_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Display name (trust store, else the name the client sent). Absent if nameless."
+          },
+          "codec": {
+            "type": "string",
+            "description": "`h264` | `hevc` | `av1` | `pyrowave`."
+          },
+          "duration_s": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "ended": {
+            "$ref": "#/components/schemas/SessionEndReason"
+          },
+          "frames_dropped": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Frames the capturer's encode pool refused. Absent on a capturer that does not\ncount them (everything but the Windows IDD push path).",
+            "minimum": 0
+          },
+          "frames_sent": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Access units the send thread put on the wire. Absent when the video loop\nnever reached its tail — the `host_error` case.",
+            "minimum": 0
+          },
+          "gyro": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/GyroCadence",
+                "description": "Absent when no pad sent motion — most sessions."
+              }
+            ]
+          },
+          "hdr": {
+            "type": "boolean"
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Same id [`SessionRef`] and the per-session routes carry.",
+            "minimum": 0
+          },
+          "input": {
+            "$ref": "#/components/schemas/InputCounts"
+          },
+          "join": {
+            "type": "boolean",
+            "description": "Shared another session's display at ITS mode instead of owning one."
+          },
+          "mode": {
+            "type": "string",
+            "description": "`WxH@Hz` as last delivered; a mid-session mode switch moves it."
+          },
+          "path_mtu": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Path MTU the QUIC stack settled on, bytes. Absent as `frames_sent` is.",
+            "minimum": 0
+          },
+          "started_unix": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Host wall clock at stream start, unix seconds."
           }
         }
       },
@@ -9784,6 +10883,52 @@
           }
         }
       },
+      "Toplevel": {
+        "type": "object",
+        "description": "One compositor toplevel, as every backend reports it.\n\n`id` is the backend's own handle (a Hyprland address, a sway con id) and is\nopaque above this module: it goes back to the backend that minted it and\nnowhere else. Defined on every platform — the management route and its\nschema exist on a Windows host too, which simply lists nothing.",
+        "required": [
+          "id",
+          "title",
+          "app_id",
+          "focused",
+          "fullscreen",
+          "workspace",
+          "output"
+        ],
+        "properties": {
+          "app_id": {
+            "type": "string",
+            "description": "Wayland `app_id`, or the X11 class on an Xwayland window."
+          },
+          "focused": {
+            "type": "boolean"
+          },
+          "fullscreen": {
+            "type": "boolean"
+          },
+          "id": {
+            "type": "string",
+            "description": "Backend handle. Never parsed above the backend, never reused across one."
+          },
+          "output": {
+            "type": "string",
+            "description": "The head this window is on — always the streamed one, by construction."
+          },
+          "pid": {
+            "type": "integer",
+            "format": "int32",
+            "description": "`None` where the compositor does not report one (some Xwayland cons).",
+            "minimum": 0
+          },
+          "title": {
+            "type": "string"
+          },
+          "workspace": {
+            "type": "string",
+            "description": "Workspace name as the compositor spells it, not its id."
+          }
+        }
+      },
       "Topology": {
         "type": "string",
         "description": "Host topology while managed virtual displays are up.",
@@ -10165,6 +11310,35 @@
             "minimum": 0
           }
         }
+      },
+      "WindowActionRequest": {
+        "type": "object",
+        "required": [
+          "action"
+        ],
+        "properties": {
+          "action": {
+            "$ref": "#/components/schemas/WindowVerb",
+            "description": "`focus` | `fullscreen` | `close`."
+          }
+        }
+      },
+      "WindowVerb": {
+        "type": "string",
+        "description": "What a client may ask of one window.\n\nDefined on every platform: the management route decodes it before any\nbackend is consulted.",
+        "enum": [
+          "focus",
+          "fullscreen",
+          "close"
+        ]
+      },
+      "WorkspacePlacement": {
+        "type": "string",
+        "description": "Where a library launch's windows open on the streamed head.\n\nDefault `own`: the player gets the game on an empty workspace instead of\nthe operator's desk. Honoured only by the backends that can place a launch\n(`claim_workspace`); everywhere else a launch is always `current`.\n\n[`DisplayPolicy`] field, not part of [`EffectivePolicy`]: a preset never\nclobbers it. A library entry's own `on_window.workspace` outranks it.",
+        "enum": [
+          "own",
+          "current"
+        ]
       }
     },
     "securitySchemes": {

@@ -23,9 +23,10 @@ and nothing configured here runs anywhere near the streaming path.
 | Kind | Fires when | Carries |
 |---|---|---|
 | `client.connected` / `client.disconnected` | a client session is admitted / goes away | device name, cert fingerprint, plane (`native`/`gamestream`); disconnect adds `reason`: `quit` (user stop), `timeout` (vanished), `error` |
-| `session.started` / `session.ended` | an A/V session registers / ends | session id, client label, mode (`3840x2160@120`), HDR |
+| `session.started` / `session.ended` | an A/V session registers / ends | session id, client label, mode (`3840x2160@120`), HDR. `session.ended` adds a `summary`: duration, codec / bit depth / chroma, the bitrate span (min/avg/max + how many times it moved), frames sent and dropped, input datagram counts, gyro cadence, audio egress totals, bring-up ms, path MTU, and `ended` — `local`, `game_exited`, `host_ended`, `host_error`, `lost` or `stopped_by_operator`. The same shape `GET /api/v1/session/last` returns for the last eight |
 | `stream.started` / `stream.stopped` | video actually starts / stops | mode, HDR, client name, launched app id/title (when one was requested), plane |
 | `game.running` | a launched game's own process is seen running (not merely its launcher) | app id, title, store, client, plane |
+| `game.window` | the game's own window reaches the screen — often 5-40 s after `game.running`, while Proton builds a prefix or a splash sits on a black window | the same, plus `title` and `app_id` of that window |
 | `game.exited` | a launched game is gone | the same, plus `reason`: `exited` (the player quit it) or `terminated` (the host closed it, per your [session⇄game settings](/docs/virtual-displays#when-a-game-ends-and-when-a-session-does)) |
 | `pairing.pending` | an unpaired device knocks (once per device, not per retry) | device name, fingerprint, plane |
 | `pairing.completed` / `pairing.denied` | a pairing is approved+stored / denied | device name, fingerprint, plane |
@@ -222,6 +223,50 @@ The same `prep` array works on a custom `library.json` entry, where the identity
 `PF_APP_ID`. The console's Library form has no input for prep steps and **clears** them on save, so
 edit that file directly.
 
+### A launch on its own workspace
+
+A launch lands on whatever the streamed head is showing — which on a shared desk is the operator's
+browser, chat and terminal. Where the compositor can place windows, the host instead puts the
+launch on an **empty workspace** on that head and switches back when the game is done. Set it per
+entry in `library.json`, beside `prep`:
+
+```json
+{ "title": "Hades", "on_window": { "workspace": "own" } }
+```
+
+`own` (the default) or `current` to keep the old behaviour. The host-wide default is
+`launch_workspace` in `display-settings.json`; the entry wins where both are set. A reconnect to a
+running game goes back to *that* game's workspace — the workspace belongs to the launch, not to the
+session.
+
+Three more keys in the same block act on the game's first window, once, when it appears:
+
+```json
+{ "title": "Hades", "on_window": {
+    "workspace": "own", "focus": true, "fullscreen": false, "move_to_stream_output": true
+} }
+```
+
+- **`focus`** (default `true`) raises it. The player asked for this game, so it belongs in front —
+  a launcher that grabs focus back leaves them looking at the desktop.
+- **`fullscreen`** (default `false`) makes it full-screen. Off because most games set their own
+  mode, and forcing it fights a title that deliberately opened windowed.
+- **`move_to_stream_output`** (default `true`) carries it onto the streamed screen if it opened on
+  one of your own monitors. A game the player cannot see is the failure this whole stage exists
+  for, so leave it on unless you are deliberately playing on the host's panel.
+
+| Compositor | A launch gets its own workspace |
+| --- | --- |
+| Hyprland | yes — an empty workspace on the streamed head, or a free one |
+| sway / wlroots | yes — same, through `swaymsg` |
+| KWin | not yet |
+| GNOME / Mutter | no — no per-output workspace to aim a launch at |
+| gamescope | no — the game already has the session to itself |
+| Windows | no — no workspaces |
+
+Placement never costs you a launch: a compositor that refuses the switch, or a missing `hyprctl`,
+logs one line and the game opens where it would have before.
+
 ## Reacting to a game, not a stream
 
 `stream.stopped` tells you the *stream* ended; `game.exited` tells you the *game* did. Often the
@@ -231,9 +276,16 @@ game if you turned off "end the session when the game exits". No polling needed:
 ```json
 { "hooks": [
     { "on": "game.running", "run": "/home/me/.config/punktfunk/scripts/game-up.sh" },
+    { "on": "game.window",  "run": "/home/me/.config/punktfunk/scripts/game-on-screen.sh" },
     { "on": "game.exited",  "run": "/home/me/.config/punktfunk/scripts/game-down.sh" }
 ] }
 ```
+
+`game.running` fires when the host sees the game's *process*; `game.window` fires when its window
+is actually on screen, which on a cold Proton prefix or an emulator loading a ROM can be half a
+minute later. Dim the lights on the first; drop a "ready" notification on the second. It is
+best-effort: on a compositor that reports no windows — KWin, GNOME, gamescope, Windows — it never
+fires at all, and nothing else about the launch changes.
 
 Both carry the title in `PF_EVENT_GAME_TITLE` / `PF_EVENT_GAME_APP`, and `game.exited` adds
 `PF_EVENT_REASON` so a script can tell "the player quit" (`exited`) from "the host closed it"

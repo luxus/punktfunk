@@ -18,6 +18,7 @@ use crate::widgets::{
 };
 use pf_client_core::audio_format::{AUDIO_FORMATS, AUDIO_FORMAT_OPUS};
 use pf_client_core::menu_nav::{MenuDir, MenuEvent, MenuPulse};
+use pf_client_core::presets::SettingsOverlay;
 use pf_client_core::start;
 use pf_client_core::trust::{MouseMode, StatsVerbosity, TouchMode};
 use skia_safe::{Canvas, Rect};
@@ -415,6 +416,9 @@ pub(crate) struct SettingsScreen {
     /// `(id, name)` loaded once. The console cannot create presets, so this is
     /// stable for the screen's lifetime.
     presets: Vec<(String, String)>,
+    /// Each preset's overrides by id, loaded with `presets`: the rows say when a
+    /// host's bound preset outranks the global value they show.
+    overrides: std::collections::HashMap<String, SettingsOverlay>,
     /// D-pad focus on the strip. TV remotes have no shoulders and no Tab key.
     strip_focus: bool,
     /// Typed Mbps while Y has the bitrate field open. Y, not A, so A still cycles.
@@ -425,7 +429,9 @@ pub(crate) struct SettingsScreen {
 
 impl SettingsScreen {
     pub(crate) fn new(store: &dyn crate::store::SettingsStore) -> SettingsScreen {
-        Self::with_presets(store.presets())
+        let mut s = Self::with_presets(store.presets());
+        s.overrides = store.preset_overrides();
+        s
     }
 
     fn with_presets(presets: Vec<(String, String)>) -> SettingsScreen {
@@ -435,6 +441,7 @@ impl SettingsScreen {
             tab: 0,
             tab_cursors: [0; TABS.len()],
             presets,
+            overrides: Default::default(),
             strip_focus: false,
             custom_bitrate: None,
             keyboard: Keyboard::new(),
@@ -802,6 +809,7 @@ impl SettingsScreen {
             *self.row_ids(ctx).get(self.list.cursor)?,
             ctx,
             &self.presets,
+            &self.overrides,
         );
         Some(match row.value {
             Some(value) => format!("{}, {}", row.label, value),
@@ -903,7 +911,7 @@ impl SettingsScreen {
         self.clamp_cursor(ids.len());
         let mut rows: Vec<RowSpec> = ids
             .iter()
-            .map(|id| row_spec(*id, ctx, &self.presets))
+            .map(|id| row_spec(*id, ctx, &self.presets, &self.overrides))
             .collect();
         // Field-open: the Bitrate row shows the typed digits and the caret.
         if let (Some(text), Some(i)) = (
@@ -1045,7 +1053,101 @@ fn start_in_value(ctx: &Ctx) -> String {
     }
 }
 
-pub fn row_spec(id: RowId, ctx: &Ctx, presets: &[(String, String)]) -> RowSpec {
+/// The row as drawn. A row a known host's bound preset overrides carries the dot and a
+/// note naming preset, host and the value that host streams at: the row keeps showing
+/// the global, which is what the console edits.
+pub fn row_spec(
+    id: RowId,
+    ctx: &Ctx,
+    presets: &[(String, String)],
+    overrides: &std::collections::HashMap<String, SettingsOverlay>,
+) -> RowSpec {
+    let mut spec = row_spec_base(id, ctx, presets);
+    if let Some((host, preset, overlay)) = preset_override(id, ctx, presets, overrides) {
+        let mut resolved = overlay.apply(ctx.settings);
+        let under = Ctx {
+            hosts: ctx.hosts,
+            library: ctx.library,
+            settings: &mut resolved,
+            store: ctx.store,
+            platform: ctx.platform,
+            pads: ctx.pads,
+            deck: ctx.deck,
+            fallback_ui: ctx.fallback_ui,
+            pyrowave_ok: ctx.pyrowave_ok,
+            device_name: ctx.device_name,
+            t: ctx.t,
+        };
+        let value = row_spec_base(id, &under, presets).value.unwrap_or_default();
+        spec.dot = true;
+        spec.note = Some(format!(
+            "Preset \u{201c}{preset}\u{201d} on {host}: {value}"
+        ));
+    }
+    spec
+}
+
+/// The first known host whose bound preset, or one bound to a title, overrides `id`:
+/// `(host, preset name, overlay)`. Pinned shortcut rows are skipped; the host's own row
+/// carries its binding.
+fn preset_override<'a>(
+    id: RowId,
+    ctx: &'a Ctx,
+    presets: &'a [(String, String)],
+    overrides: &'a std::collections::HashMap<String, SettingsOverlay>,
+) -> Option<(&'a str, &'a str, &'a SettingsOverlay)> {
+    ctx.hosts.iter().filter(|h| h.pin.is_none()).find_map(|h| {
+        h.bound_preset
+            .iter()
+            .map(|c| c.id.as_str())
+            .chain(h.game_presets.values().map(String::as_str))
+            .find_map(|pid| {
+                let overlay = overrides.get(pid).filter(|o| overrides_row(id, o))?;
+                let name = presets.iter().find(|(id, _)| id == pid)?.1.as_str();
+                Some((h.name.as_str(), name, overlay))
+            })
+    })
+}
+
+/// Whether an overlay pins the value this row shows.
+fn overrides_row(id: RowId, o: &SettingsOverlay) -> bool {
+    match id {
+        RowId::Resolution | RowId::Aspect => {
+            o.width.is_some() || o.height.is_some() || o.match_window.is_some()
+        }
+        RowId::Refresh => o.refresh_hz.is_some(),
+        RowId::RenderScale => o.render_scale.is_some(),
+        RowId::VideoFit => o.video_fit.is_some(),
+        RowId::Bitrate => o.bitrate_kbps.is_some(),
+        RowId::Compositor => o.compositor.is_some(),
+        RowId::Codec => o.codec.is_some(),
+        RowId::Hdr => o.hdr_enabled.is_some(),
+        RowId::Chroma444 => o.enable_444.is_some(),
+        RowId::TenBitSdr => o.ten_bit_sdr.is_some(),
+        RowId::PresentPriority => o.present_priority.is_some(),
+        RowId::SmoothBuffer => o.smooth_buffer.is_some(),
+        RowId::Vsync => o.vsync.is_some(),
+        RowId::AllowVrr => o.allow_vrr.is_some(),
+        RowId::Audio => o.audio_channels.is_some(),
+        RowId::AudioFormat => o.audio_format.is_some(),
+        RowId::KeepHostAudio => o.keep_host_audio.is_some(),
+        RowId::Mic => o.mic_enabled.is_some(),
+        RowId::EchoCancel => o.echo_cancel.is_some(),
+        RowId::PadForward => o.gamepad_forwarding.is_some(),
+        RowId::PadType => o.gamepad.is_some(),
+        RowId::SystemButtons => o.system_buttons.is_some(),
+        RowId::GuideGesture => o.guide_gesture.is_some(),
+        RowId::Touch => o.touch_mode.is_some(),
+        RowId::Mouse => o.mouse_mode.is_some(),
+        RowId::InvertScroll => o.invert_scroll.is_some(),
+        RowId::Shortcuts => o.inhibit_shortcuts.is_some(),
+        RowId::Stats => o.stats_verbosity.is_some(),
+        RowId::Fullscreen => o.fullscreen_on_stream.is_some(),
+        _ => false,
+    }
+}
+
+fn row_spec_base(id: RowId, ctx: &Ctx, presets: &[(String, String)]) -> RowSpec {
     // Pin count from live host rows, matching the carousel.
     match id {
         RowId::Preset(i) => {
@@ -1466,7 +1568,10 @@ pub fn detail(id: RowId, ctx: &Ctx) -> &'static str {
              VirtualHere, or a pad plugged into the host — so games don't see two of them."
         }
         RowId::Pad => "Which pad is forwarded to the host, as player 1.",
-        RowId::PadType => "The virtual pad the host creates — Automatic matches this controller.",
+        RowId::PadType => {
+            "The virtual pad the host creates — Automatic matches this controller. A host's \
+             preset can pin another; the row says so."
+        }
         RowId::SystemButtons => {
             "Where the guide (Xbox/PS/Steam) and quick-access presses go. Automatic \
              sends them to the host except in Gaming Mode, where Steam on this device \
@@ -1971,6 +2076,79 @@ pub(crate) mod tests {
     use super::*;
     use pf_client_core::trust::Settings;
 
+    /// The row shows the global; a host's bound preset outranks it at launch, and the
+    /// row has to say so or "Automatic" streams as DualSense with nothing explaining it.
+    #[test]
+    fn a_bound_preset_marks_the_row_it_overrides() {
+        let (mut settings, pads) = ctx_parts();
+        settings.gamepad = "auto".into();
+        let library = crate::library::LibraryShared::default();
+        let desk = crate::model::HostRow {
+            key: "bb".into(),
+            id: None,
+            name: "Desk".into(),
+            addr: "10.0.0.7".into(),
+            port: 9777,
+            fp_hex: "bb".into(),
+            paired: true,
+            saved: true,
+            online: true,
+            mgmt_port: 47990,
+            can_wake: false,
+            clipboard_sync: false,
+            last_used: None,
+            os: String::new(),
+            actions: Vec::new(),
+            pin: None,
+            bound_preset: Some(crate::model::PresetChip {
+                id: "p1".into(),
+                name: "Living room".into(),
+                accent: None,
+                bitrate_kbps: None,
+            }),
+            running: String::new(),
+            game_presets: Default::default(),
+        };
+        let hosts = [desk];
+        let ctx = Ctx {
+            hosts: &hosts,
+            library: &library,
+            settings: &mut settings,
+            store: crate::store::file_store(),
+            platform: crate::platform::Platform::Desktop,
+            pads: &pads,
+            deck: false,
+            fallback_ui: false,
+            pyrowave_ok: true,
+            device_name: "t",
+            t: 0.0,
+        };
+        let presets = vec![("p1".to_string(), "Living room".to_string())];
+        let overrides = std::collections::HashMap::from([(
+            "p1".to_string(),
+            SettingsOverlay {
+                gamepad: Some("dualsense".into()),
+                ..Default::default()
+            },
+        )]);
+        let spec = row_spec(RowId::PadType, &ctx, &presets, &overrides);
+        assert!(spec.dot, "the overridden row carries the dot");
+        assert_eq!(
+            spec.value.as_deref(),
+            Some("Automatic"),
+            "the row keeps the global, which is what the console edits"
+        );
+        assert_eq!(
+            spec.note.as_deref(),
+            Some("Preset \u{201c}Living room\u{201d} on Desk: DualSense")
+        );
+        let spec = row_spec(RowId::Codec, &ctx, &presets, &overrides);
+        assert!(
+            !spec.dot && spec.note.is_none(),
+            "a row the preset leaves alone carries no marker"
+        );
+    }
+
     /// Tab names vs `console-vectors.json`. Input is `desktop_only` in the vectors:
     /// omitting it would fail this test; a seven-name list would fail the mobile clients.
     #[test]
@@ -2271,7 +2449,9 @@ pub(crate) mod tests {
         };
         let size = |ctx: &Ctx| (ctx.settings.width, ctx.settings.height);
         assert_eq!(
-            row_spec(RowId::Aspect, &ctx, &[]).value.as_deref(),
+            row_spec(RowId::Aspect, &ctx, &[], &Default::default())
+                .value
+                .as_deref(),
             Some("16:9"),
             "Native lists 16:9"
         );
@@ -2341,7 +2521,7 @@ pub(crate) mod tests {
             device_name: "t",
             t: 0.0,
         };
-        assert!(!row_spec(RowId::EchoCancel, &ctx, &[]).enabled);
+        assert!(!row_spec(RowId::EchoCancel, &ctx, &[], &Default::default()).enabled);
         assert!(
             !adjust(RowId::EchoCancel, -1, false, &mut ctx),
             "mic off = thud"
@@ -2350,7 +2530,7 @@ pub(crate) mod tests {
         assert!(ctx.settings.echo_cancel, "and nothing was written");
 
         ctx.settings.mic_enabled = true;
-        assert!(row_spec(RowId::EchoCancel, &ctx, &[]).enabled);
+        assert!(row_spec(RowId::EchoCancel, &ctx, &[], &Default::default()).enabled);
         assert!(adjust(RowId::EchoCancel, -1, false, &mut ctx));
         assert!(!ctx.settings.echo_cancel);
         assert!(adjust(RowId::EchoCancel, 1, true, &mut ctx));
@@ -2404,18 +2584,27 @@ pub(crate) mod tests {
             device_name: "t",
             t: 0.0,
         };
-        let value = row_spec(RowId::Codec, &ctx, &[]).value.unwrap();
+        let value = row_spec(RowId::Codec, &ctx, &[], &Default::default())
+            .value
+            .unwrap();
         assert!(value.contains("unsupported"), "value said {value}");
         assert!(detail(RowId::Codec, &ctx).contains("can't decode PyroWave"));
 
         ctx.settings.codec = "hevc".into();
-        assert_eq!(row_spec(RowId::Codec, &ctx, &[]).value.unwrap(), "HEVC");
+        assert_eq!(
+            row_spec(RowId::Codec, &ctx, &[], &Default::default())
+                .value
+                .unwrap(),
+            "HEVC"
+        );
         assert!(!detail(RowId::Codec, &ctx).contains("PyroWave"));
 
         ctx.settings.codec = "pyrowave".into();
         ctx.pyrowave_ok = true;
         assert_eq!(
-            row_spec(RowId::Codec, &ctx, &[]).value.unwrap(),
+            row_spec(RowId::Codec, &ctx, &[], &Default::default())
+                .value
+                .unwrap(),
             "PyroWave (wired LAN)"
         );
     }
@@ -2439,7 +2628,7 @@ pub(crate) mod tests {
             device_name: "t",
             t: 0.0,
         };
-        assert!(!row_spec(RowId::Bitrate, &ctx, &[]).enabled);
+        assert!(!row_spec(RowId::Bitrate, &ctx, &[], &Default::default()).enabled);
         assert!(
             !adjust(RowId::Bitrate, 1, false, &mut ctx),
             "pyrowave = thud"
@@ -2448,7 +2637,7 @@ pub(crate) mod tests {
         assert_eq!(ctx.settings.bitrate_kbps, 80_000, "the stored rate is kept");
 
         ctx.settings.codec = "hevc".into();
-        assert!(row_spec(RowId::Bitrate, &ctx, &[]).enabled);
+        assert!(row_spec(RowId::Bitrate, &ctx, &[], &Default::default()).enabled);
         assert!(adjust(RowId::Bitrate, 1, false, &mut ctx));
     }
 
@@ -2761,11 +2950,11 @@ pub(crate) mod tests {
         let ids = s.row_ids(&ctx);
         assert_eq!(ids, vec![RowId::Preset(0), RowId::Preset(1)]);
 
-        let spec = row_spec(RowId::Preset(0), &ctx, &s.presets);
+        let spec = row_spec(RowId::Preset(0), &ctx, &s.presets, &s.overrides);
         assert_eq!(spec.header, None, "the tab pill names the section");
         assert_eq!(spec.label, "Work");
         assert_eq!(spec.value.as_deref(), Some("Pinned to 1 host"));
-        let spec = row_spec(RowId::Preset(1), &ctx, &s.presets);
+        let spec = row_spec(RowId::Preset(1), &ctx, &s.presets, &s.overrides);
         assert_eq!(spec.value.as_deref(), Some("Not pinned"));
 
         s.list.cursor = 0;
@@ -2808,7 +2997,7 @@ pub(crate) mod tests {
         s.tab = PRESETS_TAB;
         let ids = s.row_ids(&ctx);
         assert_eq!(ids, vec![RowId::NoPresets]);
-        let spec = row_spec(RowId::NoPresets, &ctx, &s.presets);
+        let spec = row_spec(RowId::NoPresets, &ctx, &s.presets, &s.overrides);
         assert!(!spec.enabled);
 
         s.list.cursor = ids.len() - 1;
@@ -2835,7 +3024,7 @@ pub(crate) mod tests {
             device_name: "t",
             t: 0.0,
         };
-        let row = row_spec(RowId::QuickActions, &ctx, &[]);
+        let row = row_spec(RowId::QuickActions, &ctx, &[], &Default::default());
         assert!(row.value.is_none(), "an action row");
         assert_eq!(row.label, "Quick actions");
         assert!(!adjust(RowId::QuickActions, 1, false, &mut ctx));
@@ -3108,7 +3297,7 @@ pub(crate) mod tests {
         assert!(adjust(RowId::LibraryCollections, 1, false, &mut ctx));
         assert!(ctx.settings.library_collections);
         assert_eq!(
-            row_spec(RowId::LibraryCollections, &ctx, &[])
+            row_spec(RowId::LibraryCollections, &ctx, &[], &Default::default())
                 .value
                 .as_deref(),
             Some("On"),
@@ -3251,7 +3440,7 @@ pub(crate) mod tests {
 
         ctx.settings.audio_format = AUDIO_FORMAT_LOSSLESS_48.into();
         ctx.settings.audio_channels = 6;
-        assert!(!row_spec(RowId::AudioFormat, &ctx, &[]).enabled);
+        assert!(!row_spec(RowId::AudioFormat, &ctx, &[], &Default::default()).enabled);
         assert!(
             !adjust(RowId::AudioFormat, 1, false, &mut ctx),
             "surround = thud"
@@ -3263,13 +3452,16 @@ pub(crate) mod tests {
         );
         assert!(s.row_ids(&ctx).contains(&RowId::AudioFormat));
         ctx.settings.audio_channels = 2;
-        assert!(row_spec(RowId::AudioFormat, &ctx, &[]).enabled);
+        assert!(row_spec(RowId::AudioFormat, &ctx, &[], &Default::default()).enabled);
 
         ctx.settings.audio_format = AUDIO_FORMAT_OPUS.into();
-        let opus = row_spec(RowId::AudioFormat, &ctx, &[]).value;
+        let opus = row_spec(RowId::AudioFormat, &ctx, &[], &Default::default()).value;
         assert!(opus.is_some());
         ctx.settings.audio_format = "lossless192".into();
-        assert_eq!(row_spec(RowId::AudioFormat, &ctx, &[]).value, opus);
+        assert_eq!(
+            row_spec(RowId::AudioFormat, &ctx, &[], &Default::default()).value,
+            opus
+        );
     }
 
     #[test]
@@ -3291,7 +3483,9 @@ pub(crate) mod tests {
         };
         assert_eq!(ctx.settings.ui_palette, "violet", "the brand default ships");
         assert_eq!(
-            row_spec(RowId::Palette, &ctx, &[]).value.as_deref(),
+            row_spec(RowId::Palette, &ctx, &[], &Default::default())
+                .value
+                .as_deref(),
             Some("Violet")
         );
         assert!(
@@ -3309,7 +3503,9 @@ pub(crate) mod tests {
         assert_eq!(ctx.settings.ui_palette, "violet");
         ctx.settings.ui_palette = "chartreuse".into();
         assert_eq!(
-            row_spec(RowId::Palette, &ctx, &[]).value.as_deref(),
+            row_spec(RowId::Palette, &ctx, &[], &Default::default())
+                .value
+                .as_deref(),
             Some("Violet"),
             "an unknown palette reads as the default it actually draws"
         );
@@ -3340,7 +3536,11 @@ pub(crate) mod tests {
             device_name: "t",
             t: 0.0,
         };
-        let value = |ctx: &Ctx| row_spec(RowId::StartIn, ctx, &[]).value.unwrap();
+        let value = |ctx: &Ctx| {
+            row_spec(RowId::StartIn, ctx, &[], &Default::default())
+                .value
+                .unwrap()
+        };
 
         // The fresh default is the list by choice, so the row reads plainly, not as a fallback.
         assert_eq!(value(&ctx), "Host list");

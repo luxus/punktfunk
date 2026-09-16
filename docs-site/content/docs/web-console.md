@@ -1,6 +1,6 @@
 ---
 title: The Web Console
-description: Enable the Punktfunk browser console, read or change its login password, arm PIN pairing, and what every page in it does.
+description: Enable the Punktfunk browser console, read or reset its login password, arm PIN pairing, and what every page in it does.
 ---
 
 The web console is the browser UI for a Punktfunk host — live status, pairing, display policy, the
@@ -67,47 +67,51 @@ In practice:
 
 ## Login password
 
-The console is password-protected; where the password lives and how you change it depends on the
-host platform.
+The console is password-protected. The password is stored as a **salted argon2id hash**, so it is
+readable exactly once — while it is still the clear line a generated or typed password was written
+as. The moment you first sign in, the console replaces that line with the hash. After that there is
+nothing to read back, and a forgotten password is **reset**, not recovered.
 
-**Linux packages (apt / RPM / Bazzite).** The guided installer asks, right before it installs:
-take a generated password, or type your own. Either way it ends up in
-`~/.config/punktfunk/web-password` (as `PUNKTFUNK_UI_PASSWORD=…`) — a generated one is written by
-`punktfunk-web-init` on the console's first start. Read it from the file — the journal names the
-file but never the password, so the secret stays 0600:
+**Linux packages (apt / RPM / Bazzite).** The guided installer asks, right before it installs: take
+a generated password, or type your own. Either way it lands in `~/.config/punktfunk/web-password`
+— a generated one is written by `punktfunk-web-init` on the console's first start. Read it before
+your first sign-in (the journal names the file but never the password, so the secret stays 0600):
 
 ```sh
 sed -n 's/^PUNKTFUNK_UI_PASSWORD=//p' ~/.config/punktfunk/web-password
 ```
 
-To set your own, edit that file (`PUNKTFUNK_UI_PASSWORD=<your-password>`) and restart the console:
-`systemctl --user restart punktfunk-web`.
-
-**SteamOS host.** Same idea, but the install script writes the generated password to
-`~/.config/punktfunk/web.env` and prints it at the end of the install run:
+Prints nothing? Then it is already hashed. **Reset it** — write a clear line back and restart; the
+next sign-in hashes it and signs every other session out:
 
 ```sh
-sed -n 's/^PUNKTFUNK_UI_PASSWORD=//p' ~/.config/punktfunk/web.env
+printf 'PUNKTFUNK_UI_PASSWORD=%s\n' 'your-password' > ~/.config/punktfunk/web-password
+chmod 600 ~/.config/punktfunk/web-password
+systemctl --user restart punktfunk-web
 ```
 
-Edit that file and `systemctl --user restart punktfunk-web` to change it.
+**SteamOS host.** Same idea, but the install script writes the generated password to
+`~/.config/punktfunk/web.env` and prints it at the end of the install run. Read it with the `sed`
+line above against `web.env`. To reset, **edit** that file — it also holds the session secret, so
+replace the `PUNKTFUNK_UI_PASSWORD_HASH=` line with `PUNKTFUNK_UI_PASSWORD=<your-password>` rather
+than overwriting the whole file — then `systemctl --user restart punktfunk-web`.
 
 **Windows host.** How you got the password depends on how you installed:
 
 - **The wizard** pre-fills a secure random default, lets you change it, and shows it again on its
   final page.
 - **A silent install** — winget, or `/VERYSILENT` — has no wizard. It generates the password and
-  displays nothing, so you read it back afterwards.
+  displays nothing, so you read it back before you first sign in.
 
-Either way it's stored in `%ProgramData%\punktfunk\web-password` (as `PUNKTFUNK_UI_PASSWORD=…`),
-readable only by Administrators and SYSTEM. Print it from an **elevated** PowerShell:
+Either way it lives in `%ProgramData%\punktfunk\web-password`, readable only by Administrators and
+SYSTEM. Print it from an **elevated** PowerShell:
 
 ```powershell
 punktfunk-host web password
 ```
 
-To change it, edit the file and restart the Punktfunk Host service from that same elevated
-PowerShell:
+Once it is hashed that command says so instead. To reset, edit the file and restart the Punktfunk
+Host service from the same elevated PowerShell:
 
 ```powershell
 notepad "$env:ProgramData\punktfunk\web-password"   # set PUNKTFUNK_UI_PASSWORD=<your-password>
@@ -131,7 +135,11 @@ Nine destinations in the sidebar (a **More** tab on a phone holds the last five)
 ![Live status during a stream: video and audio streaming, the running game, the session's codec, resolution, frame rate and bitrate](/img/console-live-status.png)
 
 - **Dashboard** — the live status above: what's streaming, which games run, how many clients are
-  paired. Buttons stop a session or ask the encoder for a fresh keyframe.
+  paired. The **Sessions** card lists every connected client — one row each, with its display mode,
+  whether it has its own display or joined another session, and how long it has been up. Each row
+  stops, keyframes, mutes or changes the access level of that one session; the buttons in the card
+  below are host-wide and take every session at once. A Moonlight session has no row controls: the
+  host holds no per-session handle for the compat plane.
 - **Host** — this host's identity (hostname, OS, local IP, version, unique id), the codecs it
   advertises, its ports, the **Updates** card (see [Updating the Host](/docs/updating)), the
   **GPUs** card — Automatic, or prefer one GPU for capture and encode, applied to the next session

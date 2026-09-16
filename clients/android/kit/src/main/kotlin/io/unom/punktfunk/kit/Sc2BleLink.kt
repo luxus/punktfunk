@@ -164,21 +164,42 @@ class Sc2BleLink(
         )
     }
 
-    /** Feed the firmware watchdog: lizard mode off, on the feature characteristic. */
-    private fun sendLizardOff() {
+    /** Write one lizard-mode setting ([Sc2Device.DISABLE_LIZARD] / [Sc2Device.ENABLE_LIZARD]) on
+     *  the feature characteristic. Off feeds the firmware watchdog; on hands the pad back. */
+    private fun sendLizard(frame: ByteArray) {
         if (state != State.READY) return
         val g = gatt ?: return
         val ch = featureChar ?: return
-        val payload = Sc2Device.featurePayload(Sc2Device.DISABLE_LIZARD) ?: return
+        val payload = Sc2Device.featurePayload(frame) ?: return
         write(g, ch, payload, acked = true)
     }
 
-    /** Disconnect for good and stop the lizard ticker. Idempotent; does not fire [onClosed]. */
+    /** Wait out the acked write in flight, at most 30 × 5 ms — a GATT write is asynchronous and
+     *  a disconnect drops one still queued. Returns early the moment the ack lands. */
+    private fun awaitWriteIdle() {
+        repeat(30) {
+            if (!writeBusy.get()) return
+            runCatching { Thread.sleep(5) }
+        }
+    }
+
+    /**
+     * Restore lizard mode, then disconnect for good and stop the ticker. Idempotent; does not
+     * fire [onClosed]. The restore blocks the caller for as long as [awaitWriteIdle] allows.
+     */
     fun stop() {
         stopped = true // a disconnect from here must not re-arm the autoConnect request
-        state = State.IDLE // before the disconnect, so its callback cannot report a live drop
+        // Join the ticker, or a refresh caught mid-loop lands its lizard-off after the restore
+        // below and the pad is dead again. It is interrupted, so it leaves at its next sleep.
         lizardTicker?.interrupt()
+        runCatching { lizardTicker?.join(50) }
         lizardTicker = null
+        // Still READY here, so the setting can go out: lizard's kb/mouse is what drives the OS
+        // once this link lets go, and waiting for the watchdog leaves the pad dead for seconds.
+        awaitWriteIdle()
+        sendLizard(Sc2Device.ENABLE_LIZARD)
+        awaitWriteIdle()
+        state = State.IDLE // before the disconnect, so its callback cannot report a live drop
         runCatching { gatt?.disconnect() }
         runCatching { gatt?.close() }
         gatt = null
@@ -274,7 +295,7 @@ class Sc2BleLink(
         if (subsIndex >= pendingSubs.size) {
             state = State.READY
             Log.i(TAG, "SC2 BLE link up (${pendingSubs.size} notify chars)")
-            sendLizardOff()
+            sendLizard(Sc2Device.DISABLE_LIZARD)
             // The firmware watchdog re-enables lizard mode; refresh on SDL's cadence until the
             // host's Steam takes over via the raw plane (its writes land through writeRaw too).
             lizardTicker = Thread({
@@ -284,7 +305,7 @@ class Sc2BleLink(
                     } catch (_: InterruptedException) {
                         return@Thread
                     }
-                    sendLizardOff()
+                    sendLizard(Sc2Device.DISABLE_LIZARD)
                 }
             }, "pf-sc2-lizard").apply { isDaemon = true; start() }
             return

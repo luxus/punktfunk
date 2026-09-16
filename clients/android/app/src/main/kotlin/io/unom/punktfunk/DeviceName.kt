@@ -23,3 +23,8 @@ internal fun deviceName(context: Context): String {
         ?: Build.MODEL?.trim()?.takeIf { it.isNotEmpty() }
         ?: "Android"
 }
+
+/** This build's `versionName`, or `"?"` when the package manager will not say. */
+internal fun appVersion(context: Context): String = runCatching {
+    context.packageManager.getPackageInfo(context.packageName, 0).versionName
+}.getOrNull() ?: "?"

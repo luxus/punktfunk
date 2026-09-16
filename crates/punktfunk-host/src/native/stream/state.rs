@@ -146,6 +146,11 @@ pub(super) struct StreamState {
     pub(super) plan: crate::session_plan::SessionPlan,
     pub(super) stop: Arc<AtomicBool>,
     pub(super) quit: Arc<AtomicBool>,
+    /// Why this session ended, for its summary. First write wins, so the path that knows
+    /// (game exit, operator stop, the peer's own close) beats the loop's clean tail.
+    pub(super) end_reason: Arc<std::sync::atomic::AtomicU8>,
+    /// Session totals; this loop notes every encoder rate it adopts.
+    pub(super) counters: Arc<crate::session_status::SessionCounters>,
     pub(super) conn: super::super::link::SessionLink,
     /// The client's ask. Encoders fit to it; the display may deliver another size.
     pub(super) negotiated: punktfunk_core::Mode,
@@ -243,7 +248,12 @@ impl StreamState {
         }
     }
 
+    /// A rebuild re-resolved what it encodes. Noted for the summary's bitrate span: the
+    /// rate the session runs at moved, whoever decided it.
     pub(super) fn adopt_built_bitrate(&mut self, built: u32) {
+        if built != self.bitrate_kbps {
+            self.counters.note_bitrate(built);
+        }
         adopt_built_bitrate(
             &mut self.bitrate_kbps,
             built,
@@ -302,6 +312,8 @@ impl StreamState {
             seconds,
             stop,
             quit,
+            end_reason,
+            counters,
             reconfig,
             keyframe,
             rfi,
@@ -342,8 +354,10 @@ impl StreamState {
             client_name,
             launch,
             launch_target,
+            launch_outcome,
             client_hdr,
             join_live,
+            controls,
             reframe_to: _,
             frame_map,
             bringup,
@@ -554,6 +568,18 @@ impl StreamState {
         // discoverable in `/proc`, so an unscoped launch or watch lands on somebody else's screen.
         #[cfg(target_os = "linux")]
         let seat: Option<String> = cur_display_gen.and_then(crate::vdisplay::registry::seat_for);
+        // Latch the head for this session's window routes. Read here, where capture
+        // has already published it and a later session cannot have re-pointed the
+        // injector's one-per-process slot yet.
+        #[cfg(target_os = "linux")]
+        let streamed_head = crate::inject::stream_output()
+            .map(|output| crate::session_status::StreamedHead { compositor, output });
+        #[cfg(target_os = "linux")]
+        controls.set_head(streamed_head.clone());
+        // Workspace this launch owns on the streamed head; handed to the lease, which
+        // releases it when the game is done.
+        #[cfg(target_os = "linux")]
+        let mut launch_workspace: Option<crate::vdisplay::WorkspaceClaim> = None;
         #[cfg(target_os = "linux")]
         let spawned_launch = match launch.as_deref() {
             Some(cmd) if adopt_launch => {
@@ -562,6 +588,12 @@ impl StreamState {
                     "this client's copy of this title is already running from an earlier session — not \
                      starting a second one"
                 );
+                // The claim belongs to the launch, not to us: go back to the game's
+                // workspace rather than opening an empty one beside it.
+                launch_workspace = launch_claim
+                    .as_ref()
+                    .and_then(|c| c.workspace())
+                    .and_then(|ws| crate::library::adopt_launch_workspace(compositor, ws));
                 None
             }
             // Nested only when this acquire actually spawned gamescope — then `cmd` is already its
@@ -576,9 +608,12 @@ impl StreamState {
                 None
             }
             Some(cmd) => {
-                match crate::library::launch_session_command(compositor, cmd, seat.as_deref()) {
-                    Ok(spawned) => {
+                let own = launch_target.as_ref().is_some_and(|t| t.own_workspace);
+                match crate::library::launch_session_command(compositor, cmd, seat.as_deref(), own)
+                {
+                    Ok(mut spawned) => {
                         spawned_now = true;
+                        launch_workspace = spawned.workspace.take();
                         Some(spawned)
                     }
                     Err(e) => {
@@ -589,6 +624,13 @@ impl StreamState {
             }
             None => None,
         };
+        if let Some(t) = launch_target.as_ref() {
+            let _ = launch_outcome.send(launch_verdict(
+                &t.game.title,
+                launch_claim.as_ref(),
+                spawned_now,
+            ));
+        }
         if let Some(c) = launch_claim.as_ref() {
             if spawned_now {
                 c.launched();
@@ -597,6 +639,11 @@ impl StreamState {
                 }
             } else if c.must_spawn() {
                 c.abandon();
+            }
+            // On the record, not on the session: the next reconnect focuses it.
+            #[cfg(target_os = "linux")]
+            if let Some(ws) = launch_workspace.as_ref() {
+                c.placed(ws.id());
             }
         }
 
@@ -616,6 +663,7 @@ impl StreamState {
             let conn = conn.clone();
             let stop = stop.clone();
             let quit = quit.clone();
+            let end_reason = end_reason.clone();
             move || {
                 if !crate::session_settings::get().session_on_game_exit {
                     tracing::info!(
@@ -627,6 +675,7 @@ impl StreamState {
                 tracing::info!(
                     "the launched game exited — ending the session cleanly (APP_EXITED)"
                 );
+                crate::events::SessionEndReason::GameExited.latch(&end_reason);
                 conn.close(punktfunk_core::quic::APP_EXITED_CLOSE_CODE, b"game exited");
                 quit.store(true, Ordering::SeqCst);
                 stop.store(true, Ordering::SeqCst);
@@ -684,6 +733,19 @@ impl StreamState {
                     spawned: spawned_pid,
                     launch_stamp,
                     procs: launch_claim.as_ref().and_then(|c| c.procs()),
+                    // The watcher says so when this launch dies on the spot.
+                    outcome: Some(launch_outcome.clone()),
+                    #[cfg(target_os = "linux")]
+                    workspace: launch_workspace,
+                    // Absent on a backend that names no head: the lease then
+                    // runs exactly as it did before the window stage.
+                    #[cfg(target_os = "linux")]
+                    window_stage: streamed_head
+                        .clone()
+                        .map(|head| crate::gamelease::WindowStage {
+                            head,
+                            on_window: target.on_window,
+                        }),
                 },
                 on_exit,
             )
@@ -774,6 +836,12 @@ impl StreamState {
             last_resize_ms: resize_ms.clone(),
             game: game_shared,
             capture_health: capture_health.clone(),
+            join: join_live,
+            controls,
+            bit_depth,
+            chroma: plan.chroma,
+            end_reason: end_reason.clone(),
+            counters: counters.clone(),
         });
 
         // Replaced by `spawn_session_watcher` inside the session span; disconnected until then.
@@ -784,6 +852,8 @@ impl StreamState {
             plan,
             stop,
             quit,
+            end_reason,
+            counters,
             conn,
             negotiated: mode,
             bitrate_auto,
@@ -926,6 +996,10 @@ impl StreamState {
     }
 
     /// The tick loop, then the drain. Every phase is a method; the order is the contract.
+    ///
+    /// Reaching the tail is what makes the end clean: it hands the registry this session's
+    /// totals and latches `host_ended`. Any earlier exit leaves both unset, and the summary
+    /// reads that as `host_error`.
     pub(super) fn run(mut self) -> Result<()> {
         // Concurrent sessions interleave in one log; this stamps every line below with
         // the id `/status` reports. Sync body, so the guard never straddles an await.
@@ -969,6 +1043,15 @@ impl StreamState {
             dropped = src.as_ref().map_or(0, |h| h.dropped_total),
             "punktfunk/1 virtual stream complete"
         );
+        crate::session_status::record_tally(
+            self.live_session.id,
+            crate::session_status::SessionTally {
+                frames_sent: self.sent,
+                frames_dropped: src.as_ref().map(|h| h.dropped_total),
+                path_mtu: self.conn.current_mtu(),
+            },
+        );
+        crate::events::SessionEndReason::HostEnded.latch(&self.end_reason);
         Ok(())
     }
 }
@@ -991,6 +1074,44 @@ pub(super) fn adopt_built_bitrate(
     *current = built;
     live.store(built, Ordering::Relaxed);
     let _ = retarget.send(built);
+}
+
+/// What this session's launch came to, in the client's vocabulary.
+///
+/// One verdict from the two facts the launch site has: whether it spawned, and
+/// what the registry adopted against. `Spawned` says nothing — the player asked
+/// for a game and is about to get one; only the other three need words.
+fn launch_verdict(
+    title: &str,
+    claim: Option<&crate::launchreg::Claim>,
+    spawned: bool,
+) -> punktfunk_core::quic::LaunchOutcome {
+    use crate::launchreg::Liveness;
+    use punktfunk_core::quic::{LaunchOutcome, LaunchOutcomeKind as Kind};
+    if spawned {
+        return LaunchOutcome::new(Kind::Spawned, "");
+    }
+    match claim.and_then(|c| c.adopted()) {
+        Some(Liveness::Running) => LaunchOutcome::new(
+            Kind::Adopted,
+            &format!(
+                "{title} was already running from an earlier session — this picked that copy up \
+                 instead of starting a second one."
+            ),
+        ),
+        // Adopted on the in-flight window: the host reused a launch it cannot see.
+        Some(_) => LaunchOutcome::new(
+            Kind::AdoptedUnknown,
+            &format!(
+                "{title} was started a moment ago, so this picked that launch up rather than \
+                 starting a second copy. Start it again if nothing comes up."
+            ),
+        ),
+        None => LaunchOutcome::new(
+            Kind::Refused,
+            &format!("Couldn't start {title} — this host had nothing to run for it."),
+        ),
+    }
 }
 
 /// Announce a host-local rebuild gap so the client does not score a straddling window as congestion.
@@ -1016,5 +1137,36 @@ mod tests {
         assert_eq!(current, 60_000);
         assert_eq!(live.load(Ordering::Relaxed), 60_000);
         assert_eq!(rx.try_recv().ok(), Some(60_000));
+    }
+
+    /// The registry's liveness vocabulary and the wire's are one set, mapped here
+    /// and nowhere else. A spawn says nothing; a refusal and a blind adoption
+    /// both owe the player a sentence.
+    #[test]
+    fn the_launch_verdict_follows_what_the_registry_adopted() {
+        use punktfunk_core::quic::LaunchOutcomeKind as Kind;
+
+        let spawned = launch_verdict("Quail", None, true);
+        assert_eq!(spawned.kind, Kind::Spawned);
+        assert!(spawned.message.is_empty());
+        assert!(!spawned.kind.needs_telling());
+
+        let refused = launch_verdict("Quail", None, false);
+        assert_eq!(refused.kind, Kind::Refused);
+        assert!(refused.message.starts_with("Couldn't start Quail"));
+        assert!(refused.kind.needs_telling());
+
+        let (fp, app) = (Some("fp-verdict"), Some("custom:verdict"));
+        let first = crate::launchreg::claim(fp, app, false, Some(1.0));
+        first.launched();
+        // Nothing adopted, inside the in-flight window: the host cannot see it.
+        let blind = crate::launchreg::claim(fp, app, false, Some(2.0));
+        assert!(!blind.must_spawn());
+        let out = launch_verdict("Quail", Some(&blind), false);
+        assert_eq!(out.kind, Kind::AdoptedUnknown);
+        assert!(out.message.contains("Start it again"));
+        assert!(out.kind.needs_telling());
+        blind.abandon();
+        drop(first);
     }
 }

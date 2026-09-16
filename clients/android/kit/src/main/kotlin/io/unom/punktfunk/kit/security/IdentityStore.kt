@@ -44,24 +44,42 @@ fun splitGenerated(joined: String): ClientIdentity? {
     )
 }
 
+/** Serialises the mint below. Process-wide: the two shells share one file, not one store object. */
+private val MINT_LOCK = Any()
+
 /**
  * Load the device identity, minting *once* on genuine first run. NEVER mints over an error state:
  * an [IdentityLoad.Unrecoverable] surfaces as a throw so the UI can tell the user (re-pair) rather
  * than silently swapping in a new identity (which would change our fingerprint everywhere).
+ *
+ * Both shells start this on a background thread as the app comes up. Unlocked, both would read
+ * `Absent` on first run, both mint, and the loser would keep its copy in memory and dial under a
+ * second fingerprint for the life of the process — which the host counts as another client and
+ * admits by `mode-conflict: JOIN` rather than treating as a reconnect. Hence the re-read under
+ * the lock: whoever gets there second takes what the first one persisted.
  */
 fun obtainIdentity(store: IdentityStore): ClientIdentity =
     when (val r = store.load()) {
         is IdentityLoad.Ok -> r.identity
-        IdentityLoad.Absent -> {
-            val joined = NativeBridge.nativeGenerateIdentity()
-            val id = splitGenerated(joined)
-                ?: throw IdentityUnrecoverableException("nativeGenerateIdentity returned empty", null)
-            store.persist(id)
-            id
+        IdentityLoad.Absent -> synchronized(MINT_LOCK) {
+            when (val second = store.load()) {
+                is IdentityLoad.Ok -> second.identity
+                IdentityLoad.Absent -> mint(store)
+                is IdentityLoad.Unrecoverable ->
+                    throw IdentityUnrecoverableException(second.reason, second.cause)
+            }
         }
         is IdentityLoad.Unrecoverable ->
             throw IdentityUnrecoverableException(r.reason, r.cause)
     }
+
+/** Generate and persist a fresh identity. Call under [MINT_LOCK]. */
+private fun mint(store: IdentityStore): ClientIdentity {
+    val id = splitGenerated(NativeBridge.nativeGenerateIdentity())
+        ?: throw IdentityUnrecoverableException("nativeGenerateIdentity returned empty", null)
+    store.persist(id)
+    return id
+}
 
 /**
  * Persists the identity PEM blob to app-private storage, wrapped with an AndroidKeyStore AES-256-GCM

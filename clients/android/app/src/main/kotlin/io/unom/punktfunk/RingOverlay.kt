@@ -27,6 +27,8 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.VolumeOff
+import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.Bedtime
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Home
@@ -216,6 +218,11 @@ class RingActions(
     val padMouseTarget: () -> Int,
     val padMouseOn: () -> Boolean,
     val togglePadMouse: () -> Unit,
+    /** This device's speakers: the live mute mask (`StreamUi.AUDIO_MUTE_*`), the sentence for it,
+     *  and the local-only toggle. */
+    val audioMute: () -> Int,
+    val audioMuteLabel: () -> String?,
+    val toggleStreamMute: () -> Unit,
     /** `[w, h, hz]` as last requested (Android has no live read-back of the negotiated mode). */
     val currentMode: () -> IntArray,
     val requestMode: (Int, Int, Int) -> Unit,
@@ -293,6 +300,12 @@ private fun spec(slot: SlotId, cfg: OverlayConfig, a: RingActions): SlotSpec = w
         enabled = a.pointerGranted() && a.padMouseTarget() != 0,
         reason = if (a.pointerGranted()) "No controller is connected" else "This host only allows controller input",
         toggle = true, state = if (a.padMouseOn()) "On" else "Off",
+    )
+    SlotId.StreamMute -> SlotSpec(
+        "stream_mute", "Mute this stream",
+        if (a.audioMute() != 0) Icons.AutoMirrored.Filled.VolumeOff else Icons.AutoMirrored.Filled.VolumeUp,
+        // The shared sentence, so the slot never reads "On" while the host is muting.
+        toggle = true, state = a.audioMuteLabel() ?: "On",
     )
     is SlotId.Host -> {
         val act = a.hostActions().firstOrNull { it.id == slot.actionId }
@@ -546,6 +559,7 @@ private fun fireSlot(
         SlotId.Guide -> { state.close(); actions.tapPadButton(Gamepad.BTN_GUIDE) }
         SlotId.Qam -> { state.close(); actions.tapPadButton(Gamepad.BTN_MISC1) }
         SlotId.PadMouse -> actions.togglePadMouse()
+        SlotId.StreamMute -> actions.toggleStreamMute()
         is SlotId.Host -> {
             actions.hostActions().firstOrNull { it.id == slot.actionId }?.let { state.close(); actions.invokeHost(it) }
         }

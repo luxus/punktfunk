@@ -22,14 +22,24 @@ use tokio::sync::broadcast;
 const MAX_EVENT_STREAMS: usize = 32;
 
 /// 15 s: dead-peer probe and idle-middlebox keep-alive between sparse lifecycle events.
-const KEEP_ALIVE: Duration = Duration::from_secs(15);
+pub(crate) const KEEP_ALIVE: Duration = Duration::from_secs(15);
 
 static LIVE_STREAMS: AtomicUsize = AtomicUsize::new(0);
 
 /// Connection-cap token. `pub(crate)` so [`test_support`] can return the slots it holds.
 pub(crate) struct StreamSlot;
 
-fn try_acquire_slot() -> Option<StreamSlot> {
+/// The 503 every SSE route answers with once [`MAX_EVENT_STREAMS`] is reached.
+pub(crate) fn stream_cap_reached() -> Response {
+    api_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "event-stream connection cap reached — close an existing stream or retry",
+    )
+}
+
+/// One cap across every SSE route on the box: a pad stream costs a connection like a
+/// lifecycle stream does.
+pub(crate) fn try_acquire_slot() -> Option<StreamSlot> {
     LIVE_STREAMS
         .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
             (n < MAX_EVENT_STREAMS).then_some(n + 1)
@@ -111,10 +121,7 @@ struct StreamState {
 )]
 pub(crate) async fn stream_events(Query(q): Query<EventsQuery>, headers: HeaderMap) -> Response {
     let Some(slot) = try_acquire_slot() else {
-        return api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "event-stream connection cap reached — close an existing stream or retry",
-        );
+        return stream_cap_reached();
     };
     // SSE auto-reconnect sends `Last-Event-ID`; it wins over the URL's `?since=` when both exist.
     let since = headers

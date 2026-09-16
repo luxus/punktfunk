@@ -132,6 +132,33 @@ impl AbsoluteAnchor {
 /// a channel, so a session reaches it only through typed process state. See `SESSION_BACKEND`.
 static ABSOLUTE_ANCHOR: std::sync::RwLock<Option<AbsoluteAnchor>> = std::sync::RwLock::new(None);
 
+/// Capture bring-ups so far — every publish of an aim slot (`set_stream_output`,
+/// `set_stream_target`) bumps it, unchanged name included: a new session owes a warp too.
+static AIM_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Called by both aim slots. Cross-platform: the debt is a pointer position, not a backend.
+pub(crate) fn bump_aim_gen() {
+    AIM_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn aim_gen() -> u64 {
+    AIM_GEN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Streamed head's mode, published beside the aim at capture bring-up.
+static STREAM_EXTENT: std::sync::RwLock<Option<(u16, u16)>> = std::sync::RwLock::new(None);
+
+/// Extent the pointer warp sends its centre at. A backend that resolves an absolute sample by
+/// SIZE (libei regions) only recognizes the streamed head at the head's own mode; the others
+/// normalize and take any extent. `None` leaves the warp on its neutral extent.
+pub fn set_stream_extent(mode: Option<(u16, u16)>) {
+    *STREAM_EXTENT.write().unwrap_or_else(|e| e.into_inner()) = mode;
+}
+
+pub(crate) fn stream_extent() -> Option<(u16, u16)> {
+    *STREAM_EXTENT.read().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Pin absolute coordinates to a specific output. `None` keeps size-matching.
 ///
 /// Host-level, not per-session: the injector is host-lifetime and every session shares it, so

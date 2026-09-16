@@ -21,6 +21,12 @@ use crate::facts::{Channel, Facts, Family};
 /// The management API's home when Sunshine already holds 47990.
 pub const DEFAULT_MGMT_PORT: u16 = 47991;
 
+/// The console's default listen address: this machine only. `PUNKTFUNK_UI_BIND` in host.env.
+pub const LOOPBACK_BIND: &str = "127.0.0.1";
+
+/// What `--web-bind` writes for "my whole network".
+pub const LAN_BIND: &str = "0.0.0.0";
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Action {
     #[default]
@@ -52,6 +58,7 @@ pub struct Pins {
     pub omarchy_theme: Option<bool>,
     pub console_cert: Option<bool>,
     pub mgmt_port: Option<u16>,
+    pub web_bind: Option<String>,
     pub no_start: bool,
 }
 
@@ -77,6 +84,9 @@ pub struct Choices {
     /// Trust the console's certificate in the user's browser store. On by default on every
     /// host install and never a row on the screen: it is one certificate, this machine's own.
     pub console_cert: bool,
+    /// Where the web console listens (`PUNKTFUNK_UI_BIND`). Loopback unless the user or
+    /// `--web-bind` says otherwise; the plugin-UI origin on 47993 follows it.
+    pub web_bind: String,
     /// The console login password the user typed. `None` leaves it to the console's own
     /// first start, which generates one into `~/.config/punktfunk/web-password`. Never
     /// echoed: `exec` writes the file, the plan step carries no value.
@@ -149,6 +159,14 @@ impl Choices {
             omarchy_theme: pins.omarchy_theme.unwrap_or(omarchy_setup),
             // The trust lands in this box's browser store; a box with no desktop has none.
             console_cert: pins.console_cert.unwrap_or(facts.desktop_sessions),
+            // Flag, then whatever host.env already names, then loopback. The middle arm is what
+            // keeps a re-run from moving a console the operator placed: a bare Enter through the
+            // question re-writes the value the box is already living by.
+            web_bind: pins
+                .web_bind
+                .clone()
+                .or_else(|| facts.web_bind.clone())
+                .unwrap_or_else(|| LOOPBACK_BIND.to_string()),
             // Asked after the settings screen, so nothing derives it here.
             web_password: None,
             group_why: punktfunk_group.then_some(group_why).flatten(),
@@ -209,6 +227,7 @@ mod tests {
             user_manager: true,
             web_unit_present: true,
             web_password_present: false,
+            web_bind: None,
             scripting_unit_disabled: false,
             ip: Some("192.168.1.10".into()),
             user: "pf".into(),

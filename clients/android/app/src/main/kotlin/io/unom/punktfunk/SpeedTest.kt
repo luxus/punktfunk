@@ -97,7 +97,7 @@ suspend fun runSpeedTest(
     )
     val handle = connectToHost(
         context, probeSettings, identity, host, port, pinHex,
-        launch = null, timeoutMs = SPEED_TEST_CONNECT_TIMEOUT_MS,
+        launch = null, dialer = "speed-test", timeoutMs = SPEED_TEST_CONNECT_TIMEOUT_MS,
     )
     if (handle == 0L) {
         onPhase(

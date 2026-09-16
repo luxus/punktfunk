@@ -17,9 +17,8 @@
 // The full sequence-header parse (AV1 spec 5.5.1) runs only when a keyframe actually carries
 // one — it exists to fill the `av1C` record fields (profile/level/tier/depth/chroma) and the
 // colorimetry extensions (so VideoDecoder.isHDRFormat and the presenter's color handling work
-// identically across codecs). The host currently gates 10-bit and 4:4:4 to HEVC, so an AV1
-// stream is 8-bit 4:2:0 today; the parser still reads depth/chroma/color faithfully so nothing
-// here needs touching when that gate lifts.
+// identically across codecs). An AV1 stream carries 8- or 10-bit 4:2:0 — the host gates 4:4:4
+// to HEVC, never depth.
 
 import CoreMedia
 import Foundation

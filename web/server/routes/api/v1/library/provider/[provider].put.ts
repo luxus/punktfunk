@@ -32,7 +32,7 @@ export default defineEventHandler(async (event) => {
 	const password = Array.isArray(body) ? undefined : body?.password;
 	// `confirmIfCommandExecution` already iterates arrays and only prompts when an entry actually
 	// carries a shell field — an ordinary catalog reconcile forwards untouched.
-	confirmIfCommandExecution(event, entries, password);
+	await confirmIfCommandExecution(event, entries, password);
 	// Preserve `?store=` (the provider routes are store-qualified upstream).
 	const { search } = getRequestURL(event);
 	return forwardJson(

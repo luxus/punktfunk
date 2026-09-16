@@ -13,7 +13,7 @@ import { forwardJson } from "../../../../util/forward";
 
 export default defineEventHandler(async (event) => {
 	const body = await readBody<{ password?: string; force?: boolean }>(event);
-	confirmPassword(event, body?.password);
+	await confirmPassword(event, body?.password);
 	// The password stops here — the host only ever sees the force flag.
 	return forwardJson(event, "/api/v1/update/apply", "POST", {
 		force: body?.force === true,

@@ -21,7 +21,7 @@ interface ArmBody {
 
 export default defineEventHandler(async (event) => {
 	const body = await readBody<ArmBody>(event);
-	confirmPassword(event, body?.password);
+	await confirmPassword(event, body?.password);
 	// Rebuild from the contract's own fields so the password cannot leak upstream, and so an
 	// unexpected extra field can't ride along to the host. Absent stays absent: the console omits
 	// `grants`/`expires_in_secs` to mean "keep what a re-pairing device already has".

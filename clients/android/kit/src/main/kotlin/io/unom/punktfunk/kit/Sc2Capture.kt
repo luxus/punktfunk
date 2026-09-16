@@ -2,6 +2,8 @@ package io.unom.punktfunk.kit
 
 import android.content.Context
 import android.hardware.usb.UsbDevice
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import java.nio.ByteBuffer
 
@@ -129,6 +131,27 @@ class Sc2Capture(
     /** Replay a host raw write on the physical pad — wire to [GamepadFeedback.onHidRaw]. */
     fun onHidRaw(padIndex: Int, kind: Int, data: ByteArray) {
         if (padIndex != pad?.index) return // addressed to some other controller
+        writeLink(kind, data)
+    }
+
+    /**
+     * Buzz both grip motors for [RUMBLE_MS] — the client's own rumble test, since a captured pad
+     * leaves the input stack and has no Android vibrator to pulse. False when no link is
+     * delivering reports. The stop frame is not optional: `0x80` carries a level the firmware
+     * holds until the next one.
+     */
+    fun testRumble(): Boolean {
+        if (!reporting) return false
+        writeLink(HID_RAW_OUTPUT, Sc2Device.rumbleFrame(0xFFFF, 0xFFFF))
+        Handler(Looper.getMainLooper()).postDelayed(
+            { writeLink(HID_RAW_OUTPUT, Sc2Device.rumbleFrame(0, 0)) },
+            RUMBLE_MS,
+        )
+        return true
+    }
+
+    /** Hand one id-first report to whichever transport is selected; no link, no write. */
+    private fun writeLink(kind: Int, data: ByteArray) {
         when (activeLink) {
             LINK_USB -> usb.writeRaw(kind, data)
             LINK_BLE -> ble.writeRaw(kind, data)
@@ -309,6 +332,13 @@ class Sc2Capture(
         const val LINK_NONE = 0
         const val LINK_USB = 1
         const val LINK_BLE = 2
+
+        /** The C ABI's `HID_RAW_OUTPUT` — the kind every output report goes out as. */
+        const val HID_RAW_OUTPUT = 0
+
+        /** Matches the vibrator pulse the ordinary pad test gives: long enough to feel, short
+         *  enough that a stuck stop frame is not a running motor. */
+        const val RUMBLE_MS = 300L
 
         /** Half deflection (device i16 range) — the stick-to-focus threshold. */
         const val STICK_NAV = 16384

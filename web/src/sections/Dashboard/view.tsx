@@ -13,6 +13,7 @@ import type { ActiveGame } from "@/api/gen/model/activeGame";
 import type { AudioWiring } from "@/api/gen/model/audioWiring";
 import type { GameEntry } from "@/api/gen/model/gameEntry";
 import type { RuntimeStatus } from "@/api/gen/model/runtimeStatus";
+import type { SessionRow } from "@/api/gen/model/sessionRow";
 import { QueryState } from "@/components/query-state";
 import { Stagger } from "@/components/stagger";
 import { Badge } from "@/components/ui/badge";
@@ -22,7 +23,9 @@ import { fmtNumber } from "@/lib/format";
 import type { Loadable } from "@/lib/query";
 import { m } from "@/paraglide/messages";
 import { ActivityCard } from "@/sections/Activity";
+import { LastSessionCard } from "./LastSessionCard";
 import { RunningGames } from "./RunningGames";
+import { SessionList } from "./SessionList";
 
 export const DashboardView: FC<{
 	status: Loadable<RuntimeStatus>;
@@ -34,9 +37,15 @@ export const DashboardView: FC<{
 	onStopSession: () => void;
 	onRequestIdr: () => void;
 	onEndGame: (game: ActiveGame) => void;
+	/** Per-session, by id — the host-wide `onStopSession` above stops every one of them. */
+	onStopOne: (row: SessionRow) => void;
+	onIdrOne: (row: SessionRow) => void;
+	onMuteOne: (row: SessionRow, muted: boolean) => void;
+	onAccessOne: (row: SessionRow, level: string) => void;
 	isStopping: boolean;
 	isRequestingIdr: boolean;
 	isEndingGame: boolean;
+	isChangingSession: boolean;
 }> = ({
 	status,
 	library,
@@ -44,9 +53,14 @@ export const DashboardView: FC<{
 	onStopSession,
 	onRequestIdr,
 	onEndGame,
+	onStopOne,
+	onIdrOne,
+	onMuteOne,
+	onAccessOne,
 	isStopping,
 	isRequestingIdr,
 	isEndingGame,
+	isChangingSession,
 }) => {
 	const s = status.data;
 	return (
@@ -121,11 +135,29 @@ export const DashboardView: FC<{
 								isEnding={isEndingGame}
 							/>
 
+							{/* Above the stream card: the list is who is connected, the card below is
+							    the numbers for one of them. */}
+							<SessionList
+								sessions={s.sessions}
+								onStop={onStopOne}
+								onIdr={onIdrOne}
+								onMute={onMuteOne}
+								onAccess={onAccessOne}
+								busy={isChangingSession}
+							/>
+
 							<Card>
 								<CardHeader className="flex flex-col items-start gap-3 space-y-0 sm:flex-row sm:items-center sm:justify-between">
 									<CardTitle className="flex items-center gap-2">
 										<MonitorPlay className="size-4" />
 										{m.status_session()}
+										{/* Which of the rows above these numbers belong to: the card is
+										    singular and the list is not. */}
+										{s.session_id != null && (
+											<span className="text-xs font-normal text-muted-foreground tabular-nums">
+												#{s.session_id}
+											</span>
+										)}
 										{s.active_sessions > 1 && (
 											<Badge variant="secondary">
 												{m.status_sessions_active({ count: s.active_sessions })}
@@ -240,7 +272,9 @@ export const DashboardView: FC<{
 								</CardContent>
 							</Card>
 
-							{/* Below the session card: the past, under the present. */}
+							{/* Below the session card: the past, under the present. The summary
+							    first — it is about the session the page was just showing. */}
+							<LastSessionCard />
 							<ActivityCard />
 						</Stagger>
 					)}

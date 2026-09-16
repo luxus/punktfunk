@@ -49,6 +49,15 @@ Want a guest picking games? Turn on that one Advanced toggle.
 A session's quality controls — resolution, bitrate, keyframe requests — are *not* governed. They
 only shape that device's own stream; restricting them would cost usability and buy no security.
 
+**The window list is not a grant.** A client can ask what is open on the screen it is streaming —
+so a player in a full-screen game can see the Discord call or the launcher waiting behind it — and
+every device gets that, spectators included: those windows are already in the picture it receives.
+Only the streamed screen is listed; your other monitors never appear, whatever the access level.
+*Acting* on a window is governed: **Gamepad, Pointer or Keyboard** lets a device focus or
+full-screen one (a device that can send input can already click a window to raise it), and
+**closing** one needs **Launch**, for the same reason Launch governs starting a game — the owner
+drives what runs. A view-only spectator can do none of the three.
+
 ## Temporary access
 
 Any grant can carry an expiry, picked when you approve the device or set later in its edit sheet:
@@ -102,9 +111,22 @@ with the overlay off. A guest who wants to check what they are allowed to do bri
 way they bring up the stats. The expiry warnings are separate: they are toasts, they announce a
 change rather than describe a state, and they appear whatever the overlay is set to.
 
+## Changing access while someone is streaming
+
+The Dashboard's **Sessions** card carries an access picker on each row. It changes the session in
+front of you — the mask the host checks every event against — with no reconnect: hand a
+view-only friend the pad, take it back when your turn comes round. An up-to-date client's access
+chip follows within the same second.
+
+This is the *session*, not the pairing. The device's stored access is untouched, so the change
+lasts until that session ends, and an edit to the device's own access overrides it. The picker can
+only re-point **within** the pairing: asking for more than the device is paired for lands on what
+the pairing allows, not on what was asked. Widening the device itself is still the **Paired
+devices** sheet, behind the console login.
+
 ## Where enforcement happens
 
-The host checks every input event against the device's grants before injecting it, refuses
+The host checks every input event against the session's live grants before injecting it, refuses
 ungranted planes at session setup (no Gamepad grant means the virtual pads are never created; no
 Microphone grant means the mic plane never attaches), and re-pairing a device **preserves** its
 existing access — the only way to widen a grant is the console's own dialogs, behind the console

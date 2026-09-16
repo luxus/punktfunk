@@ -27,7 +27,7 @@
 // Wrong attempts share the login throttle's per-peer budget, so none of these can be used as a
 // password oracle, and a lockout covers all of them at once.
 import { createError, type H3Event, setResponseHeader } from "h3";
-import { peerAddress, timingSafeEqual, uiPassword } from "./auth";
+import { authConfigured, peerAddress, verifyUiPassword } from "./auth";
 import {
 	recordLoginFailure,
 	recordLoginSuccess,
@@ -36,11 +36,16 @@ import {
 
 /**
  * Verify the re-entered console password, or throw the right HTTP error (503 unconfigured,
- * 429 throttled, 401 wrong). Returns nothing on success — the caller proceeds.
+ * 429 throttled, 401 wrong). Resolves with nothing on success — the caller proceeds.
+ *
+ * Async because the compare is an argon2id verify against the stored hash. Every caller must
+ * `await` it: a dropped promise would let the gated route run before the password is checked.
  */
-export function confirmPassword(event: H3Event, password: unknown): void {
-	const expected = uiPassword();
-	if (!expected) {
+export async function confirmPassword(
+	event: H3Event,
+	password: unknown,
+): Promise<void> {
+	if (!authConfigured()) {
 		throw createError({
 			statusCode: 503,
 			statusMessage: "auth not configured",
@@ -55,7 +60,7 @@ export function confirmPassword(event: H3Event, password: unknown): void {
 			statusMessage: "too many attempts — try again shortly",
 		});
 	}
-	if (!timingSafeEqual(String(password ?? ""), expected)) {
+	if (!(await verifyUiPassword(String(password ?? "")))) {
 		recordLoginFailure(ip);
 		throw createError({
 			statusCode: 401,

@@ -321,6 +321,7 @@ private val previewActions = RingActions(
     invokeHost = {}, sendShortcut = {},
     padAvailable = { true }, padShown = { false }, togglePad = {}, tapPadButton = {},
     pointerGranted = { true }, padMouseTarget = { 1 }, padMouseOn = { false }, togglePadMouse = {},
+    audioMute = { 0 }, audioMuteLabel = { null }, toggleStreamMute = {},
     currentMode = { intArrayOf(1920, 1080, 60) }, requestMode = { _, _, _ -> },
 )
 
@@ -345,7 +346,10 @@ private fun slotGroups(cfg: OverlayConfig): List<SlotGroup> {
             SlotOption("pad_mouse", "Controller mouse", "Your controller moves the host's pointer"),
         )),
         SlotGroup("View", listOf(SlotOption("stats", "Statistics"))),
-        SlotGroup("Audio", listOf(SlotOption("mic", "Microphone"))),
+        SlotGroup("Audio", listOf(
+            SlotOption("mic", "Microphone"),
+            SlotOption("stream_mute", "Mute this stream", "This device only — the host keeps playing"),
+        )),
         SlotGroup("Host", listOf(
             SlotOption("host:power.sleep", "Sleep host", "Only where the host offers it"),
             SlotOption("host:power.reboot", "Restart host", "Only where the host offers it"),

@@ -360,6 +360,9 @@ fn host_install(facts: &WinFacts, choices: &WinChoices) -> WinPlan {
     if facts.needs_coexistence() {
         service.push(format!("--mgmt-bind=0.0.0.0:{MGMT_PORT_MOVED}"));
     }
+    if let Some(addr) = &choices.web_bind {
+        service.push(format!("--web-bind={addr}"));
+    }
     let mut service_steps = vec![WinAction::Run(service)];
     if choices.start_service {
         service_steps.push(run(&[&host_exe, "service", "start"]));

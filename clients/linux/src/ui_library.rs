@@ -40,6 +40,8 @@ struct State {
     /// The "Games" heading — only earns its space once a Launchers shelf is above it.
     games_heading: gtk::Label,
     error_page: adw::StatusPage,
+    /// Says the shelf is a memory, not the host's answer. Hidden by a live catalog.
+    banner: adw::Banner,
     /// Per-page poster cache (entry id → texture) — a Retry re-renders without refetching.
     art: RefCell<HashMap<String, gdk::Texture>>,
     /// The Picture each entry currently renders into (rebuilt per render), so async art
@@ -236,6 +238,10 @@ fn build(
     retry.set_halign(gtk::Align::Center);
     error_page.set_child(Some(&retry));
 
+    // Disk-cache provenance lands here, not in the error page: a remembered shelf is still
+    // the titles to pick from, and its cards launch through the ordinary connect path.
+    let banner = adw::Banner::new("");
+
     let empty = adw::StatusPage::builder()
         .icon_name("applications-games-symbolic")
         .title("No games found")
@@ -271,6 +277,7 @@ fn build(
 
     let toolbar = adw::ToolbarView::new();
     toolbar.add_top_bar(&header);
+    toolbar.add_top_bar(&banner);
     toolbar.set_content(Some(&stack));
 
     let page = adw::NavigationPage::builder()
@@ -289,6 +296,7 @@ fn build(
         launchers_group,
         games_heading,
         error_page,
+        banner,
         art: RefCell::new(HashMap::new()),
         pics: RefCell::new(HashMap::new()),
         mock: Cell::new(false),
@@ -327,44 +335,104 @@ fn build(
     state
 }
 
+/// What the library worker reports, in that order: the disk snapshot if there is one,
+/// then whatever the host said. Two messages, because the whole point of the first is
+/// that it lands without waiting for the second.
+enum Loaded {
+    Cached(Vec<GameEntry>),
+    Fetched(Result<Vec<GameEntry>, library::LibraryError>),
+}
+
+/// Put one catalog on screen and start its posters. The cards are the same either way —
+/// a remembered title launches through the ordinary connect path, which dials the host.
+fn show(state: &Rc<State>, games: Vec<GameEntry>) {
+    *state.games.borrow_mut() = games.clone();
+    render(state);
+    state.stack.set_visible_child_name("grid");
+    load_art(state, &games);
+}
+
 /// Fetch the library off the main thread and route the result into the grid or the
-/// error/empty states.
+/// error/empty states, with the disk catalog on screen first when there is one.
+///
+/// A host that never answers keeps that remembered shelf and says so in the banner —
+/// the console shell's rule, and the same sentence. Only a first visit to an
+/// unreachable host has nothing to show and lands on the error page.
 fn load(state: &Rc<State>) {
     if state.mock.get() {
         return; // screenshot scene renders injected entries only
     }
     state.stack.set_visible_child_name("loading");
+    state.banner.set_revealed(false);
     let generation = state.generation.get().wrapping_add(1);
     state.generation.set(generation);
     let port = state.mgmt_port;
     let addr = state.req.addr.clone();
     let identity = state.identity.clone();
-    let pin = state.req.fp_hex.as_deref().and_then(trust::parse_hex32);
-    let (tx, rx) = async_channel::bounded(1);
+    let fp_hex = state.req.fp_hex.clone();
+    let pin = fp_hex.as_deref().and_then(trust::parse_hex32);
+    let (tx, rx) = async_channel::bounded(2);
+    let cache_key = fp_hex.clone();
     std::thread::Builder::new()
         .name("punktfunk-library".into())
         .spawn(move || {
-            let _ = tx.send_blocking(library::fetch_games(&addr, port, &identity, pin));
+            // Read here, not on the main loop: a shelf is not worth a stall. Keyed on the
+            // pinned fingerprint, so a box back on a new DHCP lease is the same library —
+            // and an unpinned host has no key, so it simply runs uncached.
+            if let Some(cached) = cache_key
+                .as_deref()
+                .and_then(pf_client_core::library_cache::load)
+                .filter(|c| !c.games.is_empty())
+                && tx.send_blocking(Loaded::Cached(cached.games)).is_err()
+            {
+                return;
+            }
+            let fetched = library::fetch_games(&addr, port, &identity, pin);
+            let _ = tx.send_blocking(Loaded::Fetched(fetched));
         })
         .expect("spawn library thread");
     let weak = Rc::downgrade(state);
     glib::spawn_future_local(async move {
-        let Ok(result) = rx.recv().await else { return };
-        let Some(state) = weak.upgrade() else { return };
-        if state.generation.get() != generation {
-            return; // a newer load already owns the grid
-        }
-        match result {
-            Ok(games) if games.is_empty() => state.stack.set_visible_child_name("empty"),
-            Ok(games) => {
-                *state.games.borrow_mut() = games.clone();
-                render(&state);
-                state.stack.set_visible_child_name("grid");
-                load_art(&state, &games);
+        let mut remembered = false;
+        while let Ok(msg) = rx.recv().await {
+            let Some(state) = weak.upgrade() else { return };
+            if state.generation.get() != generation {
+                return; // a newer load already owns the grid
             }
-            Err(e) => {
-                state.error_page.set_description(Some(&e.to_string()));
-                state.stack.set_visible_child_name("error");
+            match msg {
+                Loaded::Cached(games) => {
+                    remembered = true;
+                    state
+                        .banner
+                        .set_title("Last known library \u{2014} asking the host\u{2026}");
+                    state.banner.set_revealed(true);
+                    show(&state, games);
+                }
+                Loaded::Fetched(Ok(games)) if games.is_empty() => {
+                    // An empty answer is the host's, so it replaces the memory. The disk
+                    // file stays: `store` refuses an empty list rather than blanking it.
+                    state.banner.set_revealed(false);
+                    state.stack.set_visible_child_name("empty");
+                }
+                Loaded::Fetched(Ok(games)) => {
+                    state.banner.set_revealed(false);
+                    show(&state, games);
+                    // Remembered AFTER it is on screen: the disk write is not on the path
+                    // to a shelf.
+                    if let Some(fp) = fp_hex.as_deref() {
+                        pf_client_core::library_cache::store(fp, &state.games.borrow());
+                    }
+                }
+                Loaded::Fetched(Err(e)) if remembered => {
+                    tracing::info!(addr = %state.req.addr, error = %e, "library fetch failed; keeping the remembered shelf");
+                    state
+                        .banner
+                        .set_title("Last known library \u{2014} the host didn\u{2019}t answer");
+                }
+                Loaded::Fetched(Err(e)) => {
+                    state.error_page.set_description(Some(&e.to_string()));
+                    state.stack.set_visible_child_name("error");
+                }
             }
         }
     });

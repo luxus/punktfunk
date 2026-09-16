@@ -34,6 +34,8 @@ pub enum SlotId {
     Qam,
     /// Controller mouse: the pad drives the host pointer instead of its virtual pad.
     PadMouse,
+    /// Silence this client's speakers. Local: the host keeps playing for anyone joined to it.
+    StreamMute,
     Host(String),
     Shortcut(String),
 }
@@ -53,6 +55,7 @@ impl SlotId {
             SlotId::Guide => "guide".into(),
             SlotId::Qam => "qam".into(),
             SlotId::PadMouse => "pad_mouse".into(),
+            SlotId::StreamMute => "stream_mute".into(),
             SlotId::Host(id) => format!("host:{id}"),
             SlotId::Shortcut(id) => format!("shortcut:{id}"),
         }
@@ -72,6 +75,7 @@ impl SlotId {
             "guide" => SlotId::Guide,
             "qam" => SlotId::Qam,
             "pad_mouse" => SlotId::PadMouse,
+            "stream_mute" => SlotId::StreamMute,
             _ => {
                 if let Some(id) = s.strip_prefix("host:").filter(|id| !id.is_empty()) {
                     SlotId::Host(id.into())
@@ -96,49 +100,7 @@ pub struct Shortcut {
     pub keys: Vec<String>,
 }
 
-/// Windows VK for a stored key name. The wire is VKs; presets store names.
-/// `None` means this build does not know the name — the chord does not fire.
-pub fn key_vk(name: &str) -> Option<u8> {
-    let n = name.trim().to_ascii_lowercase();
-    let vk = match n.as_str() {
-        "ctrl" | "control" => 0x11,
-        "shift" => 0x10,
-        "alt" | "option" => 0x12,
-        "win" | "cmd" | "super" | "meta" => 0x5B,
-        "escape" | "esc" => 0x1B,
-        "tab" => 0x09,
-        "enter" | "return" => 0x0D,
-        "space" => 0x20,
-        "backspace" => 0x08,
-        "delete" | "del" => 0x2E,
-        "insert" => 0x2D,
-        "home" => 0x24,
-        "end" => 0x23,
-        "pageup" => 0x21,
-        "pagedown" => 0x22,
-        "up" => 0x26,
-        "down" => 0x28,
-        "left" => 0x25,
-        "right" => 0x27,
-        "printscreen" => 0x2C,
-        "pause" => 0x13,
-        "capslock" => 0x14,
-        _ => {
-            let b = n.as_bytes();
-            return match b {
-                [c @ b'a'..=b'z'] => Some(0x41 + (c - b'a')),
-                [c @ b'0'..=b'9'] => Some(0x30 + (c - b'0')),
-                [b'f', rest @ ..] if !rest.is_empty() => n[1..]
-                    .parse::<u8>()
-                    .ok()
-                    .filter(|f| (1..=24).contains(f))
-                    .map(|f| 0x70 + f - 1),
-                _ => None,
-            };
-        }
-    };
-    Some(vk)
-}
+pub use punktfunk_core::input::key_vk;
 
 pub fn chord_chip(keys: &[String]) -> String {
     keys.iter()
@@ -438,7 +400,10 @@ pub fn catalogue(cfg: &OverlayConfig, platform: RingPlatform) -> Vec<CatalogueGr
         },
         CatalogueGroup {
             title: "Audio",
-            entries: vec![e("mic", "Microphone", "")],
+            entries: vec![
+                e("mic", "Microphone", ""),
+                e("stream_mute", "Mute this stream", "This device only"),
+            ],
         },
         CatalogueGroup {
             title: "Host",
@@ -491,6 +456,7 @@ pub fn slot_icon(id: &str, state: &str) -> Option<&'static str> {
         "guide" => "house",
         "qam" => "panel-right",
         "pad_mouse" => "mouse",
+        "stream_mute" => "volume-2",
         "more" => "ellipsis",
         "host:power.sleep" => "moon",
         "host:power.reboot" => "rotate-cw",
@@ -703,6 +669,7 @@ mod tests {
             "guide",
             "qam",
             "pad_mouse",
+            "stream_mute",
             "host:power.reboot",
             "shortcut:s2",
         ] {

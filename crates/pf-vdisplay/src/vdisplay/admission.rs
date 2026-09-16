@@ -26,6 +26,9 @@ pub struct LiveDisplay {
     /// The owner's isolated planes (`design/gamescope-multiuser.md`): a joiner reads its input
     /// relay and taps its sink.
     pub isolation: Option<crate::SessionIsolation>,
+    /// `node.name` of the sink this session captures, published once its capturer is open.
+    /// A joiner on the shared path taps it instead of claiming a second default sink.
+    pub audio_sink: Arc<Mutex<Option<String>>>,
 }
 
 #[derive(Clone)]

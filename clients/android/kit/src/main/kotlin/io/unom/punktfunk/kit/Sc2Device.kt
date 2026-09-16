@@ -68,12 +68,36 @@ object Sc2Device {
         else -> null
     }
 
+    /** Grip-rumble output report — the id Steam drives both motors with. */
+    const val ID_OUT_RUMBLE = 0x80
+
     /**
-     * The pending-OUT queue key for an output frame. Steam re-sends `0x80` grip rumble as a level,
-     * so a newer one supersedes the pending one; every other id is a one-shot that must not be lost.
+     * The pending-OUT queue key for an output frame. Steam re-sends [ID_OUT_RUMBLE] grip rumble as
+     * a level, so a newer one supersedes the pending one; every other id is a one-shot that must
+     * not be lost.
      */
     fun outputCoalesceKey(frame: ByteArray): Int =
-        if (frame.firstOrNull() == 0x80.toByte()) OutReportQueue.KEY_RUMBLE else OutReportQueue.NO_COALESCE
+        if (frame.firstOrNull() == ID_OUT_RUMBLE.toByte()) {
+            OutReportQueue.KEY_RUMBLE
+        } else {
+            OutReportQueue.NO_COALESCE
+        }
+
+    /**
+     * `MsgHapticRumble`: `[0x80][type][intensity u16][left.speed u16][left.gain i8]
+     * [right.speed u16][right.gain i8]`, little-endian, 10 bytes on the wire — the same offsets
+     * the host reads back in `triton_proto::parse_triton_rumble`. Type 0 and gain 0 are the
+     * unattenuated default; a frame of zero speeds is what stops the motors again.
+     */
+    fun rumbleFrame(left: Int, right: Int): ByteArray = ByteArray(10).also {
+        it[0] = ID_OUT_RUMBLE.toByte()
+        it[2] = 0xFF.toByte() // intensity: full scale
+        it[3] = 0xFF.toByte()
+        it[4] = (left and 0xFF).toByte()
+        it[5] = ((left shr 8) and 0xFF).toByte()
+        it[7] = (right and 0xFF).toByte()
+        it[8] = ((right shr 8) and 0xFF).toByte()
+    }
 
     /**
      * Incoming: a GATT characteristic value is the bare payload with no HID report-id byte, so
@@ -179,6 +203,20 @@ object Sc2Device {
         it[2] = 3 // one ControllerSetting {u8 num, u16 value}
         it[3] = 0x2E // SETTING_ENABLE_RAW_JOYSTICK
         // [4..6] = disabled (0) — firmware emits calibrated signed i16 values
+    }
+
+    /**
+     * Lizard mode back ON — the same settings write, value non-zero. The claim removes the pad
+     * from the OS input stack entirely, and lizard's kb/mouse is what navigates Android TV, so a
+     * capture restores it as it releases: the firmware watchdog would, but only after seconds of
+     * a dead pad.
+     */
+    val ENABLE_LIZARD: ByteArray = ByteArray(64).also {
+        it[0] = 0x01 // feature report id
+        it[1] = 0x87.toByte() // ID_SET_SETTINGS_VALUES
+        it[2] = 3 // one ControllerSetting {u8 num, u16 value}
+        it[3] = 9 // SETTING_LIZARD_MODE
+        it[4] = 1 // LIZARD_MODE_ON (u16 little-endian)
     }
 
     const val LIZARD_REFRESH_MS = 3000L

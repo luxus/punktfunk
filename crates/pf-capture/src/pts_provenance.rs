@@ -76,6 +76,12 @@ pub(crate) struct PtsReport {
     /// Empirical period. A skipped tick is what a negotiated refresh would
     /// mis-score as jitter.
     pub(crate) period_us: i64,
+    /// Ticks the producer never delivered, from the intervals that swallowed
+    /// them. `period_us` is a median and `*_mad_us` a median deviation, so both
+    /// are blind to a hole by construction: a producer that SKIPS and one that
+    /// runs SLOW both read as a low `frames`. This separates them — skipping
+    /// holds the period and raises this, running slow raises `period_us`.
+    pub(crate) skipped: u64,
     /// Own-median MAD, µs. A shared centre folds period-estimation error and any
     /// genuine rate difference into "jitter".
     pub(crate) hdr_mad_us: i64,
@@ -122,11 +128,15 @@ impl PtsProvenance {
         if self.delivery_intervals.len() < 8 {
             return None;
         }
+        // Both before `mad`, which rewrites the intervals into deviations.
+        let period_ns = median(&mut self.delivery_intervals);
+        let skipped = skipped_ticks(&self.delivery_intervals, period_ns);
         Some(PtsReport {
             frames: self.frames,
             with_hdr: self.with_hdr,
             samples: self.delivery_intervals.len() as u64,
-            period_us: median(&mut self.delivery_intervals) / 1_000,
+            period_us: period_ns / 1_000,
+            skipped,
             hdr_mad_us: mad(&mut self.hdr_intervals) / 1_000,
             delivery_mad_us: mad(&mut self.delivery_intervals) / 1_000,
             offset_p50_ms: median(&mut self.offsets) / 1_000_000,
@@ -160,6 +170,18 @@ fn median(v: &mut [i64]) -> i64 {
     }
     v.sort_unstable();
     v[v.len() / 2]
+}
+
+/// Whole ticks the gaps swallowed, each interval rounded to nearest periods.
+/// Ordinary jitter rounds to one period and counts nothing.
+fn skipped_ticks(intervals: &[i64], period_ns: i64) -> u64 {
+    if period_ns <= 0 {
+        return 0;
+    }
+    intervals
+        .iter()
+        .map(|&d| (d.max(0).saturating_add(period_ns / 2) / period_ns - 1).max(0) as u64)
+        .sum()
 }
 
 /// MAD about the series' own median. A mean lets a skipped tick dominate; a
@@ -281,6 +303,40 @@ mod tests {
             r.hdr_mad_us > 1_000,
             "…and both must show the wobble, got {} us",
             r.hdr_mad_us
+        );
+    }
+
+    /// The issue-912 field question: a 30 s window short of its frame count is
+    /// either a producer skipping ticks or one running slow, and the median
+    /// period cannot tell them apart. `skipped` must.
+    #[test]
+    fn a_skipping_producer_is_separable_from_a_slow_one() {
+        let mut skip = PtsProvenance::new();
+        let mut t = RT_BASE as i64;
+        for i in 0..600i64 {
+            // Holds the grid, but stalls 10 ticks every 100 frames.
+            t += if i % 100 == 0 { PERIOD * 10 } else { PERIOD };
+            skip.observe(None, t as u64);
+        }
+        let r = skip.report().unwrap();
+        assert!(
+            (r.period_us - PERIOD / 1_000).abs() <= 1,
+            "a skipping producer still holds its period, got {} us",
+            r.period_us
+        );
+        // i=0 opens the chain and yields no interval, so five stalls are scored.
+        assert_eq!(r.skipped, 45, "five stalls of nine swallowed ticks each");
+
+        let mut slow = PtsProvenance::new();
+        for i in 0..600i64 {
+            slow.observe(None, (RT_BASE as i64 + i * PERIOD * 3 / 2) as u64);
+        }
+        let r = slow.report().unwrap();
+        assert_eq!(r.skipped, 0, "a slow producer skips nothing — it drags");
+        assert!(
+            (r.period_us - PERIOD * 3 / 2 / 1_000).abs() <= 1,
+            "…and shows it in the period, got {} us",
+            r.period_us
         );
     }
 

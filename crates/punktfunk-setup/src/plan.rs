@@ -431,6 +431,9 @@ fn group_steps(facts: &Facts, choices: &Choices) -> Vec<Step> {
 
 fn option_steps(facts: &Facts, choices: &Choices) -> Vec<Step> {
     let mut steps = vec![];
+    // Always written, never conditional: the line is what tells web-init.sh this box has already
+    // answered the question, so an upgrade never has to guess the console's reach for it.
+    steps.push(Step::set_env("PUNKTFUNK_UI_BIND", choices.web_bind.clone()));
     if choices.gamestream {
         if facts.sunshine_active {
             steps.push(Step::note(

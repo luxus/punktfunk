@@ -47,6 +47,7 @@ static STATE: Mutex<State> = Mutex::new(State {
 /// events (parallel-displays plan) and the single slot is never worse than the historical
 /// whole-desktop mapping.
 pub fn set_stream_target(target: Option<pf_win_display::win_display::CcdTargetKey>) {
+    crate::bump_aim_gen();
     let mut st = STATE.lock().unwrap();
     if st.target != target {
         tracing::info!(?target, "absolute-input stream target set");

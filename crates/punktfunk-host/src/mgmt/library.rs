@@ -15,6 +15,7 @@ use super::auth::AuthLane;
 use super::shared::*;
 use axum::http::header;
 use axum::Extension;
+use sha2::{Digest, Sha256};
 
 /// Refuse a custom-entry write that carries an operator-privileged field on a lane that may
 /// not set one, or local art the proxy would not serve.
@@ -87,8 +88,9 @@ pub(crate) struct LibraryQuery {
 
 /// List every title this host knows, sorted by title.
 ///
-/// Plugin-synced entries plus custom ones. Local-file art is rewritten to this API's art
-/// proxy; remote URLs pass through. `?provider=` / `?platform=` (case-insensitive) narrow.
+/// Plugin-synced entries plus custom ones. Art the host can serve is rewritten to this API's
+/// art proxy, local paths and remote URLs alike; a URL the proxy already refused passes
+/// through. `?provider=` / `?platform=` (case-insensitive) narrow.
 ///
 /// The operator lane sees hidden titles (`hidden: true`) so the console can un-hide them.
 /// Every other lane is filtered upstream and cannot tell they exist.
@@ -117,15 +119,16 @@ pub(crate) async fn get_library(
         let mut rows = crate::library::all_games_for_operator();
         rows.retain(|r| matches_query(&r.entry, &q));
         for r in &mut rows {
-            crate::library::proxy_local_art(&r.entry.id, &mut r.entry.art);
+            crate::library::proxy_art(&r.entry.id, &mut r.entry.art);
         }
         return Json(rows).into_response();
     }
     let mut games = crate::library::all_games();
     games.retain(|g| matches_query(g, &q));
-    // Provider covers are on-host paths; rewrite to the art proxy so the client never sees them.
+    // Rewrite to the art proxy: an on-host path a client cannot reach, and a CDN URL every
+    // client would otherwise fetch over the WAN for itself.
     for g in &mut games {
-        crate::library::proxy_local_art(&g.id, &mut g.art);
+        crate::library::proxy_art(&g.id, &mut g.art);
     }
     // `cert_may_access` allows GET /library, so paired clients see this body. For a custom
     // entry `launch.value` is the operator's shell command; clear it. `kind` stays so the
@@ -672,10 +675,12 @@ pub(crate) async fn report_provider_running(
 
 /// Stream one cover-art image for a library entry.
 ///
-/// Resolves `kind` (`portrait` | `hero` | `logo` | `header`) for a catalog id and returns
-/// the local file bytes. Unknown id or kind is 404 so the client can try the next candidate.
-/// Remote `http(s)` art is fetched by the client; this proxy exists for launcher cover
-/// caches on the host disk.
+/// Resolves `kind` (`portrait` | `hero` | `logo` | `header`) for a catalog id and returns the
+/// bytes: a launcher's cover cache on the host disk, or a remote URL the host fetches once on
+/// the first miss and then serves from its own store. Unknown id or kind is 404 so the client
+/// can try the next candidate, and so is a URL the fetch refused — `GET /library` advertises
+/// that one verbatim again. The response carries `Cache-Control` and an `ETag` of the bytes; a
+/// request whose `If-None-Match` names that tag gets 304 with no body.
 #[utoipa::path(
     get,
     path = "/library/art/{id}/{kind}",
@@ -684,14 +689,19 @@ pub(crate) async fn report_provider_running(
     params(
         ("id" = String, Path, description = "The store-qualified library id, e.g. `steam:570`"),
         ("kind" = String, Path, description = "`portrait` | `hero` | `logo` | `header`"),
+        ("If-None-Match" = Option<String>, Header, description = "An `ETag` from an earlier response"),
     ),
     responses(
         (status = OK, description = "Image bytes", content_type = "image/jpeg"),
+        (status = NOT_MODIFIED, description = "The tag in `If-None-Match` is current"),
         (status = UNAUTHORIZED, description = "Missing or invalid credentials", body = ApiError),
         (status = NOT_FOUND, description = "No art of that kind for that id", body = ApiError),
     )
 )]
-pub(crate) async fn get_library_art(Path((id, kind)): Path<(String, String)>) -> Response {
+pub(crate) async fn get_library_art(
+    Path((id, kind)): Path<(String, String)>,
+    headers: axum::http::HeaderMap,
+) -> Response {
     let Some(kind) = crate::library::ArtKind::parse(&kind) else {
         return api_error(StatusCode::NOT_FOUND, "unknown art kind");
     };
@@ -699,11 +709,53 @@ pub(crate) async fn get_library_art(Path((id, kind)): Path<(String, String)>) ->
     // The proxy does not know which store the id belongs to.
     let stored = {
         let id = id.clone();
-        tokio::task::spawn_blocking(move || crate::library::library_local_art_bytes(&id, kind))
-            .await
+        tokio::task::spawn_blocking(move || crate::library::library_art_bytes(&id, kind)).await
     };
     if let Ok(Some((bytes, ctype))) = stored {
-        return ([(header::CONTENT_TYPE, ctype)], bytes).into_response();
+        // The tag is the bytes' hash: a replaced cover misses, an unchanged one revalidates
+        // for free. A day of freshness keeps a shelf revisit off the network entirely.
+        let etag = format!("\"{}\"", hex::encode(&Sha256::digest(&bytes)[..16]));
+        let cache = [
+            (header::CACHE_CONTROL, "public, max-age=86400".to_string()),
+            (header::ETAG, etag.clone()),
+        ];
+        let sent = headers
+            .get(header::IF_NONE_MATCH)
+            .and_then(|v| v.to_str().ok());
+        if not_modified(sent, &etag) {
+            return (StatusCode::NOT_MODIFIED, cache).into_response();
+        }
+        let [cc, et] = cache;
+        return ([cc, et, (header::CONTENT_TYPE, ctype)], bytes).into_response();
     }
     api_error(StatusCode::NOT_FOUND, "no art of that kind for this title")
+}
+
+/// Whether an `If-None-Match` value names `etag`: a list, `*`, or a weak `W/` form of it.
+fn not_modified(if_none_match: Option<&str>, etag: &str) -> bool {
+    if_none_match.is_some_and(|v| {
+        v.split(',')
+            .map(|t| t.trim().trim_start_matches("W/"))
+            .any(|t| t == "*" || t == etag)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::not_modified;
+
+    #[test]
+    fn if_none_match_forms() {
+        let tag = "\"abc\"";
+        assert!(not_modified(Some("\"abc\""), tag));
+        assert!(not_modified(Some("\"x\", \"abc\""), tag));
+        assert!(not_modified(Some("W/\"abc\""), tag));
+        assert!(not_modified(Some("*"), tag));
+        assert!(!not_modified(Some("\"abd\""), tag));
+        assert!(
+            !not_modified(Some("abc"), tag),
+            "an unquoted tag is not ours"
+        );
+        assert!(!not_modified(None, tag));
+    }
 }

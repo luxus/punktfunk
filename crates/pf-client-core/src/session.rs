@@ -1488,8 +1488,10 @@ fn codec_fallback_event(
 
 /// Dedicated audio thread: owns decoder, scratch, and PipeWire player, and blocks
 /// on `next_audio` (the plane's single consumer). Decoded chunks are Vecs recycled
-/// from the player's pool — steady state allocates nothing. Best-effort: setup
-/// failure logs and the session streams video-only. Exits on stop or a closed plane.
+/// from the player's pool — steady state allocates nothing. A muted stream still
+/// decodes and still queues, in silence: the device never closes, so a toggle costs
+/// neither a click nor a resync. Best-effort: setup failure logs and the session
+/// streams video-only. Exits on stop or a closed plane.
 fn spawn_audio(
     connector: Arc<NativeClient>,
     stop: Arc<AtomicBool>,
@@ -1595,6 +1597,18 @@ fn spawn_audio(
             // leaves the thread as it was (`audio_rt`).
             crate::audio_rt::boost_and_log("punktfunk-audio-rx");
             let mut pcm = vec![0f32; scratch];
+            // Every frame reaches the device through here. A muted stream queues silence of
+            // the same length, so the ring keeps its cadence and unmute lands in step — the
+            // frame still decoded, so there is no decoder state to rebuild.
+            let queue = |player: &audio::AudioPlayer, pcm: &[f32]| {
+                let mut buf = player.take_buffer();
+                if connector.audio_muted() {
+                    buf.resize(pcm.len(), 0.0);
+                } else {
+                    buf.extend_from_slice(pcm);
+                }
+                player.push(buf);
+            };
             let mut gaps = punktfunk_core::audio::AudioGapTracker::new();
             let mut frame_samples = 0usize;
             let mut av = punktfunk_core::audio::AvSync::new_at_rate(channels, rate_hz);
@@ -1684,17 +1698,13 @@ fn spawn_audio(
                                 break;
                             }
                             if let Some(n) = dec.conceal(frame_samples, &mut pcm) {
-                                let mut buf = player.take_buffer();
-                                buf.extend_from_slice(&pcm[..n]);
-                                player.push(buf);
+                                queue(&player, &pcm[..n]);
                             }
                         }
                         match dec.decode(&pkt.data, &mut pcm) {
                             Some(n) => {
                                 frame_samples = n;
-                                let mut buf = player.take_buffer();
-                                buf.extend_from_slice(&pcm[..n]);
-                                player.push(buf);
+                                queue(&player, &pcm[..n]);
                             }
                             // Opus: corrupt packet. PCM: not a whole number of samples
                             // at the negotiated depth. Either way the frame is lost.
@@ -1708,9 +1718,7 @@ fn spawn_audio(
                         let depth_ms = (sync_cell.depth() / per_ms) as u32;
                         if frame_samples > 0 && drought.conceal(last_packet.elapsed(), depth_ms) {
                             if let Some(n) = dec.conceal(frame_samples, &mut pcm) {
-                                let mut buf = player.take_buffer();
-                                buf.extend_from_slice(&pcm[..n]);
-                                player.push(buf);
+                                queue(&player, &pcm[..n]);
                             }
                             sync_cell.publish_plc_ms(drought.total_ms());
                         }

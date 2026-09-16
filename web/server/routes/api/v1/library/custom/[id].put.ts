@@ -8,7 +8,7 @@ import { confirmIfCommandExecution } from "../../../../../util/libraryConfirm";
 export default defineEventHandler(async (event) => {
 	const id = getRouterParam(event, "id") ?? "";
 	const body = await readBody<Record<string, unknown>>(event);
-	confirmIfCommandExecution(event, body, body?.password);
+	await confirmIfCommandExecution(event, body, body?.password);
 	const { password: _password, ...entry } = body ?? {};
 	return forwardJson(
 		event,

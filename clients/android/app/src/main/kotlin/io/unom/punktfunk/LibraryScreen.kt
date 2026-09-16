@@ -276,6 +276,7 @@ fun LibraryScreen(
                 context, streamSettings, identity,
                 host.address, host.port, host.fpHex,
                 launch = game.id.takeUnless { game.isDesktop },
+                dialer = "touch/library",
             )
             launching = false
             if (handle != 0L) {

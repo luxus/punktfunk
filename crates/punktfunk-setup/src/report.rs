@@ -8,14 +8,15 @@
 //! Under `--yes` the choices summary is the only place the punktfunk-group
 //! grant is stated, so the row names it (`design/installer-v2.md`).
 
-use crate::choices::{Action, Choices};
+use crate::choices::{Action, Choices, LAN_BIND, LOOPBACK_BIND};
 use crate::exec::{Opts, Outcome};
 use crate::facts::{Facts, Nvidia, DOCS};
 use crate::seam::CommandRunner;
 use crate::ui::Reporter;
 
 /// Printing the password is one command, and it is the same one in the step that offers to
-/// generate it, in the outro, and in the docs.
+/// generate it, in the outro, and in the docs. It prints until the first sign-in only: the
+/// console then stores a salted hash, and a forgotten password is reset, not read.
 pub const PASSWORD_READ: &str =
     "sed -n 's/^PUNKTFUNK_UI_PASSWORD=//p' ~/.config/punktfunk/web-password";
 
@@ -74,6 +75,21 @@ pub fn choices_summary(ui: &dyn Reporter, choices: &Choices) {
             Some(why) if on => ui.line(&format!("  {label}: {value}  ({why})")),
             _ => ui.line(&format!("  {label}: {value}")),
         }
+    }
+    // Not a yes/no, and it belongs here anyway: under --yes this summary is the only place who
+    // can reach the console is stated, and it prints before the first privileged command.
+    ui.line(&format!(
+        "  Web console reachable from: {}",
+        bind_label(choices)
+    ));
+}
+
+/// The console's bind in the words the question asked it in.
+fn bind_label(choices: &Choices) -> String {
+    match choices.web_bind.as_str() {
+        LOOPBACK_BIND => "this machine only".to_string(),
+        LAN_BIND => "this local network".to_string(),
+        addr => addr.to_string(),
     }
 }
 
@@ -166,12 +182,19 @@ fn next_steps(
     // console on the box. `--dry-run` shows the same text (it installs nothing).
     if run.which("punktfunk-web-server") || opts.dry {
         ui.line("  On the device you play on, open punktfunk and pick this host. Approve it in the notification here, or in the console.");
-        ui.line(&format!(
-            "  Console: https://{ip}:47992  (its certificate is this host's own)"
-        ));
+        // The URL has to be the one that answers. A loopback console is not at the box's LAN
+        // address, and printing it there is how an operator concludes the install failed.
+        let console = match choices.web_bind.as_str() {
+            LOOPBACK_BIND => "https://127.0.0.1:47992  (this machine only — PUNKTFUNK_UI_BIND in host.env opens it up)".to_string(),
+            LAN_BIND => format!("https://{ip}:47992  (its certificate is this host's own)"),
+            addr => format!("https://{addr}:47992  (its certificate is this host's own)"),
+        };
+        ui.line(&format!("  Console: {console}"));
         let password = match choices.web_password {
-            Some(_) => format!("  Password: the one you typed — this prints it: {PASSWORD_READ}"),
-            None => format!("  Password — this prints it: {PASSWORD_READ}"),
+            Some(_) => "  Password: the one you typed".to_string(),
+            None => {
+                format!("  Password — this prints it, until you first sign in: {PASSWORD_READ}")
+            }
         };
         ui.line(&password);
     } else {

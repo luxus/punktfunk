@@ -76,6 +76,161 @@ pub struct SessionRef {
     pub hdr: bool,
 }
 
+/// Why a session ended, in the client's own words
+/// ([`punktfunk_core::client::PunktfunkEndReason`]) so both ends name the same end the
+/// same way. The bytes match that ABI where the two overlap.
+///
+/// [`Self::StoppedByOperator`] is the one a client cannot see: the host closes it as
+/// code 0, which every client reads as `host_ended`.
+#[derive(Serialize, Deserialize, ToSchema, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[repr(u8)]
+pub enum SessionEndReason {
+    /// The client hung up — its Stop, or its process went away.
+    Local = 1,
+    /// The launched game exited and the session followed it (`APP_EXITED`).
+    GameExited = 2,
+    /// The stream loop finished cleanly.
+    HostEnded = 3,
+    /// The stream loop bailed. The host log above the summary has the cause.
+    HostError = 4,
+    /// The link died: idle timeout, reset, network.
+    Lost = 5,
+    /// `DELETE /session`, `DELETE /session/{id}`, or unpairing a streaming client.
+    StoppedByOperator = 6,
+}
+
+impl SessionEndReason {
+    /// `0` is "nothing latched": the video loop never reached its clean tail.
+    pub fn from_u8(v: u8) -> Option<SessionEndReason> {
+        Some(match v {
+            1 => Self::Local,
+            2 => Self::GameExited,
+            3 => Self::HostEnded,
+            4 => Self::HostError,
+            5 => Self::Lost,
+            6 => Self::StoppedByOperator,
+            _ => return None,
+        })
+    }
+
+    /// First writer wins. The path that knows why latches before teardown reaches the
+    /// generic one, so a game exit is never overwritten by the close that follows it.
+    pub fn latch(self, slot: &std::sync::atomic::AtomicU8) {
+        use std::sync::atomic::Ordering;
+        let _ = slot.compare_exchange(0, self as u8, Ordering::SeqCst, Ordering::Relaxed);
+    }
+}
+
+/// Client datagrams this session took, by class.
+///
+/// Counted up to the moment the session was summarized: the reader task ends with the
+/// connection, which closes after this, so a last straggler can fall outside.
+#[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
+pub struct InputCounts {
+    /// Keyboard, pointer and touch events.
+    pub events: u64,
+    /// Opus microphone frames.
+    pub mic: u64,
+    /// Gamepad and stylus batches.
+    pub rich: u64,
+    /// Offers the input queue refused because it was full. Not a wire loss.
+    pub dropped: u64,
+}
+
+/// Client gyro arrival counts. Absent when no pad ever sent motion.
+#[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
+pub struct GyroCadence {
+    pub samples: u64,
+    /// Gaps of 500 ms or more — the feed stopping, not jitter.
+    pub stalls: u64,
+}
+
+/// Audio egress for the whole session. Absent when the session had no audio plane.
+#[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
+pub struct AudioEgress {
+    pub sent: u64,
+    /// Frames synthesized over a capture hole. Wire continuity is not captured continuity.
+    pub infilled: u64,
+    /// Departures a whole frame or more behind their slot.
+    pub late: u64,
+    pub max_late_ms: u64,
+    /// Times the pacer fell far enough behind to forgive its debt and re-anchor.
+    pub reanchors: u64,
+}
+
+/// What the encoder's target did over the session. Absent when no encoder opened.
+#[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
+pub struct BitrateSpan {
+    pub min_kbps: u32,
+    /// Mean of the targets the session ran at, NOT weighted by how long each held.
+    /// A rate held for a second counts as much as one held for an hour.
+    pub avg_kbps: u32,
+    pub max_kbps: u32,
+    /// Times the target moved after the opening rate: adaptive-bitrate decisions, plus a
+    /// rebuild re-resolving what it actually encodes.
+    pub adaptive_steps: u32,
+}
+
+/// Everything the host knows about one finished session.
+///
+/// The `session.ended` payload AND the body of `GET /api/v1/session/last`: one struct,
+/// so a screenshot of the console card is the API answer a bug report would have carried.
+/// A number the host does not accumulate per session is absent rather than zero.
+#[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
+pub struct SessionSummary {
+    /// Same id [`SessionRef`] and the per-session routes carry.
+    pub id: u64,
+    /// Cert-fingerprint prefix, or peer IP for an anonymous client.
+    pub client: String,
+    /// Display name (trust store, else the name the client sent). Absent if nameless.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_name: Option<String>,
+    /// Host wall clock at stream start, unix seconds.
+    pub started_unix: i64,
+    pub duration_s: u64,
+    /// `WxH@Hz` as last delivered; a mid-session mode switch moves it.
+    pub mode: String,
+    pub hdr: bool,
+    /// Shared another session's display at ITS mode instead of owning one.
+    pub join: bool,
+    /// `h264` | `hevc` | `av1` | `pyrowave`.
+    pub codec: String,
+    /// 8 or 10. Independent of `hdr` — 10-bit SDR is a mode.
+    pub bit_depth: u8,
+    /// `4:2:0` or `4:4:4`.
+    pub chroma: String,
+    /// The encoder's target when the session ended, kbps. `bitrate` has the span.
+    pub bitrate_kbps: u32,
+    /// What the encoder's target did. Absent on a session that opened no encoder.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bitrate: Option<BitrateSpan>,
+    /// Access units the send thread put on the wire. Absent when the video loop
+    /// never reached its tail — the `host_error` case.
+    #[schema(value_type = u64, required = false)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frames_sent: Option<u64>,
+    /// Frames the capturer's encode pool refused. Absent on a capturer that does not
+    /// count them (everything but the Windows IDD push path).
+    #[schema(value_type = u64, required = false)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frames_dropped: Option<u64>,
+    pub input: InputCounts,
+    /// Absent when no pad sent motion — most sessions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gyro: Option<GyroCadence>,
+    /// Absent when the session ran no audio plane (synthetic source, or the thread never started).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio: Option<AudioEgress>,
+    /// Hello → first video packet, ms. `0` if no packet ever left.
+    pub bringup_ms: u32,
+    /// Path MTU the QUIC stack settled on, bytes. Absent as `frames_sent` is.
+    #[schema(value_type = u16, required = false)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path_mtu: Option<u16>,
+    pub ended: SessionEndReason,
+}
+
 /// Live video stream (what the stream marker file reflects).
 #[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
 pub struct StreamRef {
@@ -134,7 +289,12 @@ pub enum EventKind {
     #[serde(rename = "session.started")]
     SessionStarted { session: SessionRef },
     #[serde(rename = "session.ended")]
-    SessionEnded { session: SessionRef },
+    SessionEnded {
+        session: SessionRef,
+        /// Every number the host has for the finished session, including why it ended.
+        // Boxed, not inline: every variant of this enum would otherwise pay its size.
+        summary: Box<SessionSummary>,
+    },
     #[serde(rename = "stream.started")]
     StreamStarted { stream: StreamRef },
     #[serde(rename = "stream.stopped")]
@@ -142,6 +302,17 @@ pub enum EventKind {
     /// Fires once the host has seen the game process, not merely spawned its launcher.
     #[serde(rename = "game.running")]
     GameRunning { game: GameRefPayload },
+    /// Fires when the game's own window reaches the screen, which is often far
+    /// later than its process: a Proton prefix build, a splash on a black
+    /// window, an emulator loading a ROM.
+    #[serde(rename = "game.window")]
+    GameWindow {
+        game: GameRefPayload,
+        /// Title the compositor reports for that window.
+        title: String,
+        /// Wayland `app_id`, or the X11 class on an Xwayland window.
+        app_id: String,
+    },
     #[serde(rename = "game.exited")]
     GameExited {
         game: GameRefPayload,
@@ -240,6 +411,7 @@ impl EventKind {
             EventKind::StreamStarted { .. } => "stream.started",
             EventKind::StreamStopped { .. } => "stream.stopped",
             EventKind::GameRunning { .. } => "game.running",
+            EventKind::GameWindow { .. } => "game.window",
             EventKind::GameExited { .. } => "game.exited",
             EventKind::PairingPending { .. } => "pairing.pending",
             EventKind::PairingCompleted { .. } => "pairing.completed",
@@ -268,15 +440,15 @@ impl EventKind {
         match self {
             EventKind::ClientConnected { client }
             | EventKind::ClientDisconnected { client, .. } => Some(&client.name),
-            EventKind::SessionStarted { session } | EventKind::SessionEnded { session } => {
+            EventKind::SessionStarted { session } | EventKind::SessionEnded { session, .. } => {
                 Some(&session.client)
             }
             EventKind::StreamStarted { stream } | EventKind::StreamStopped { stream } => {
                 Some(&stream.client)
             }
-            EventKind::GameRunning { game } | EventKind::GameExited { game, .. } => {
-                Some(&game.client)
-            }
+            EventKind::GameRunning { game }
+            | EventKind::GameWindow { game, .. }
+            | EventKind::GameExited { game, .. } => Some(&game.client),
             EventKind::PairingPending { device }
             | EventKind::PairingCompleted { device }
             | EventKind::PairingDenied { device }
@@ -312,9 +484,9 @@ impl EventKind {
             EventKind::StreamStarted { stream } | EventKind::StreamStopped { stream } => {
                 Some(stream.plane)
             }
-            EventKind::GameRunning { game } | EventKind::GameExited { game, .. } => {
-                Some(game.plane)
-            }
+            EventKind::GameRunning { game }
+            | EventKind::GameWindow { game, .. }
+            | EventKind::GameExited { game, .. } => Some(game.plane),
             EventKind::PairingPending { device }
             | EventKind::PairingCompleted { device }
             | EventKind::PairingDenied { device }
@@ -331,9 +503,9 @@ impl EventKind {
                 stream.app.as_deref()
             }
             // No library id: operator-typed command; title is the only hook-filter handle.
-            EventKind::GameRunning { game } | EventKind::GameExited { game, .. } => {
-                game.app.as_deref().or(Some(&game.title))
-            }
+            EventKind::GameRunning { game }
+            | EventKind::GameWindow { game, .. }
+            | EventKind::GameExited { game, .. } => game.app.as_deref().or(Some(&game.title)),
             _ => None,
         }
     }
@@ -515,6 +687,48 @@ mod tests {
         assert!(sub.rx.try_recv().is_err());
     }
 
+    /// The reporter's requirement, asserted rather than documented: the host names an end
+    /// with the byte the client already decodes from the QUIC close.
+    #[test]
+    fn the_end_reason_bytes_are_the_clients_own() {
+        use punktfunk_core::client::PunktfunkEndReason as Client;
+
+        for (host, client) in [
+            (SessionEndReason::Local, Client::Local),
+            (SessionEndReason::GameExited, Client::GameExited),
+            (SessionEndReason::HostEnded, Client::HostEnded),
+            (SessionEndReason::HostError, Client::HostError),
+            (SessionEndReason::Lost, Client::Lost),
+        ] {
+            assert_eq!(host as u8, client as u8, "{host:?} must be {client:?}");
+            assert_eq!(SessionEndReason::from_u8(host as u8), Some(host));
+        }
+
+        // Host-only: a client sees the close code 0 an operator stop rides on as `HostEnded`.
+        assert_eq!(SessionEndReason::StoppedByOperator as u8, 6);
+        assert_eq!(
+            SessionEndReason::from_u8(6),
+            Some(SessionEndReason::StoppedByOperator)
+        );
+        // 0 is "nothing latched" and 7 is a byte no one writes; neither is an end.
+        assert_eq!(SessionEndReason::from_u8(0), None);
+        assert_eq!(SessionEndReason::from_u8(7), None);
+    }
+
+    /// First write wins, which is what keeps a game exit from becoming the `Lost` the
+    /// local close that follows it would otherwise latch.
+    #[test]
+    fn the_first_latched_reason_is_the_one_reported() {
+        let slot = std::sync::atomic::AtomicU8::new(0);
+        SessionEndReason::GameExited.latch(&slot);
+        SessionEndReason::Lost.latch(&slot);
+        SessionEndReason::HostEnded.latch(&slot);
+        assert_eq!(
+            SessionEndReason::from_u8(slot.load(std::sync::atomic::Ordering::SeqCst)),
+            Some(SessionEndReason::GameExited)
+        );
+    }
+
     /// Additive-only wire contract: a failing snapshot is a schema-version bump, not a test update.
     #[test]
     fn wire_shape_snapshots() {
@@ -617,6 +831,116 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&ev).unwrap(),
             r#"{"seq":6,"ts_ms":1700000000000,"schema":1,"kind":"game.exited","game":{"title":"Big Picture","client":"","plane":"gamestream"},"reason":"terminated"}"#
+        );
+
+        // Every field the summary claims, in order. The console card reads this shape, so a
+        // renamed or dropped key is a console break as well as a schema bump.
+        let ev = HostEvent {
+            seq: 7,
+            ts_ms: 1_700_000_000_000,
+            schema: 1,
+            kind: EventKind::SessionEnded {
+                session: SessionRef {
+                    id: 3,
+                    client: "a1b2c3d4e5f6".into(),
+                    mode: mode_str(1920, 1080, 30),
+                    hdr: false,
+                },
+                summary: Box::new(SessionSummary {
+                    id: 3,
+                    client: "a1b2c3d4e5f6".into(),
+                    client_name: Some("Living Room TV".into()),
+                    started_unix: 1_700_000_000,
+                    duration_s: 2460,
+                    mode: mode_str(1920, 1080, 30),
+                    hdr: false,
+                    join: false,
+                    codec: "hevc".into(),
+                    bit_depth: 8,
+                    chroma: "4:2:0".into(),
+                    bitrate_kbps: 12_400,
+                    bitrate: Some(BitrateSpan {
+                        min_kbps: 9_000,
+                        avg_kbps: 12_100,
+                        max_kbps: 15_000,
+                        adaptive_steps: 4,
+                    }),
+                    frames_sent: Some(73_800),
+                    frames_dropped: Some(0),
+                    input: InputCounts {
+                        events: 7457,
+                        mic: 0,
+                        rich: 150_983,
+                        dropped: 0,
+                    },
+                    gyro: Some(GyroCadence {
+                        samples: 150_983,
+                        stalls: 0,
+                    }),
+                    audio: Some(AudioEgress {
+                        sent: 492_000,
+                        infilled: 12,
+                        late: 3,
+                        max_late_ms: 11,
+                        reanchors: 1,
+                    }),
+                    bringup_ms: 603,
+                    path_mtu: Some(1369),
+                    ended: SessionEndReason::GameExited,
+                }),
+            },
+        };
+        assert_eq!(
+            serde_json::to_string(&ev).unwrap(),
+            r#"{"seq":7,"ts_ms":1700000000000,"schema":1,"kind":"session.ended","session":{"id":3,"client":"a1b2c3d4e5f6","mode":"1920x1080@30","hdr":false},"summary":{"id":3,"client":"a1b2c3d4e5f6","client_name":"Living Room TV","started_unix":1700000000,"duration_s":2460,"mode":"1920x1080@30","hdr":false,"join":false,"codec":"hevc","bit_depth":8,"chroma":"4:2:0","bitrate_kbps":12400,"bitrate":{"min_kbps":9000,"avg_kbps":12100,"max_kbps":15000,"adaptive_steps":4},"frames_sent":73800,"frames_dropped":0,"input":{"events":7457,"mic":0,"rich":150983,"dropped":0},"gyro":{"samples":150983,"stalls":0},"audio":{"sent":492000,"infilled":12,"late":3,"max_late_ms":11,"reanchors":1},"bringup_ms":603,"path_mtu":1369,"ended":"game_exited"}}"#
+        );
+
+        // A loop that bailed has no totals: every optional one is omitted, never zeroed.
+        // `input` stays: the datagram reader runs from before the session registers.
+        let ev = HostEvent {
+            seq: 8,
+            ts_ms: 1_700_000_000_000,
+            schema: 1,
+            kind: EventKind::SessionEnded {
+                session: SessionRef {
+                    id: 4,
+                    client: "192.0.2.7".into(),
+                    mode: mode_str(0, 0, 0),
+                    hdr: false,
+                },
+                summary: Box::new(SessionSummary {
+                    id: 4,
+                    client: "192.0.2.7".into(),
+                    client_name: None,
+                    started_unix: 1_700_000_000,
+                    duration_s: 1,
+                    mode: mode_str(0, 0, 0),
+                    hdr: false,
+                    join: false,
+                    codec: "av1".into(),
+                    bit_depth: 10,
+                    chroma: "4:4:4".into(),
+                    bitrate_kbps: 0,
+                    bitrate: None,
+                    frames_sent: None,
+                    frames_dropped: None,
+                    input: InputCounts {
+                        events: 0,
+                        mic: 0,
+                        rich: 0,
+                        dropped: 0,
+                    },
+                    gyro: None,
+                    audio: None,
+                    bringup_ms: 0,
+                    path_mtu: None,
+                    ended: SessionEndReason::HostError,
+                }),
+            },
+        };
+        assert_eq!(
+            serde_json::to_string(&ev).unwrap(),
+            r#"{"seq":8,"ts_ms":1700000000000,"schema":1,"kind":"session.ended","session":{"id":4,"client":"192.0.2.7","mode":"0x0@0","hdr":false},"summary":{"id":4,"client":"192.0.2.7","started_unix":1700000000,"duration_s":1,"mode":"0x0@0","hdr":false,"join":false,"codec":"av1","bit_depth":10,"chroma":"4:4:4","bitrate_kbps":0,"input":{"events":0,"mic":0,"rich":0,"dropped":0},"bringup_ms":0,"ended":"host_error"}}"#
         );
     }
 

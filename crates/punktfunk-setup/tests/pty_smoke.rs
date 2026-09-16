@@ -113,7 +113,7 @@ fn plain(raw: &str) -> String {
 fn the_demo_walks_from_the_settings_screen_to_the_outro() {
     let text = plain(&run(
         &["--demo", "debian-fresh", "-v"],
-        b"\r\r",
+        b"\r\r\r",
         "Done. Next",
     ));
     assert!(
@@ -140,6 +140,16 @@ fn the_demo_walks_from_the_settings_screen_to_the_outro() {
         text.contains("PUNKTFUNK_UI_PASSWORD"),
         "the step did not say how to print the password:\n{text}"
     );
+    // And the bind question right after it. Taking its default must leave the console on this
+    // machine — the whole point of asking is that nobody gets the LAN without saying so.
+    assert!(
+        text.contains("Where should the web console be reachable?"),
+        "the bind step never showed:\n{text}"
+    );
+    assert!(
+        text.contains("PUNKTFUNK_UI_BIND=127.0.0.1"),
+        "the default answer did not reach host.env:\n{text}"
+    );
     assert!(
         text.contains("Done. Next"),
         "never reached the outro:\n{text}"
@@ -150,7 +160,7 @@ fn the_demo_walks_from_the_settings_screen_to_the_outro() {
 fn a_failed_step_renders_the_failure_and_points_at_the_docs() {
     let text = plain(&run(
         &["--demo", "debian-fresh", "--fail", "installing"],
-        b"\r\r",
+        b"\r\r\r",
         "that step failed",
     ));
     assert!(
@@ -174,7 +184,7 @@ fn the_demo_writes_nothing_into_the_users_home() {
     let home = tempfile::tempdir().expect("tempdir");
     let text = plain(&run_with_home(
         &["--demo", "fedora-sunshine", "-v"],
-        b"\r\r",
+        b"\r\r\r",
         "Done. Next",
         home.path().to_str(),
     ));
@@ -207,7 +217,7 @@ fn quitting_the_settings_screen_changes_nothing() {
 /// the wall of them is what hid the one warning that mattered.
 #[test]
 fn the_default_run_collapses_to_a_progress_line() {
-    let text = plain(&run(&["--demo", "debian-fresh"], b"\r\r", "Done. Next"));
+    let text = plain(&run(&["--demo", "debian-fresh"], b"\r\r\r", "Done. Next"));
     assert!(
         !text.contains("+ sudo apt install"),
         "the command echo should be behind -v:\n{text}"
@@ -222,7 +232,7 @@ fn the_default_run_collapses_to_a_progress_line() {
 /// so this outro is the only thing that tells the user the install worked — or did not.
 #[test]
 fn a_hand_off_still_reports_the_outcome() {
-    let text = plain(&run(&["--demo", "omarchy", "-v"], b"\r\r", "Done. Next"));
+    let text = plain(&run(&["--demo", "omarchy", "-v"], b"\r\r\r", "Done. Next"));
     assert!(
         text.contains("punktfunk-omarchy setup"),
         "the hand-off never ran:\n{text}"
@@ -237,10 +247,11 @@ fn a_hand_off_still_reports_the_outcome() {
 /// console's unit reads. `--demo` writes into its own sandbox root, which the transcript names.
 #[test]
 fn a_typed_password_lands_in_the_file_the_console_reads() {
-    // Enter installs, ↓ Enter picks "Set my own now", then the password and Enter.
+    // Enter installs, ↓ Enter picks "Set my own now", the password and Enter, then Enter
+    // again to take the bind question's default.
     let text = plain(&run(
         &["--demo", "debian-fresh", "-v"],
-        b"\r\x1b[B\rhunter2-and-then-some\r",
+        b"\r\x1b[B\rhunter2-and-then-some\r\r",
         "Done. Next",
     ));
     let line = text

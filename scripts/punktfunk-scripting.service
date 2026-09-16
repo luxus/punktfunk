@@ -38,14 +38,22 @@ RestartSec=2
 KillMode=mixed
 KillSignal=SIGTERM
 TimeoutStopSec=30
-# Sandbox: free hardening for well-behaved plugins. The filesystem is read-only outside the home
-# directory (ReadWritePaths keeps plugin state, download dirs, and ~/.config/punktfunk writable);
-# no setuid re-escalation; sockets limited to what automation actually uses (loopback mgmt API,
-# LAN/IPv6 webhooks, unix sockets). A plugin that must write OUTSIDE $HOME (e.g. a library on
-# another mount) gets a drop-in:
-#   systemctl --user edit punktfunk-scripting   →   [Service]\nReadWritePaths=/mnt/games
-# NOTE: the mount-namespace options (ProtectSystem) need unprivileged user namespaces for a
-# *user* unit; on kernels/distros that restrict those, drop them via the same drop-in.
+# Sandbox: the plugin token's privilege split, made real by the filesystem. A plugin holds a
+# capability-limited token, so the runner must not be able to read the full-admin `mgmt-token` or
+# the host identity key that sits beside it — same uid as the operator means file modes cannot say
+# that, but a mount namespace can. The home is an empty tmpfs and the binds below are the whole of
+# what a plugin sees of it: the Windows runner's LocalService ACL grants the scoped token plus the
+# TLS pin and nothing else, and this is that contract in the Linux idiom.
+#
+# InaccessiblePaths is belt and braces: wherever the home tmpfs does not land — a layout that keeps
+# the home outside /home, a drop-in that removes ProtectHome — the denylist is what still stands.
+#
+# A plugin that must reach something else gets a drop-in — `systemctl --user edit
+# punktfunk-scripting` — with `ReadWritePaths=/mnt/games` outside the home, or `BindPaths=` /
+# `BindReadOnlyPaths=` for a path inside it.
+#
+# NOTE: these are all mount-namespace options, and a *user* unit needs unprivileged user namespaces
+# for them; on a kernel that restricts those, drop them via the same drop-in.
 #
 # PrivateTmp is deliberately OFF (field report 2026-08-03, the VirtualHere plugin). A plugin's
 # whole job is integrating with things already running on this box, and on Linux those talk over
@@ -57,8 +65,45 @@ TimeoutStopSec=30
 NoNewPrivileges=yes
 PrivateTmp=no
 ProtectSystem=strict
-ReadWritePaths=%h /tmp
+ProtectHome=tmpfs
+InaccessiblePaths=-%h/.config/punktfunk/mgmt-token -%h/.config/punktfunk/key.pem
+InaccessiblePaths=-%h/.config/punktfunk/native-key.pem
+# Writable: the installed packages (the runner refreshes their shared SDK with `bun install` on
+# every start) and the one directory a plugin may persist into. '-' on both — neither exists until
+# the first plugin is installed.
+BindPaths=-%h/.config/punktfunk/plugins -%h/.config/punktfunk/plugin-state
+# bun's package cache ($BUN_INSTALL). Only the SDK refresh writes here, and it fails soft without
+# it — but soft means plugins silently keep an old SDK across host upgrades.
+BindPaths=-%h/.bun
+# Read-only: the operator's loose scripts, the drop box another local account fills, the scoped
+# token, and the TLS pin (native-cert.pem after the identity split, cert.pem before it — a host has
+# one or both). mgmt-endpoint carries the port the host REALLY bound; without it a moved listener
+# leaves every plugin dialling 47990 forever.
+BindReadOnlyPaths=-%h/.config/punktfunk/scripts -%h/.config/punktfunk/ingest
+BindReadOnlyPaths=-%h/.config/punktfunk/plugin-token -%h/.config/punktfunk/mgmt-endpoint
+BindReadOnlyPaths=-%h/.config/punktfunk/native-cert.pem -%h/.config/punktfunk/cert.pem
+# ProtectHome empties /run/user too. %t is where the host publishes its live-stream marker
+# (punktfunk/stream, which scripts source) and where the session bus and compositor sockets live.
+BindPaths=%t
+# On Linux a game library lives IN the home, so an empty home is an empty library: the scanner
+# plugins read these roots (plugin-kit steamRoots and friends). Read-only, and '-' because a box
+# has only the launchers it installed. A scanner for a launcher not listed here needs a drop-in.
+BindReadOnlyPaths=-%h/.local/share/Steam -%h/.steam -%h/.var/app
+BindReadOnlyPaths=-%h/.local/share/lutris -%h/.config/lutris -%h/.config/heroic
+# SteamOS builds the runner under the home and points ExecStart at it (scripts/steamdeck/install.sh
+# rewrites that line only), so the binary has to survive the tmpfs.
+BindReadOnlyPaths=-%h/.local/bin/punktfunk-scripting -%h/.local/lib/punktfunk-scripting
+BindReadOnlyPaths=-%h/.local/share/punktfunk-scripting
+ReadWritePaths=/tmp
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# Free for a JS runtime that only talks HTTP and reads files. Two are absent on purpose:
+# MemoryDenyWriteExecute because bun JITs, and PrivateDevices because a plugin's vendor binary
+# integrates with hardware already on this box (VirtualHere forwards USB).
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
 
 [Install]
 WantedBy=default.target

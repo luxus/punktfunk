@@ -22,7 +22,7 @@ interface InstallBody {
 export default defineEventHandler(async (event) => {
 	const body = await readBody<InstallBody>(event);
 	const rawSpec = body?.accept_unverified === true;
-	if (rawSpec) confirmPassword(event, body?.password);
+	if (rawSpec) await confirmPassword(event, body?.password);
 	// The password stops here — rebuild the upstream body from known fields so it cannot leak
 	// through, and so an unexpected extra field can't ride along to the host.
 	const upstream = rawSpec

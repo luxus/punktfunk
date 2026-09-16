@@ -27,6 +27,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -59,6 +60,7 @@ import io.unom.punktfunk.models.LaunchHold
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 /**
@@ -67,6 +69,23 @@ import kotlinx.coroutines.withContext
  */
 private const val LAUNCH_HOLD_MAX_S = 120.0
 private const val LAUNCH_NO_LEASE_S = 15.0
+
+/**
+ * Why the hold is giving up, in one sentence, or null while it should keep waiting.
+ *
+ * [state] is the host's own `games[]` word for this title, null when the host lists nothing for it
+ * at all — which is what a refused launch looks like from here. Every sentence this returns ends
+ * the hold with a message and its three actions; `running`, `untracked` and `grace` return null
+ * and the caller shows the stream, because those are launches that worked.
+ */
+internal fun launchGaveUp(title: String, state: String?, elapsed: Double): String? = when {
+    state == null && elapsed >= LAUNCH_NO_LEASE_S ->
+        "The host didn't start $title \u2014 nothing is running for it."
+    state == "launching" && elapsed >= LAUNCH_HOLD_MAX_S ->
+        "$title is still starting after 2 minutes."
+    state == "exited" -> "$title closed right after starting."
+    else -> null
+}
 
 /** The cover's flight: `response ≈ 0.75 s`, loose enough that the turn reads on the way. */
 private const val FLIGHT_STIFFNESS = 70f
@@ -95,16 +114,21 @@ object TileFrames {
  * game is actually up.
  *
  * Opaque, so the launcher and desktop behind it are never seen — that is the whole job. Polls the
- * host's `/status` once a second (the Resume badge's lane) and calls [onShow] once the title leaves
- * `launching`, or when the host will never say; a tap shows the stream anyway.
+ * host's `/status` once a second (the Resume badge's lane) and calls [onShow] once the title is up;
+ * a tap does the same. When the launch did not produce a game it says so and offers the three moves
+ * ([launchGaveUp]), rather than sliding away and leaving the player on a desktop.
  */
 @Composable
-fun LaunchHoldOverlay(hold: LaunchHold, onShow: () -> Unit) {
+fun LaunchHoldOverlay(hold: LaunchHold, onRetry: () -> Unit, onShow: () -> Unit) {
     val context = LocalContext.current
     val density = LocalDensity.current
     var loader by remember(hold) { mutableStateOf<ImageLoader?>(null) }
     val flight = remember(hold) { Animatable(0f) }
     var rootInWindow by remember(hold) { mutableStateOf(Rect.Zero) }
+    // Non-null replaces the spinner with the message and its actions; the hold stops polling then.
+    var gaveUp by remember(hold) { mutableStateOf<String?>(null) }
+    var ending by remember(hold) { mutableStateOf<String?>(null) }
+    val scope = rememberCoroutineScope()
 
     LaunchedEffect(hold) {
         flight.animateTo(
@@ -132,13 +156,14 @@ fun LaunchHoldOverlay(hold: LaunchHold, onShow: () -> Unit) {
             }
             val state = games.firstOrNull { it.appId == hold.game.id }?.state
             val elapsed = (SystemClock.elapsedRealtime() - began) / 1000.0
-            val done = when (state) {
-                "launching" -> elapsed >= LAUNCH_HOLD_MAX_S
-                null -> elapsed >= LAUNCH_NO_LEASE_S
-                // running, exited, untracked, grace: the host has said all it will.
-                else -> true
+            val said = launchGaveUp(hold.game.title, state, elapsed)
+            if (said != null) {
+                gaveUp = said
+                return@LaunchedEffect
             }
-            if (done) {
+            // Anything else the host names is a launch that worked; only `launching` and a host
+            // that lists nothing yet are still worth waiting on.
+            if (state != null && state != "launching") {
                 onShow()
                 return@LaunchedEffect
             }
@@ -150,7 +175,9 @@ fun LaunchHoldOverlay(hold: LaunchHold, onShow: () -> Unit) {
         Modifier
             .fillMaxSize()
             .onGloballyPositioned { rootInWindow = it.boundsInWindow() }
+            // Only while it is still waiting: a stray tap must not take the message away.
             .clickable(
+                enabled = gaveUp == null,
                 interactionSource = remember { MutableInteractionSource() },
                 indication = null,
                 onClick = onShow,
@@ -289,24 +316,74 @@ fun LaunchHoldOverlay(hold: LaunchHold, onShow: () -> Unit) {
                     modifier = Modifier.padding(top = 4.dp),
                 )
             }
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier.padding(top = 22.dp),
-            ) {
-                CircularProgressIndicator(
-                    modifier = Modifier.size(16.dp),
-                    color = Color.White,
-                    strokeWidth = 2.dp,
-                )
+            val said = gaveUp
+            if (said == null) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.padding(top = 22.dp),
+                ) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(16.dp),
+                        color = Color.White,
+                        strokeWidth = 2.dp,
+                    )
+                    Text(
+                        "Connecting\u2026",
+                        color = Color.White.copy(alpha = 0.5f),
+                        fontSize = 13.sp,
+                        modifier = Modifier.padding(start = 9.dp),
+                    )
+                }
+                TextButton(onClick = onShow, modifier = Modifier.padding(top = 8.dp)) {
+                    Text("Show stream", color = Color.White)
+                }
+            } else {
                 Text(
-                    "Connecting\u2026",
-                    color = Color.White.copy(alpha = 0.5f),
-                    fontSize = 13.sp,
-                    modifier = Modifier.padding(start = 9.dp),
+                    said,
+                    color = Color.White.copy(alpha = 0.85f),
+                    fontSize = 15.sp,
+                    lineHeight = 21.sp,
+                    modifier = Modifier.padding(top = 22.dp),
                 )
-            }
-            TextButton(onClick = onShow, modifier = Modifier.padding(top = 8.dp)) {
-                Text("Show stream", color = Color.White)
+                ending?.let {
+                    Text(
+                        it,
+                        color = Color.White.copy(alpha = 0.5f),
+                        fontSize = 13.sp,
+                        modifier = Modifier.padding(top = 8.dp),
+                    )
+                }
+                // Stacked, not a row: three labels this long wrap to nothing readable on a phone.
+                TextButton(onClick = onRetry, modifier = Modifier.padding(top = 10.dp)) {
+                    Text("Retry", color = Color.White)
+                }
+                TextButton(onClick = onShow) {
+                    Text("Show the desktop anyway", color = Color.White)
+                }
+                TextButton(
+                    enabled = ending == null,
+                    onClick = {
+                        ending = "Ending it\u2026"
+                        scope.launch {
+                            val id = withContext(Dispatchers.IO) {
+                                runCatching { obtainIdentity(IdentityStore(context)) }.getOrNull()
+                            }
+                            val done = id != null && withContext(Dispatchers.IO) {
+                                LibraryClient.endGame(
+                                    hold.address, hold.mgmtPort, id.certPem, id.privateKeyPem,
+                                    hold.fpHex, hold.game.id,
+                                )
+                            }
+                            ending = if (done) {
+                                "Ended it \u2014 press Retry to start it again."
+                            } else {
+                                "The host had nothing running for it."
+                            }
+                        }
+                    },
+                ) {
+                    Text("End it on the host", color = Color.White)
+                }
             }
         }
         }

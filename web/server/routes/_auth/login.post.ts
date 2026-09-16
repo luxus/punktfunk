@@ -1,7 +1,7 @@
-// POST /_auth/login {password} — verify the shared password (constant-time), then seal an
-// authenticated session cookie. Public (allowlisted in the gate) so an unauthenticated user
-// can actually log in. Brute force is bounded by an in-memory per-IP throttle (loginThrottle):
-// the constant-time compare stops a timing leak, the throttle stops guessing at volume.
+// POST /_auth/login {password} — verify the shared password against its stored argon2id hash,
+// then seal an authenticated session cookie. Public (allowlisted in the gate) so an
+// unauthenticated user can actually log in. Brute force is bounded by an in-memory per-IP
+// throttle (loginThrottle); the argon2 verify costs ~50 ms, which that throttle already covers.
 import {
 	createError,
 	defineEventHandler,
@@ -10,12 +10,12 @@ import {
 	useSession,
 } from "h3";
 import {
+	authConfigured,
 	peerAddress,
 	type SessionData,
 	sessionConfig,
 	sessionEpoch,
-	timingSafeEqual,
-	uiPassword,
+	verifyUiPassword,
 } from "../../util/auth";
 import {
 	recordLoginFailure,
@@ -24,8 +24,7 @@ import {
 } from "../../util/loginThrottle";
 
 export default defineEventHandler(async (event) => {
-	const expected = uiPassword();
-	if (!expected) {
+	if (!authConfigured()) {
 		throw createError({
 			statusCode: 503,
 			statusMessage: "auth not configured",
@@ -48,7 +47,7 @@ export default defineEventHandler(async (event) => {
 
 	const body = await readBody<{ password?: string }>(event);
 	const password = String(body?.password ?? "");
-	if (!timingSafeEqual(password, expected)) {
+	if (!(await verifyUiPassword(password))) {
 		recordLoginFailure(ip);
 		throw createError({ statusCode: 401, statusMessage: "invalid password" });
 	}

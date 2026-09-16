@@ -46,9 +46,12 @@ certificate is the host's own, so your browser warns once — continue) and log 
 - **Windows:** the wizard showed it on its last page. Installed with winget, or silently? There was
   no wizard, so print it from an **elevated** PowerShell with `punktfunk-host web password`.
 
+Print it before you sign in: the console stores a salted hash from then on, and a forgotten
+password is reset rather than read.
+
 ![The console sign-in card: one password field](/img/console-login.png)
 
-Lost it? [Forgot your password](/docs/forgot-password). Everything else about the console:
+Lost it? [Reset it](/docs/forgot-password). Everything else about the console:
 [The Web Console](/docs/web-console).
 
 ## 4. Install a client and pair it

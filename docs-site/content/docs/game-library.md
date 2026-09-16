@@ -107,11 +107,16 @@ Use a full `http://` or `https://` URL. A Windows-style absolute path (`C:\art\c
 path also works: the host reads the file itself and serves the bytes to clients, so a path only the
 host can see is fine. A plain Linux path like `/home/me/cover.jpg` is **not** recognized this way.
 
-Scanned titles need no art. Steam covers come from your local Steam cache, falling back to Steam's
-public CDN. On a Windows host, GOG and Xbox covers are the one thing the library looks up over the
-network: a background pass asks GOG's and Microsoft's public catalogs when the host starts and
-repeats every five minutes for any title still unresolved. Neither needs an account or a key, the
-answer is cached on the host, and a failed lookup just leaves a title-only tile.
+Either way the cover reaches a client from the host, not from the internet. The first client to open
+the shelf makes the host download each `http(s)` cover once; it keeps the bytes under
+`~/.cache/punktfunk/art` and serves them to every client from then on — including while the site they
+came from is unreachable. Nothing is downloaded on a schedule or during a scan: a request for the
+cover is the only trigger. A cover the host will not take — a redirect, something over 16 MB, or a
+file that is not an image — stays the original URL for the client to fetch itself, as before.
+`punktfunk-host library art --clear` empties the store; the next visit fills it again.
+
+Scanned titles need no art of yours: a [plugin](/docs/plugins) publishes each title's cover while it
+scans, and the host serves that the same way.
 
 ## Games from a plugin
 
@@ -223,4 +228,6 @@ session can close the game. Both switches live on the console's **Virtual displa
 
 A custom entry can carry `prep` steps that run before it launches and undo steps that run when the
 session ends — an HDR toggle, an audio-sink switch, a VRR tweak. They are documented with the rest of
-the automation surface in [Events & hooks](/docs/automation#per-app-prepundo).
+the automation surface in [Events & hooks](/docs/automation#per-app-prepundo). The same file
+carries `on_window.workspace`, which opens the title on an empty workspace of its own on Hyprland and
+sway — [A launch on its own workspace](/docs/automation#a-launch-on-its-own-workspace).

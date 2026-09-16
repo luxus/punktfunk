@@ -280,24 +280,28 @@ impl SendStats {
         }
     }
 
+    /// `true` when this departure counted as late, so the session total scores it against the
+    /// same threshold this window does rather than a second copy of it.
     pub(crate) fn observe_departure(
         &mut self,
         late: Duration,
         since_prev: Option<Duration>,
         infilled: bool,
-    ) {
+    ) -> bool {
         self.sent += 1;
         if infilled {
             self.infilled += 1;
         }
         self.max_late_us = self.max_late_us.max(late.as_micros() as u64);
         // Inclusive: one whole frame of this session.
-        if late >= self.frame {
+        let was_late = late >= self.frame;
+        if was_late {
             self.late += 1;
         }
         if let Some(gap) = since_prev {
             self.max_spacing_us = self.max_spacing_us.max(gap.as_micros() as u64);
         }
+        was_late
     }
 
     pub(crate) fn observe_reanchor(&mut self) {
@@ -825,9 +829,15 @@ mod tests {
             let frame = Duration::from_micros(frame_us as u64);
             let mut s = SendStats::new(frame_us);
             // One microsecond under a frame is jitter; the frame itself is a slip — inclusive.
-            s.observe_departure(frame - Duration::from_micros(1), None, false);
+            assert!(
+                !s.observe_departure(frame - Duration::from_micros(1), None, false),
+                "a hair under a frame is jitter, and the session total must agree"
+            );
             assert_eq!(s.late, 0, "{frame_us} µs: sub-frame lateness is jitter");
-            s.observe_departure(frame, None, false);
+            assert!(
+                s.observe_departure(frame, None, false),
+                "one whole frame is late, inclusive"
+            );
             assert_eq!(
                 s.late, 1,
                 "{frame_us} µs: one whole frame is a slipped slot"

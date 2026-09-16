@@ -82,10 +82,87 @@ export const SessionStarted = S.Struct({
 	kind: S.Literal("session.started"),
 	session: SessionRef,
 });
+/** Why a session ended, in the same words the client maps from the QUIC close. */
+export const SessionEndReason = S.Literals([
+	"local",
+	"game_exited",
+	"host_ended",
+	"host_error",
+	"lost",
+	"stopped_by_operator",
+]);
+export type SessionEndReason = S.Schema.Type<typeof SessionEndReason>;
+
+/** Client datagrams the session took, by class. */
+export const InputCounts = S.Struct({
+	events: S.Number,
+	mic: S.Number,
+	rich: S.Number,
+	/** Offers the input queue refused because it was full — not a wire loss. */
+	dropped: S.Number,
+});
+export type InputCounts = S.Schema.Type<typeof InputCounts>;
+
+/** Gyro arrivals, and the gaps of 500 ms or more among them. */
+export const GyroCadence = S.Struct({
+	samples: S.Number,
+	stalls: S.Number,
+});
+export type GyroCadence = S.Schema.Type<typeof GyroCadence>;
+
+/** Audio egress for the whole session, not the 30 s window the host log prints. */
+export const AudioEgress = S.Struct({
+	sent: S.Number,
+	infilled: S.Number,
+	late: S.Number,
+	max_late_ms: S.Number,
+	reanchors: S.Number,
+});
+export type AudioEgress = S.Schema.Type<typeof AudioEgress>;
+
+/** What the encoder's target did. `avg_kbps` is a mean of the targets, not time-weighted. */
+export const BitrateSpan = S.Struct({
+	min_kbps: S.Number,
+	avg_kbps: S.Number,
+	max_kbps: S.Number,
+	adaptive_steps: S.Number,
+});
+export type BitrateSpan = S.Schema.Type<typeof BitrateSpan>;
+
+/**
+ * Everything the host knows about a finished session. `GET /api/v1/session/last` returns the
+ * same shape. A total the host does not keep per session is absent, never zero.
+ */
+export const SessionSummary = S.Struct({
+	id: S.Number,
+	client: S.String,
+	client_name: S.optional(S.String),
+	started_unix: S.Number,
+	duration_s: S.Number,
+	mode: S.String,
+	hdr: S.Boolean,
+	join: S.Boolean,
+	codec: S.String,
+	bit_depth: S.Number,
+	chroma: S.String,
+	bitrate_kbps: S.Number,
+	bitrate: S.optional(BitrateSpan),
+	frames_sent: S.optional(S.Number),
+	frames_dropped: S.optional(S.Number),
+	input: InputCounts,
+	gyro: S.optional(GyroCadence),
+	audio: S.optional(AudioEgress),
+	bringup_ms: S.Number,
+	path_mtu: S.optional(S.Number),
+	ended: SessionEndReason,
+});
+export type SessionSummary = S.Schema.Type<typeof SessionSummary>;
+
 export const SessionEnded = S.Struct({
 	...envelope,
 	kind: S.Literal("session.ended"),
 	session: SessionRef,
+	summary: SessionSummary,
 });
 export const StreamStarted = S.Struct({
 	...envelope,

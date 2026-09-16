@@ -35,15 +35,20 @@ impl CachedLibrary {
     }
 }
 
-fn cache_dir() -> Option<PathBuf> {
+/// One resolution for every client-side cache: `$XDG_CACHE_HOME/punktfunk/<name>`,
+/// or `%LOCALAPPDATA%\punktfunk\cache\<name>`. `None` when neither the cache dir
+/// nor a home is named — the caller then runs uncached rather than picking `.`.
+pub(crate) fn cache_subdir(name: &str) -> Option<PathBuf> {
     #[cfg(windows)]
     {
-        let local = std::env::var("LOCALAPPDATA").ok()?;
+        let local = std::env::var("LOCALAPPDATA")
+            .ok()
+            .filter(|s| !s.is_empty())?;
         Some(
             PathBuf::from(local)
                 .join("punktfunk")
                 .join("cache")
-                .join("library"),
+                .join(name),
         )
     }
     #[cfg(not(windows))]
@@ -57,8 +62,12 @@ fn cache_dir() -> Option<PathBuf> {
                     .ok()
                     .map(|h| PathBuf::from(h).join(".cache"))
             })?;
-        Some(base.join("punktfunk").join("library"))
+        Some(base.join("punktfunk").join(name))
     }
+}
+
+fn cache_dir() -> Option<PathBuf> {
+    cache_subdir("library")
 }
 
 /// Re-validated because `fp_hex` becomes a path component (64 lowercase hex).

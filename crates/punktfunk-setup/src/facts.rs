@@ -245,6 +245,10 @@ pub struct Facts {
     /// A console login password already lives in the user's config dir; a re-run must not
     /// ask about one it would only overwrite.
     pub web_password_present: bool,
+    /// `PUNKTFUNK_UI_BIND` as host.env already names it. A re-run defaults to this, so pressing
+    /// Enter through the question can never move a console the operator already placed.
+    #[serde(default)]
+    pub web_bind: Option<String>,
     pub scripting_unit_disabled: bool,
     pub ip: Option<String>,
     pub user: String,
@@ -313,6 +317,7 @@ impl Facts {
                 .any(|l| l.starts_with("punktfunk-web.service")),
             web_password_present: std::fs::metadata(paths.config.join("punktfunk/web-password"))
                 .is_ok_and(|m| m.len() > 0),
+            web_bind: env_line(&paths.host_env(), "PUNKTFUNK_UI_BIND"),
             scripting_unit_disabled: unit_files(run, "punktfunk-scripting.service")
                 .contains("disabled"),
             ip: local_ip(run),
@@ -501,6 +506,16 @@ fn firewall(paths: &BasePaths, run: &dyn CommandRunner) -> Firewall {
     Firewall::None
 }
 
+/// One `KEY=VALUE` out of an env file. Last line wins, comments and blanks do not count — the
+/// same reading systemd gives the file, so what we report is what the unit will get.
+fn env_line(path: &std::path::Path, key: &str) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    text.lines()
+        .filter_map(|l| l.trim().strip_prefix(&format!("{key}=")))
+        .map(|v| v.trim().trim_matches('"').to_string())
+        .rfind(|v| !v.is_empty())
+}
+
 fn unit_files(run: &dyn CommandRunner, unit: &str) -> String {
     run.probe("systemctl", &["--user", "list-unit-files", unit])
         .filter(|o| o.ok())
@@ -526,6 +541,42 @@ fn local_ip(run: &dyn CommandRunner) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    // host.env is hand-edited, so the reading has to be systemd's: last assignment wins, a
+    // comment is not one, and a blank value means unset (the same rule `PUNKTFUNK_MGMT_BIND`
+    // takes in pf-host-config). Getting it wrong here moves a console on the next re-run.
+    #[test]
+    fn env_line_reads_the_file_the_way_the_unit_will() {
+        let dir = std::env::temp_dir().join(format!("pf-env-line-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("host.env");
+        let write = |body: &str| std::fs::write(&path, body).unwrap();
+
+        write("PUNKTFUNK_UI_BIND=0.0.0.0\n");
+        assert_eq!(
+            super::env_line(&path, "PUNKTFUNK_UI_BIND").as_deref(),
+            Some("0.0.0.0")
+        );
+        write("  PUNKTFUNK_UI_BIND=\"100.64.0.3\"\n");
+        assert_eq!(
+            super::env_line(&path, "PUNKTFUNK_UI_BIND").as_deref(),
+            Some("100.64.0.3")
+        );
+        write("PUNKTFUNK_UI_BIND=0.0.0.0\nPUNKTFUNK_UI_BIND=127.0.0.1\n");
+        assert_eq!(
+            super::env_line(&path, "PUNKTFUNK_UI_BIND").as_deref(),
+            Some("127.0.0.1")
+        );
+        write("# PUNKTFUNK_UI_BIND=0.0.0.0\n");
+        assert_eq!(super::env_line(&path, "PUNKTFUNK_UI_BIND"), None);
+        write("PUNKTFUNK_UI_BIND=\n");
+        assert_eq!(super::env_line(&path, "PUNKTFUNK_UI_BIND"), None);
+        assert_eq!(
+            super::env_line(&dir.join("nope.env"), "PUNKTFUNK_UI_BIND"),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
     use crate::seam::FakeRunner;
 

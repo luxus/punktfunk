@@ -118,7 +118,8 @@ Description: punktfunk management web console (Nitro SSR on bun + React)
  .
  Auto-wired to the host on a packaged install: it sources the host's
  ~/.config/punktfunk/mgmt-token and a generated login password — no env editing. Enable
- the systemd user service punktfunk-web; read the login password from the --user journal.
+ the systemd user service punktfunk-web; read the login password out of web-password once,
+ before the console replaces it with a salted argon2id hash on your first sign-in.
 EOF
 
 cat > "$STAGE/DEBIAN/postinst" <<'EOF'
@@ -127,10 +128,20 @@ set -e
 if [ "$1" = "configure" ]; then
     echo "punktfunk-web installed. Enable it for your user:"
     echo "    systemctl --user enable --now punktfunk-web"
-    echo "A login password is generated on first start — read it with:"
-    echo "    journalctl --user -u punktfunk-web-init | sed -n 's/.*password generated: //p'"
-    echo "    (or: sed -n 's/^PUNKTFUNK_UI_PASSWORD=//p' ~/.config/punktfunk/web-password)"
-    echo "Then open https://<host-ip>:47992 (self-signed host cert — trust it once)"
+    echo "A login password is generated on first start. Read it once, before you sign in:"
+    echo "    sed -n 's/^PUNKTFUNK_UI_PASSWORD=//p' ~/.config/punktfunk/web-password"
+    echo "After that the console keeps only a salted hash, so a forgotten password is reset:"
+    echo "put a PUNKTFUNK_UI_PASSWORD=<your-password> line in that file, then"
+    echo "    systemctl --user restart punktfunk-web"
+    echo "Then open https://127.0.0.1:47992 (self-signed host cert — trust it once)"
+    # $2 is the version being replaced: set means upgrade. The console used to answer on every
+    # interface with no setting for it, so say where that reach now lives before anyone restarts.
+    if [ -n "$2" ]; then
+        echo "The console now listens on this machine only unless PUNKTFUNK_UI_BIND says otherwise."
+        echo "Your console already served the network, so the next start writes"
+        echo "PUNKTFUNK_UI_BIND=0.0.0.0 into ~/.config/punktfunk/host.env and keeps it that way."
+        echo "Change that line to 127.0.0.1 and restart punktfunk-web to close it."
+    fi
 fi
 exit 0
 EOF

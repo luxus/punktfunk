@@ -13,6 +13,7 @@
 #   bash scripts/steamdeck/install.sh --gamestream    # ALSO serve Moonlight clients (opt-in; #5/#9 caveats)
 #   bash scripts/steamdeck/install.sh --open          # trusted LAN: accept unpaired clients (TOFU)
 #   bash scripts/steamdeck/install.sh --no-web        # skip the management web console
+#   bash scripts/steamdeck/install.sh --web-bind=0.0.0.0  # console on your network (default: this Deck)
 #   PUNKTFUNK_SRC=~/src/punktfunk bash scripts/steamdeck/install.sh   # source elsewhere
 #
 set -euo pipefail
@@ -36,6 +37,10 @@ BOX="${PUNKTFUNK_BOX:-pf2}"
 BOX_IMAGE="${PUNKTFUNK_BOX_IMAGE:-docker.io/library/debian:trixie}"
 MGMT_PORT="${PUNKTFUNK_MGMT_PORT:-47990}"
 WEB_PORT="${PUNKTFUNK_WEB_PORT:-47992}"
+# Where the console listens. Loopback unless asked: a Deck on hotel wi-fi should not hand its
+# console to the network by default. --web-bind=0.0.0.0 (or one address) opens it.
+WEB_BIND="${PUNKTFUNK_UI_BIND:-127.0.0.1}"
+[ -n "${PUNKTFUNK_UI_BIND:-}" ] && WEB_BIND_SET=1 || WEB_BIND_SET=0
 OPEN=0
 WITH_WEB=1
 GAMESTREAM=0 # SECURE native-only by default (opt-in on every route); --gamestream adds Moonlight compat
@@ -46,6 +51,7 @@ for arg in "$@"; do
         --gamestream) GAMESTREAM=1 ;;
         --no-gamestream) GAMESTREAM=0 ;; # explicit-off kept for old command lines / re-runs
         --src=*) SRC="${arg#--src=}" ;;
+        --web-bind=*) WEB_BIND="${arg#--web-bind=}"; WEB_BIND_SET=1 ;;
         -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
         *) die "unknown option: $arg (try --help)" ;;
     esac
@@ -283,16 +289,20 @@ if [ "$WITH_WEB" = 1 ] && [ ! -f "$CONFIG/web.env" ]; then
     WEB_SECRET="$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 32 || true)"
     # `umask 077` around the redirect, not `chmod 600` after it: the heredoc CREATES the file at
     # the ambient umask (0022 on a Deck ⇒ world-readable), so the console password and session
-    # secret existed group/world-readable for the window between the redirect and the chmod
-    # (2026-08-05 review L-19). Setting the mask first means the file is never readable at all.
-    # The chmod stays as the idempotent belt for a pre-existing file.
+    # secret existed group/world-readable for the window between the redirect and the chmod.
+    # Setting the mask first means the file is never readable at all. The chmod stays as the
+    # idempotent belt for a pre-existing file. The console swaps the clear password for a salted
+    # hash in this same file on the first sign-in, keeping PUNKTFUNK_UI_SECRET beside it.
     (umask 077; cat > "$CONFIG/web.env" <<EOF
 PUNKTFUNK_UI_PASSWORD=$WEB_PW
 PUNKTFUNK_UI_SECRET=$WEB_SECRET
+# Where the console listens: 127.0.0.1 (this Deck), 0.0.0.0 (your network), or one address.
+PUNKTFUNK_UI_BIND=$WEB_BIND
 EOF
     )
     chmod 600 "$CONFIG/web.env"
-    ok "wrote web.env (generated login password)"
+    ok "wrote web.env (generated login password — read it before your first sign-in)"
+    ok "console bind: $WEB_BIND"
 elif [ "$WITH_WEB" = 1 ] && [ -f "$CONFIG/web.env" ]; then
     # THE belt the comment above promises. It used to live inside the create-only branch, so it
     # only ever ran on files that had just been written 0600 anyway — every install that predates
@@ -303,10 +313,20 @@ elif [ "$WITH_WEB" = 1 ] && [ -f "$CONFIG/web.env" ]; then
         chmod 600 "$CONFIG/web.env"
         warn "web.env was group/world-readable — an older install wrote it at the default umask."
         warn "Tightened to 0600, but that does NOT un-expose the password it already leaked to every"
-        warn "local account. Rotate it: edit PUNKTFUNK_UI_PASSWORD in $CONFIG/web.env, then"
+        warn "local account. Reset it: put a PUNKTFUNK_UI_PASSWORD line in $CONFIG/web.env, then"
         warn "  systemctl --user restart punktfunk-web"
     else
         ok "web.env exists (login password unchanged, mode already 0600)"
+    fi
+    # This Deck ran a console that answered on every interface, and the console now binds loopback
+    # unless told otherwise. Write down the reach it already had rather than take it away here;
+    # --web-bind on a re-run says otherwise. An existing line always wins — edit web.env to change it.
+    if ! grep -q '^[[:space:]]*PUNKTFUNK_UI_BIND=' "$CONFIG/web.env"; then
+        [ "$WEB_BIND_SET" = 1 ] && KEEP="$WEB_BIND" || KEEP=0.0.0.0
+        printf '# Where the console listens: this install already served your network.\nPUNKTFUNK_UI_BIND=%s\n' "$KEEP" >> "$CONFIG/web.env"
+        ok "web.env: console bind is now $KEEP"
+    elif [ "$WEB_BIND_SET" = 1 ]; then
+        warn "web.env already names PUNKTFUNK_UI_BIND — --web-bind was ignored; edit $CONFIG/web.env"
     fi
 fi
 
@@ -479,6 +499,8 @@ ok "punktfunk-host.service ($SERVE_ARGS)"
 if [ "$WITH_WEB" = 1 ]; then
     # The console is a Nitro server run by bun (Bun.serve, HTTPS — HTTP/1.1 over TLS — with the host's
     # identity cert); it lives in the build container and proxies to the host's loopback HTTPS mgmt API.
+    # No HOST/NITRO_HOST in the export below: web.env is sourced first and carries PUNKTFUNK_UI_BIND,
+    # which the server prefers — an export here would silently out-rank the file the operator edits.
     cat > "$UNITS/punktfunk-web.service" <<EOF
 # Generated by scripts/steamdeck/install.sh — punktfunk web console (bun in the '$BOX' distrobox).
 [Unit]
@@ -486,7 +508,7 @@ Description=punktfunk management web console
 After=punktfunk-host.service
 
 [Service]
-ExecStart=$DISTROBOX enter $BOX -- bash -lc 'cd $SRC/web; set -a; . $CONFIG/mgmt-token; . $CONFIG/web.env; set +a; export PUNKTFUNK_MGMT_URL=https://127.0.0.1:$MGMT_PORT PORT=$WEB_PORT HOST=0.0.0.0 NITRO_PORT=$WEB_PORT NITRO_HOST=0.0.0.0 PUNKTFUNK_UI_TLS_CERT=$CONFIG/cert.pem PUNKTFUNK_UI_TLS_KEY=$CONFIG/key.pem PUNKTFUNK_UI_SECURE=1; exec bun .output/server/index.mjs'
+ExecStart=$DISTROBOX enter $BOX -- bash -lc 'cd $SRC/web; set -a; . $CONFIG/mgmt-token; . $CONFIG/web.env; set +a; export PUNKTFUNK_MGMT_URL=https://127.0.0.1:$MGMT_PORT PORT=$WEB_PORT NITRO_PORT=$WEB_PORT PUNKTFUNK_UI_TLS_CERT=$CONFIG/cert.pem PUNKTFUNK_UI_TLS_KEY=$CONFIG/key.pem PUNKTFUNK_UI_SECURE=1 PUNKTFUNK_UI_PASSWORD_FILE=$CONFIG/web.env; exec bun .output/server/index.mjs'
 Restart=on-failure
 RestartSec=3
 
@@ -548,7 +570,12 @@ echo
 log "Done — punktfunk host is running on this Steam Deck"
 echo "  • Host status:   systemctl --user status punktfunk-host"
 if [ "$WITH_WEB" = 1 ]; then
-    echo "  • Web console:   https://${IP:-steamdeck.local}:$WEB_PORT   (login: see $CONFIG/web.env)"
+    case "$WEB_BIND" in
+        127.*|::1|localhost)
+            echo "  • Web console:   https://127.0.0.1:$WEB_PORT   (this Deck only — see $CONFIG/web.env)" ;;
+        *)
+            echo "  • Web console:   https://${IP:-steamdeck.local}:$WEB_PORT   (login: see $CONFIG/web.env)" ;;
+    esac
     echo "  • Pair a device: open the web console → Devices → arm pairing → enter the PIN on the client"
 fi
 if [ "$OPEN" = 1 ]; then

@@ -150,14 +150,19 @@ pub(super) async fn connect_and_handshake(args: &WorkerArgs) -> Result<Handshake
         let probe = std::net::UdpSocket::bind("0.0.0.0:0")?;
         let udp_port = probe.local_addr()?.port();
         drop(probe);
-        io::write_msg(
-            &mut send,
-            &Start {
-                client_udp_port: udp_port,
-            }
-            .encode(),
-        )
-        .await?;
+        // Hello is frozen and first contact, so the client's own label rides here — and only
+        // toward a host that said it parses the block. An older host reads the 6 bytes it knows.
+        let start = Start {
+            client_udp_port: udp_port,
+        };
+        let label = super::super::client_label();
+        let start_msg = if welcome.host_caps2 & crate::quic::HOST_CAP2_EXT != 0 && !label.is_empty()
+        {
+            start.encode_ext(&[(crate::quic::EXT_TAG_CLIENT, label.as_bytes())])?
+        } else {
+            start.encode()
+        };
+        io::write_msg(&mut send, &start_msg).await?;
 
         // Skew handshake before the control task takes the stream. 0 ⇒ old host did
         // not answer (shared-clock). Embedder present times are in the host capture clock.

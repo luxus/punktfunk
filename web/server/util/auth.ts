@@ -51,7 +51,7 @@ export function revokeAllSessions(): void {
 }
 
 // Shared auth helpers for the Nitro server (the deployed Bun server). Single-user,
-// shared-password gate: the user logs in with PUNKTFUNK_UI_PASSWORD, which sets a SEALED
+// shared-password gate: the user logs in against PUNKTFUNK_UI_PASSWORD_HASH, which sets a SEALED
 // (h3 useSession — AES-GCM) cookie; every request is gated by server/middleware/auth.ts.
 //
 // The management token never reaches the browser: server/routes/api/[...].ts injects it
@@ -60,7 +60,13 @@ import {
 	createHash,
 	timingSafeEqual as nodeTimingSafeEqual,
 } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+	mkdirSync,
+	readFileSync,
+	renameSync,
+	unlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import {
@@ -95,9 +101,164 @@ export function peerAddress(event: H3Event): string {
 	return getRequestIP(event) ?? "unknown";
 }
 
-/** The login password. Empty string ⇒ auth is MISCONFIGURED (the gate fails closed). */
+/** The salted argon2id hash the login compares against, in modular-crypt form.
+ *
+ * Unquoted on the way out: the password file writes the value single-quoted so the `$` fields
+ * survive a shell-sourced env file (SteamOS `. web.env`), and not every launcher strips them. */
+export function uiPasswordHash(): string {
+	const raw = process.env.PUNKTFUNK_UI_PASSWORD_HASH?.trim() ?? "";
+	return raw.replace(/^(['"])([\s\S]*)\1$/, "$2");
+}
+
+/** The LEGACY clear-text password, accepted for one release. Empty once the file is migrated. */
 export function uiPassword(): string {
 	return process.env.PUNKTFUNK_UI_PASSWORD ?? "";
+}
+
+/** Whether a password is configured at all. Either key answers; neither ⇒ auth is MISCONFIGURED
+ * and the gate fails closed. */
+export function authConfigured(): boolean {
+	return uiPasswordHash() !== "" || uiPassword() !== "";
+}
+
+/**
+ * Check a typed password against what is configured. Constant-time on both branches — the
+ * clear-text compare byte-wise, `Bun.password.verify` by construction.
+ *
+ * The legacy clear text WINS while it is set: an operator who puts a `PUNKTFUNK_UI_PASSWORD=` line
+ * back is resetting the password, and that is the whole reset path. A match then migrates the file
+ * to a hash, which is the last moment that clear text is readable — so a generated password has to
+ * be read off disk before the first login, not after it.
+ */
+export async function verifyUiPassword(password: string): Promise<boolean> {
+	const plain = uiPassword();
+	const hash = uiPasswordHash();
+	if (plain) {
+		if (!timingSafeEqual(password, plain)) return false;
+		await migratePasswordFile(plain, hash);
+		return true;
+	}
+	return hash !== "" && (await hashMatches(password, hash));
+}
+
+/** `Bun.password.verify`, counting a hash this runtime can't read as "no match" and saying so
+ * once. A mangled line must not become an open door, nor a 500 on the login route. */
+async function hashMatches(password: string, hash: string): Promise<boolean> {
+	try {
+		return await Bun.password.verify(password, hash);
+	} catch {
+		if (!warnedHash) {
+			warnedHash = true;
+			console.warn(
+				"[punktfunk-web] PUNKTFUNK_UI_PASSWORD_HASH is not a hash this server can verify — no password is accepted until it is reset",
+			);
+		}
+		return false;
+	}
+}
+let warnedHash = false;
+
+/** The argon2id surface of the runtime the console is deployed on. Declared here rather than
+ * pulled in from @types/bun, which redeclares globals this DOM-targeted config owns. */
+declare const Bun: {
+	password: {
+		hash(password: string, opts: { algorithm: "argon2id" }): Promise<string>;
+		verify(password: string, hash: string): Promise<boolean>;
+	};
+};
+
+/** The env file the launcher loads the password line from, and the one the migration rewrites.
+ * SteamOS names `web.env` here; everyone else takes the default. */
+function passwordFile(): string {
+	return (
+		process.env.PUNKTFUNK_UI_PASSWORD_FILE ??
+		join(
+			process.env.PUNKTFUNK_CONFIG_DIR ??
+				join(homedir(), ".config", "punktfunk"),
+			"web-password",
+		)
+	);
+}
+
+/** Matches either password key, so the rewrite drops both and re-adds one. */
+const PASSWORD_LINE = /^\s*PUNKTFUNK_UI_PASSWORD(_HASH)?\s*=/;
+let migrated = false;
+
+/**
+ * Swap the clear-text line in the password file for a salted hash, once per process, after a
+ * password has actually verified.
+ *
+ * `existing` is the hash already configured: a clear-text line that matches it is the same password
+ * written twice, so only the line goes. Anything else is a password the operator has just set, and
+ * every session issued before it is revoked — a reset that left old cookies alive would not be one.
+ *
+ * A file this process can't rewrite — a read-only store, a password a unit injects with no file
+ * behind it — keeps working on the clear text. Refusing the login instead would turn a hardening
+ * step into a lockout.
+ */
+async function migratePasswordFile(
+	plain: string,
+	existing: string,
+): Promise<void> {
+	if (migrated) return;
+	migrated = true;
+	const same = existing !== "" && (await hashMatches(plain, existing));
+	let hash = existing;
+	if (!same) {
+		try {
+			hash = await Bun.password.hash(plain, { algorithm: "argon2id" });
+		} catch (e) {
+			console.warn(
+				`[punktfunk-web] couldn't hash the console password — it stays in clear in ${passwordFile()}: ${e}`,
+			);
+			return;
+		}
+	}
+	const file = passwordFile();
+	if (!rewritePasswordFile(file, hash)) return;
+	// The login route stamps the session AFTER this, so whoever just typed the password stays in.
+	if (!same) revokeAllSessions();
+	console.warn(
+		`[punktfunk-web] console password stored as a salted hash in ${file} — PUNKTFUNK_UI_PASSWORD is deprecated; reset it by writing a new one back to that file and restarting`,
+	);
+}
+
+/**
+ * Write `hash` into `file` as the only password line, keeping every other line (SteamOS keeps the
+ * session secret in the same file). Temp file beside it, then rename: a crash can't leave the
+ * operator with no password at all.
+ *
+ * `false` ⇒ the file is untouched, which the caller treats as "keep serving on the clear text".
+ * A file with no clear-text line of ours is one case of that: the value came from somewhere else.
+ */
+function rewritePasswordFile(file: string, hash: string): boolean {
+	let body: string;
+	try {
+		body = readFileSync(file, "utf8");
+	} catch {
+		return false;
+	}
+	if (!body.split("\n").some((l) => PASSWORD_LINE.test(l))) return false;
+	const kept = body.split("\n").filter((l) => !PASSWORD_LINE.test(l));
+	while (kept.length > 0 && kept[kept.length - 1]?.trim() === "") kept.pop();
+	// Single-quoted: the hash carries `$` fields, and this file is sourced by a shell on SteamOS.
+	const next = `${[...kept, `PUNKTFUNK_UI_PASSWORD_HASH='${hash}'`].join("\n")}\n`;
+	const tmp = `${file}.tmp`;
+	try {
+		writeFileSync(tmp, next, { mode: 0o600 });
+		renameSync(tmp, file);
+		return true;
+	} catch (e) {
+		try {
+			unlinkSync(tmp);
+		} catch {
+			// nothing landed
+		}
+		console.warn(
+			`[punktfunk-web] couldn't rewrite ${file} — the console password stays in clear: ${e}`,
+		);
+		return false;
+	}
 }
 
 /** The management API the proxy forwards to (loopback by default — never LAN-exposed). It serves
@@ -207,6 +368,9 @@ export function isLoopbackUrl(url: string): boolean {
  * is unguessable, so a cookie sealed under it leaks nothing about the password. (Deriving from the
  * token instead of the password also means changing the password no longer silently invalidates
  * sessions; rotating the mgmt token does — the correct, security-relevant trigger.)
+ *
+ * (3) takes the HASH when there is one: it carries a random salt, so the same human password no
+ * longer gives two boxes the same seal key.
  */
 export function sessionConfig(): SessionConfig {
 	const explicit = process.env.PUNKTFUNK_UI_SECRET;
@@ -221,10 +385,10 @@ export function sessionConfig(): SessionConfig {
 			.update(`punktfunk-session-v1:token:${token}`)
 			.digest("hex");
 	} else {
-		// Last resort (no token configured — dev/local only). No worse than before; a real deployment
-		// always has a token and never reaches here.
+		// Last resort (no token configured — dev/local only). A real deployment always has a token
+		// and never reaches here.
 		secret = createHash("sha256")
-			.update(`punktfunk-session-v1:${uiPassword()}`)
+			.update(`punktfunk-session-v1:${uiPasswordHash() || uiPassword()}`)
 			.digest("hex");
 	}
 	return {

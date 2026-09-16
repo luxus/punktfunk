@@ -1,12 +1,12 @@
 ---
 title: Forgot your Password?
-description: Where the Punktfunk web console login password lives — and how to read or reset it — on each host platform.
+description: Where the Punktfunk web console login password lives, and how to reset it, on each host platform.
 ---
 
 The Punktfunk **web console** (status, paired devices, PIN pairing) is protected by a login
 password. That password is generated — or, on Windows, chosen — when the console is first set up, and
-it lives on the **host**. So if you can't get past the login screen, you recover or change it on the
-host machine itself, not from the browser.
+it lives on the **host**. So if you can't get past the login screen, you reset it on the host
+machine itself, not from the browser.
 
 New to the console? See [The Web Console](/docs/web-console) to enable it and arm pairing.
 
@@ -15,7 +15,7 @@ New to the console? See [The Web Console](/docs/web-console) to enable it and ar
 
 ## Find your host
 
-Find your host platform for exactly where the password lives, then read it back or change it below:
+Find your host platform for exactly where the password lives, then read or reset it below:
 
 | Host | Where the password lives | Section |
 |------|--------------------------|---------|
@@ -23,10 +23,13 @@ Find your host platform for exactly where the password lives, then read it back 
 | **SteamOS (host)** | `~/.config/punktfunk/web.env` | [Login password](/docs/web-console#login-password) |
 | **Windows host** | `%ProgramData%\punktfunk\web-password` | [Login password](/docs/web-console#login-password) · [Windows Host](/docs/windows-host) |
 
-## Read it back, or set your own
+## A forgotten password is reset, not recovered
 
-The password is stored on the host as a `PUNKTFUNK_UI_PASSWORD=…` line, so you can read it straight
-out of the file. On the **Linux packages** and the **SteamOS host**:
+The console stores a **salted argon2id hash**, not your password. A generated or typed password is
+readable out of the file exactly once — until you first sign in, which is when the console replaces
+that clear line with the hash. So there are two cases.
+
+**You have not signed in yet.** Read it. On the **Linux packages** and the **SteamOS host**:
 
 ```sh
 sed -n 's/^PUNKTFUNK_UI_PASSWORD=//p' ~/.config/punktfunk/web-password   # Linux packages
@@ -41,9 +44,11 @@ displays one:
 punktfunk-host web password
 ```
 
-To replace it with one you pick, follow [Login password](/docs/web-console#login-password). It has
-the exact edit-and-restart steps for each of the three platforms above, and it's the one place that
-procedure is kept up to date.
+**Nothing comes back.** Then it is hashed, and you set a new one instead: write a
+`PUNKTFUNK_UI_PASSWORD=<your-password>` line back into the same file and restart the console. Your
+next sign-in hashes it and signs every other session out — so a reset also boots anyone still
+holding an old cookie. [Login password](/docs/web-console#login-password) has the exact steps for
+each of the three platforms, and it is the one place that procedure is kept up to date.
 
 ## The password is right and it still won't let you in
 
@@ -66,17 +71,17 @@ with the password you typed.
   (The PowerShell one is Windows, from an **elevated** prompt — the console runs under the
   Punktfunk Host service there.)
 - **No password is configured at all.** If the file is missing or empty, or a line lost its
-  `PUNKTFUNK_UI_PASSWORD=` prefix, the console fails closed and admits nobody — a page you open
-  answers `auth not configured: set PUNKTFUNK_UI_PASSWORD`. Put the line back —
+  `PUNKTFUNK_UI_PASSWORD_HASH=` prefix, the console fails closed and admits nobody — a page you open
+  answers `auth not configured: set PUNKTFUNK_UI_PASSWORD_HASH`. Put a clear line back —
   `PUNKTFUNK_UI_PASSWORD=<your-password>`, on its own line, nothing else on it — and restart the
-  console as above. On the Linux packages you can instead **delete**
+  console as above; the next sign-in hashes it. On the Linux packages you can instead **delete**
   `~/.config/punktfunk/web-password` and run
 
   ```sh
   systemctl --user restart punktfunk-web-init punktfunk-web
   ```
 
-  which generates a fresh password, prints it to the journal, and starts the console with it —
-  read it back with the command above.
+  which generates a fresh password and starts the console with it — read it back with the command
+  above, before you sign in.
 
 Still stuck? See [Troubleshooting](/docs/troubleshooting).

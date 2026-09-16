@@ -16,7 +16,7 @@ interface HooksBody {
 
 export default defineEventHandler(async (event) => {
 	const body = await readBody<HooksBody>(event);
-	confirmPassword(event, body?.password);
+	await confirmPassword(event, body?.password);
 	// Rebuild from the one field the host takes, so the password cannot leak upstream.
 	return forwardJson(event, "/api/v1/hooks", "PUT", {
 		hooks: Array.isArray(body?.hooks) ? body.hooks : [],

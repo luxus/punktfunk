@@ -1,6 +1,7 @@
 // GET /_auth/ui-config — the handful of deployment facts the console UI cannot work out for itself.
 //
-// Today that is exactly one: where plugin UIs live. They are served from a different ORIGIN than
+// Two today: where plugin UIs live, and whether the console is reachable beyond this machine.
+// They are served from a different ORIGIN than
 // the console (2026-08-05 review H-3), so the browser needs the port to build the iframe URL — and
 // it must come from the server, because only the server knows whether that listener actually bound.
 //
@@ -10,7 +11,11 @@
 import { defineEventHandler } from "h3";
 import { hasTheme, hostTheme } from "../../util/hostTheme";
 import { type OmarchyTheme, omarchyTheme } from "../../util/omarchyTheme";
-import { pluginOriginPort } from "../../util/pluginOrigin";
+import {
+	boundAddress,
+	isLoopbackBind,
+	pluginOriginPort,
+} from "../../util/pluginOrigin";
 
 export interface UiConfig {
 	/**
@@ -30,19 +35,42 @@ export interface UiConfig {
 	 * publishes mode and accent only. `null` when neither answers.
 	 */
 	theme: OmarchyTheme | null;
+	/**
+	 * True when the console answers on more than this machine (`PUNKTFUNK_UI_BIND`). Settings says
+	 * so out loud: an operator who never chose that should find out where they look at settings,
+	 * not from `ss -ltnp`. `false` under `vite dev`, which stamps no bind.
+	 */
+	reachableFromNetwork: boolean;
 }
 
 export default defineEventHandler(async (): Promise<UiConfig> => {
 	// Read per request: `omarchy-theme-set` rewrites the file whenever the user switches theme,
 	// and the client refetches on navigation, so the console follows without a restart.
 	const theme = await resolveTheme();
+	const reachableFromNetwork = !isLoopbackBind(boundAddress());
 	const port = pluginOriginPort();
-	if (port) return { pluginUi: "origin", pluginPort: port, theme };
+	if (port)
+		return {
+			pluginUi: "origin",
+			pluginPort: port,
+			theme,
+			reachableFromNetwork,
+		};
 	// `import.meta.dev` is Nitro's build-time dev flag — false in every shipped build, so a
 	// production bind failure can never resolve to the same-origin arrangement.
 	if (import.meta.dev)
-		return { pluginUi: "same-origin", pluginPort: null, theme };
-	return { pluginUi: "unavailable", pluginPort: null, theme };
+		return {
+			pluginUi: "same-origin",
+			pluginPort: null,
+			theme,
+			reachableFromNetwork,
+		};
+	return {
+		pluginUi: "unavailable",
+		pluginPort: null,
+		theme,
+		reachableFromNetwork,
+	};
 });
 
 /** Omarchy › the host's own read › nothing. */

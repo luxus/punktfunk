@@ -208,13 +208,13 @@ fun App(forceGamepadUi: Boolean = false) {
         onDispose {}
     }
 
-    // Publish the live session process-wide, so a `punktfunk://` link that arrives as a SECOND
-    // activity instance (the normal case under `launchMode = standard`) can refuse it before that
-    // instance is ever resumed — see MainActivity.onCreate. Cleared on dispose, so an activity
-    // destroyed mid-stream doesn't leave a ghost that blocks every future link.
+    // Publish the live session process-wide: a `punktfunk://` link that arrives as a SECOND
+    // activity instance (the normal case under `launchMode = standard`) refuses it before that
+    // instance is resumed (MainActivity.onCreate), and every shell's dial refuses to open a second
+    // session behind it. Cleared on dispose, so an activity destroyed mid-stream leaves no ghost.
     DisposableEffect(session) {
-        MainActivity.liveStream = session?.let { MainActivity.LiveStream(it.hostId) }
-        onDispose { MainActivity.liveStream = null }
+        SessionGate.live = session?.let { SessionGate.Live(it.hostId) }
+        onDispose { SessionGate.live = null }
     }
 
     // The same rule for the rare in-instance case (a caller that set FLAG_ACTIVITY_SINGLE_TOP, so

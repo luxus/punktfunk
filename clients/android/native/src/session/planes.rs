@@ -674,6 +674,41 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeMicActive(
     })
 }
 
+/// `NativeBridge.nativeSetStreamMuted(handle, muted)` — silence this device's speakers.
+///
+/// Local: nothing reaches the host, so a second client joined to the same display keeps hearing
+/// the game. Packets keep arriving and keep decoding — the decode thread zeroes only what it
+/// queues for AAudio — so the decoder holds its state, the ring keeps its cadence, and unmute
+/// lands in step instead of re-priming. No-op on `0`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSetStreamMuted(
+    _env: EnvUnowned,
+    _this: JObject,
+    handle: jlong,
+    muted: jboolean,
+) {
+    jni_guard((), || {
+        if let Some(h) = get_session(handle) {
+            h.client.set_audio_muted(muted);
+        }
+    })
+}
+
+/// `NativeBridge.nativeAudioMute(handle): Int` — why this session is silent:
+/// `AUDIO_MUTE_LOCAL` (1), `AUDIO_MUTE_HOST` (2), both, or `0`. The overlay names the reason
+/// from this; a local unmute leaves an operator mute standing and the player is owed the
+/// difference. `0` on a `0` handle.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeAudioMute(
+    _env: EnvUnowned,
+    _this: JObject,
+    handle: jlong,
+) -> jint {
+    jni_guard(0, || {
+        get_session(handle).map_or(0, |h| jint::from(h.client.audio_mute()))
+    })
+}
+
 #[cfg(test)]
 mod panel_tests {
     use super::panel_warning;

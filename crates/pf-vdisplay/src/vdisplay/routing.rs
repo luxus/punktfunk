@@ -286,6 +286,142 @@ pub fn focus_streamed_output(compositor: Compositor, name: &str) -> bool {
     }
 }
 
+/// A launch's own workspace on the streamed head.
+///
+/// Owned by the launch, not by the session: a keep-alive reconnect re-focuses
+/// the same id instead of claiming a second one. The lease holds it and its
+/// drop calls [`WorkspaceClaim::release`].
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkspaceClaim {
+    compositor: Compositor,
+    /// Workspace the launch opens on.
+    id: i64,
+    /// What the head showed before the claim. Equal to `id` when the head was
+    /// already on an empty workspace, and then release has nothing to undo.
+    restore: i64,
+}
+
+#[cfg(target_os = "linux")]
+impl WorkspaceClaim {
+    /// Id a later session re-focuses for the same launch ([`claim_workspace`]).
+    pub fn id(&self) -> i64 {
+        self.id
+    }
+
+    /// Put the head back where the operator left it. Idempotent: a repeat, or
+    /// a head that is already gone, is a refused dispatch and one log line.
+    /// An emptied workspace disappears on its own.
+    pub fn release(&self) {
+        if !self.needs_restore() {
+            return;
+        }
+        let done = match self.compositor {
+            Compositor::Hyprland => hyprland::focus_workspace(self.restore),
+            Compositor::Wlroots => wlroots::focus_workspace(self.restore),
+            // No `_` arm: only a backend that claims can release.
+            Compositor::Kwin | Compositor::Mutter | Compositor::Gamescope | Compositor::Windows => {
+                return
+            }
+        };
+        match done {
+            Ok(()) => tracing::info!(
+                workspace = self.restore,
+                "the launch let its workspace go — the streamed head is back on the operator's"
+            ),
+            Err(e) => tracing::warn!(
+                workspace = self.restore, error = %format!("{e:#}"),
+                "workspace not restored after the launch — the streamed head stays on the one the \
+                 game had (switch back by hand)"
+            ),
+        }
+    }
+
+    /// Anything to undo? A claim on the workspace the head already showed owns
+    /// nothing, so release stays a no-op however often it runs.
+    fn needs_restore(&self) -> bool {
+        self.restore != self.id
+    }
+}
+
+/// One workspace as both backends report it, reduced to what the pick needs.
+#[cfg(target_os = "linux")]
+pub(crate) struct WsSlot {
+    pub id: i64,
+    /// Lives on the streamed head.
+    pub on_head: bool,
+    /// Holds no windows. Unknown reads as occupied: a free id is always safe.
+    pub empty: bool,
+}
+
+/// Workspace a launch gets on the streamed head: the head's own when that is
+/// already empty (no switch at all), else another empty one there, else the
+/// lowest free id — focusing an id nothing owns mints it empty on the focused
+/// head. `active` is the head's current workspace.
+#[cfg(target_os = "linux")]
+pub(crate) fn pick_workspace(slots: &[WsSlot], active: i64) -> i64 {
+    if slots.iter().any(|w| w.id == active && w.on_head && w.empty) {
+        return active;
+    }
+    if let Some(w) = slots.iter().find(|w| w.on_head && w.empty) {
+        return w.id;
+    }
+    // Special workspaces carry negative ids; a launch never wants one.
+    (1..)
+        .find(|n| !slots.iter().any(|w| w.id == *n))
+        .unwrap_or(1)
+}
+
+/// Give a launch its own empty workspace on streamed head `name`, or re-focus
+/// `want` — the workspace an earlier session already claimed for this launch.
+///
+/// Only the backends whose new windows map on the focused workspace act.
+/// `name` is checked against the backend's mint first, as in
+/// [`focus_streamed_output`]: a physical connector is not ours to switch.
+/// Best-effort: `None` leaves the launch on whatever the head shows.
+#[cfg(target_os = "linux")]
+pub fn claim_workspace(
+    compositor: Compositor,
+    name: &str,
+    want: Option<i64>,
+) -> Option<WorkspaceClaim> {
+    let placed = match compositor {
+        Compositor::Hyprland if hyprland::is_managed_output(name) => {
+            hyprland::claim_workspace(name, want)
+        }
+        Compositor::Wlroots if wlroots::is_managed_output(name) => {
+            wlroots::claim_workspace(name, want)
+        }
+        // No `_` arm: a new backend must decide here. KWin is a later step (its
+        // workspaces are a D-Bus script away); Mutter/GNOME has no per-output
+        // workspace to aim at; gamescope already gives the game the whole
+        // session; Windows has no workspaces at all.
+        Compositor::Hyprland
+        | Compositor::Wlroots
+        | Compositor::Kwin
+        | Compositor::Mutter
+        | Compositor::Gamescope
+        | Compositor::Windows => {
+            tracing::info!(
+                compositor = compositor.id(), output = %name,
+                "this compositor does not place a launch on a workspace of its own — the game \
+                 opens on whatever the streamed head is showing"
+            );
+            None
+        }
+    }?;
+    let (id, restore) = placed;
+    tracing::info!(
+        workspace = id, restore, output = %name,
+        "the launch has the streamed head's workspace to itself"
+    );
+    Some(WorkspaceClaim {
+        compositor,
+        id,
+        restore,
+    })
+}
+
 /// Nested Xwayland `(DISPLAY, XAUTHORITY)` pairs for the XFixes cursor source.
 /// Gamescope can run several; the pointer is on the focused one. Empty when
 /// none are exposed — the host then leaves gamescope cursorless.
@@ -544,6 +680,63 @@ mod tests {
         assert_eq!(input_backend_id(Compositor::Wlroots), "wlr");
         assert_eq!(input_backend_id(Compositor::Hyprland), "wlr");
         assert_eq!(input_backend_id(Compositor::Windows), "windows");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn slot(id: i64, on_head: bool, empty: bool) -> WsSlot {
+        WsSlot { id, on_head, empty }
+    }
+
+    /// The pick in all four shapes. A launch must never land on a workspace
+    /// that holds windows, and never on one belonging to another head.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_launch_takes_an_empty_workspace_on_its_own_head_or_a_free_id() {
+        // The head already shows an empty one: stay, so nothing switches.
+        let slots = [slot(1, false, false), slot(2, true, true)];
+        assert_eq!(pick_workspace(&slots, 2), 2);
+        // Occupied active, another empty one on the head.
+        let slots = [slot(1, true, false), slot(2, true, true)];
+        assert_eq!(pick_workspace(&slots, 1), 2);
+        // Every workspace on the head is occupied: lowest free id, minted empty.
+        let slots = [
+            slot(1, true, false),
+            slot(2, false, true),
+            slot(3, true, false),
+        ];
+        assert_eq!(pick_workspace(&slots, 1), 4);
+        // An empty workspace on somebody else's head is not ours to take.
+        let slots = [slot(1, true, false), slot(2, false, true)];
+        assert_eq!(pick_workspace(&slots, 1), 3);
+    }
+
+    /// Special workspaces sit at negative ids; the free-id scan starts at 1.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_free_id_scan_skips_hyprland_special_workspaces() {
+        let slots = [slot(-99, true, false), slot(1, true, false)];
+        assert_eq!(pick_workspace(&slots, 1), 2);
+    }
+
+    /// A claim on the workspace the head already showed owns nothing, so
+    /// release stays a no-op however many times a crashed launch runs it.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn releasing_a_claim_that_switched_nothing_restores_nothing() {
+        let stay = WorkspaceClaim {
+            compositor: Compositor::Hyprland,
+            id: 2,
+            restore: 2,
+        };
+        assert!(!stay.needs_restore());
+        stay.release();
+        stay.release();
+        let switched = WorkspaceClaim {
+            compositor: Compositor::Hyprland,
+            id: 4,
+            restore: 1,
+        };
+        assert!(switched.needs_restore());
     }
 
     /// Sample must not move when `PUNKTFUNK_GAMESCOPE_NODE` is written afterwards.

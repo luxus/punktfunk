@@ -10,6 +10,7 @@
 // the phone bar and the sidebar drifted apart.
 import {
 	Activity,
+	Gamepad2,
 	GaugeCircle,
 	LibraryBig,
 	type LucideIcon,
@@ -76,6 +77,13 @@ export const NAV: readonly NavEntry[] = [
 		label: () => m.nav_host(),
 		hint: () => m.nav_host_hint(),
 		group: "primary",
+	},
+	{
+		to: "/controllers",
+		icon: Gamepad2,
+		label: () => m.nav_controllers(),
+		hint: () => m.nav_controllers_hint(),
+		group: "manage",
 	},
 	{
 		to: "/stats",

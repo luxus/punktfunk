@@ -10,7 +10,7 @@ import { confirmIfCommandExecution } from "../../../../util/libraryConfirm";
 
 export default defineEventHandler(async (event) => {
 	const body = await readBody<Record<string, unknown>>(event);
-	confirmIfCommandExecution(event, body, body?.password);
+	await confirmIfCommandExecution(event, body, body?.password);
 	// Strip the confirmation before forwarding — the host has no such field and it must not leak
 	// upstream or into `library.json`.
 	const { password: _password, ...entry } = body ?? {};

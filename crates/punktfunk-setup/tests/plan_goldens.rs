@@ -65,6 +65,7 @@ fn fresh(id: &str, family: Family) -> Facts {
         // Nothing installed, so no unit: the start phase has to reason from the install.
         web_unit_present: false,
         web_password_present: false,
+        web_bind: None,
         scripting_unit_disabled: false,
         ip: Some("192.168.1.10".into()),
         user: "pf".into(),
@@ -85,6 +86,7 @@ fn installed(id: &str, family: Family, channel: Channel) -> Facts {
         has_web_server: true,
         web_unit_present: true,
         web_password_present: true,
+        web_bind: None,
         in_input_group: true,
         ..fresh(id, family)
     }

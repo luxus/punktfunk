@@ -78,6 +78,7 @@ impl StreamState {
             if applied_kbps < self.bitrate_kbps {
                 self.behind_score = 0;
             }
+            self.counters.note_bitrate(applied_kbps);
             self.bitrate_kbps = applied_kbps;
             self.live_bitrate.store(applied_kbps, Ordering::Relaxed);
             return;
@@ -114,6 +115,7 @@ impl StreamState {
                         .store(applied_kbps, Ordering::Relaxed);
                     let _ = self.retarget_tx.send(applied_kbps);
                 }
+                self.counters.note_bitrate(applied_kbps);
                 self.bitrate_kbps = applied_kbps;
                 self.live_bitrate.store(applied_kbps, Ordering::Relaxed);
                 self.inflight.clear();

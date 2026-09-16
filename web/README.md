@@ -73,10 +73,12 @@ Run it on the same box as the host; it serves the console over HTTPS on `:47992`
 
 Single-user, login-gated. Config via env (see `.env.example`):
 
-- The console requires a **login** (`PUNKTFUNK_UI_PASSWORD`). On success the server sets a
-  **sealed session cookie** (h3 `useSession`, AES-GCM). `server/middleware/auth.ts` gates
-  *every* request — pages redirect to `/login`, `/api` returns 401 — and **fails closed**
-  (503) if `PUNKTFUNK_UI_PASSWORD` is unset, so a misconfigured LAN server admits no one.
+- The console requires a **login**, checked against `PUNKTFUNK_UI_PASSWORD_HASH` (salted
+  argon2id, `Bun.password`). On success the server sets a **sealed session cookie** (h3
+  `useSession`, AES-GCM). `server/middleware/auth.ts` gates *every* request — pages redirect to
+  `/login`, `/api` returns 401 — and **fails closed** (503) when no password is configured.
+- `PUNKTFUNK_UI_PASSWORD` (clear) still works for one release and is also the reset path: the
+  first sign-in with it rewrites the password file as a hash, 0600, temp-file-and-rename.
 - The **bearer-token admin surface of the management API is loopback-only** — the host honors a
   bearer token only from a loopback peer, so the admin API is never LAN-exposed. The web server
   holds `PUNKTFUNK_MGMT_TOKEN` server-side and injects it when proxying `/api/**` →

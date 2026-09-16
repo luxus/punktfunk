@@ -42,9 +42,11 @@ bun; the **`PunktfunkHost` service supervises the console as its own child** (`b
 writes the login password to `%ProgramData%\punktfunk\web-password` (ACL'd to Administrators +
 SYSTEM). The mgmt bearer token it proxies with is the host's own
 `%ProgramData%\punktfunk\mgmt-token`. Browse `https://<host-ip>:47992` and log in with the password
-the installer shows on its final page. To change it, edit `web-password` and restart the service
-(`punktfunk-host service restart`) — or just kill the console's `bun.exe`; the supervisor respawns
-it with the new value.
+the installer shows on its final page. The console replaces that clear line with a salted argon2id
+hash on the first sign-in, so a forgotten password is **reset, not read**: put a
+`PUNKTFUNK_UI_PASSWORD=<your-password>` line back in `web-password` (elevated — the file is ACL'd)
+and restart the service (`punktfunk-host service restart`). The next sign-in re-hashes it and logs
+every other session out.
 
 ### Rebuild + restart the console (dev box)
 

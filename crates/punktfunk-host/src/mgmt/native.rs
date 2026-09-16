@@ -44,7 +44,7 @@ fn reject_lone_until_disconnect(
     None
 }
 
-fn reject_reserved(grants: u32) -> Option<Response> {
+pub(crate) fn reject_reserved(grants: u32) -> Option<Response> {
     if grants & GRANT_RESERVED != 0 {
         return Some(api_error(
             StatusCode::BAD_REQUEST,
@@ -75,9 +75,20 @@ fn chosen_access(
     })
 }
 
+/// The three named levels the console offers, as masks. `None` = not one of them;
+/// a caller that wants another shape sends `grants` instead.
+pub(crate) fn grants_for_level(level: &str) -> Option<u32> {
+    match level {
+        "full" => Some(GRANT_PRESET_FULL),
+        "controller" => Some(GRANT_PRESET_CONTROLLER_ONLY),
+        "view" => Some(GRANT_PRESET_VIEW_ONLY),
+        _ => None,
+    }
+}
+
 /// Display name of a grant mask. Derived, never stored — two copies would
 /// drift. Absent = full; reserved bits ignored (same reading as enforcement).
-fn access_level(grants: Option<u32>) -> &'static str {
+pub(crate) fn access_level(grants: Option<u32>) -> &'static str {
     match grants.unwrap_or(GRANT_ALL) & GRANT_ALL {
         m if m == GRANT_PRESET_FULL => "full",
         m if m == GRANT_PRESET_CONTROLLER_ONLY => "controller",

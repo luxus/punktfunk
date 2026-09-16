@@ -342,6 +342,20 @@ uint32_t w, h, hz; punktfunk_connection_mode(c, &w, &h, &hz);
 `punktfunk_connection_next_hdr_meta`. On `PUNKTFUNK_COMPOSITOR_GAMESCOPE`
 (`punktfunk_connection_compositor`) draw a client-side cursor by default (that capture carries none).
 
+### 5.2 The handshake extension block
+
+Hello, Welcome and Start start with a **positional** layout that is frozen: fields are read by
+offset, and absence decodes to a documented default. New fields ride a tagged block appended after
+it — `ext_len u16 || (tag u16 || len u16 || value)*`, all little-endian. Skip a tag you do not know
+and read the next one; that is what lets a newer host talk to an older client. A repeated tag, a
+length past the block, or a block over 4096 bytes is a failed handshake, not a best effort. The
+block is gated both ways, so a peer that does not ask never receives one: the host appends to
+Welcome only for a client that set `PUNKTFUNK_CLIENT_CAP_EXT`, and a client appends to Start only
+after the Welcome came back with `PUNKTFUNK_HOST_CAP2_EXT`. Hello is first contact — the host is
+still unknown there — and carries no block. Welcome's block sits after the positional layout at its
+full length (offset 89, or 121 when `cipher == 1` inserts the ChaCha key); Start's sits at 6. If you
+embed the core you get all of this for free; this is for a port that reimplements the wire.
+
 ---
 
 ## 6. The video loop

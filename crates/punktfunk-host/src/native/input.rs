@@ -166,6 +166,9 @@ struct Pads {
     pending_release: [Option<std::time::Instant>; MAX_WIRE_PADS],
     /// Resolved kind per pad; session default until a `GamepadArrival`.
     kinds: [GamepadPref; MAX_WIRE_PADS],
+    /// What the client asked for, before [`resolve_pad_kind`] folded it. `None` until
+    /// this pad declares. Reported by the Controllers feed, never used for routing.
+    declared: [Option<GamepadPref>; MAX_WIRE_PADS],
     /// Manager that holds a built device at this index (`None` = none). Stays put
     /// if `kinds[idx]` later changes (arrival-after-first-frame), so a pad is
     /// never duplicated and removal always hits the manager that owns it.
@@ -188,6 +191,7 @@ impl Pads {
             slots_exhausted_warned: false,
             pending_release: [None; MAX_WIRE_PADS],
             kinds: [default; MAX_WIRE_PADS],
+            declared: [None; MAX_WIRE_PADS],
             owner: [None; MAX_WIRE_PADS],
             xbox360: None,
             backends: PadBackends::default(),
@@ -196,7 +200,8 @@ impl Pads {
 
     /// Record a declared kind (resolved to a buildable backend). Takes effect on
     /// the next frame. A device already built keeps its owner until re-plug —
-    /// no live swap, even if arrival lands after the first frame.
+    /// no live swap, even if arrival lands after the first frame. The unresolved
+    /// kind is kept beside it: the Controllers page names both.
     fn set_kind(&mut self, idx: usize, kind: GamepadPref) {
         if idx >= MAX_WIRE_PADS {
             return;
@@ -210,6 +215,27 @@ impl Pads {
             );
         }
         self.kinds[idx] = resolved;
+        self.declared[idx] = Some(kind);
+    }
+
+    /// This pad as the Controllers feed reports it: the device the host built, the
+    /// kind the client asked for, and the state this thread just applied.
+    fn feed_frame(&self, idx: usize, state: &PadState, mask: u16) -> crate::pad_feed::PadFrame {
+        crate::pad_feed::PadFrame {
+            pad: idx as u8,
+            ts_ms: crate::pad_feed::now_ms(),
+            device: self.kinds[idx].as_str().to_string(),
+            declared: self.declared[idx].map(|k| k.as_str().to_string()),
+            slot: self.slots.slot_of(idx),
+            present: mask & (1 << idx) != 0,
+            buttons: state.buttons,
+            left_trigger: state.left_trigger,
+            right_trigger: state.right_trigger,
+            ls_x: state.ls_x,
+            ls_y: state.ls_y,
+            rs_x: state.rs_x,
+            rs_y: state.rs_y,
+        }
     }
 
     fn handle(&mut self, ev: &punktfunk_core::input::GamepadEvent) {
@@ -742,6 +768,9 @@ fn send_rumble(
 /// arrival; rumble and HID-output pump between events. Gamepads die with the
 /// session; the pointer/keyboard injector (and its portal grant) outlives it.
 ///
+/// Every pad state that reaches [`Pads`] also reaches `pad_feed`, which is what
+/// the console's Controllers page draws ([`crate::pad_feed`]).
+///
 /// Rumble is 0xCA v3 (`[level][seq][ttl_ms][trigger levels]`). The host renews
 /// an active level every ~`RUMBLE_TTL_MS × 3/10` and lets an abandoned one
 /// expire client-side (`design/rumble-envelope-plan.md`,
@@ -764,7 +793,13 @@ pub(super) fn input_thread(
     // a virtual pad or pad-audio streamer runs. One relaxed load per item.
     grants: Arc<AtomicU32>,
     frame_map: FrameMap,
+    // This session's Controllers-page tap. Every accepted pad state goes here as well
+    // as to the backends, so the page shows what was injected. Idle with nobody watching.
+    pad_feed: Arc<crate::pad_feed::PadFeed>,
     stop: Arc<AtomicBool>,
+    // Session gyro totals. This thread is joined after the summary is built, so the
+    // per-pad histogram below cannot be what the summary reads.
+    counters: Arc<crate::session_status::SessionCounters>,
 ) {
     let mut pads = Pads::new(gamepad);
     // 0xD1 streamers; `pad_audio_on` is the negotiated Welcome cap.
@@ -810,6 +845,14 @@ pub(super) fn input_thread(
         if stop.load(Ordering::SeqCst) {
             break;
         }
+        // A console just opened the Controllers page. A held button sends no further
+        // frames, so re-publish every live pad or the page draws nothing until the
+        // next press. One relaxed load per wake when the page is closed.
+        if pad_feed.take_resync() {
+            for idx in (0..MAX_WIRE_PADS).filter(|i| pad_mask & (1 << i) != 0) {
+                pad_feed.publish(|| pads.feed_frame(idx, &pad_state[idx], pad_mask));
+            }
+        }
         // Pen in range: wake at least every 100 ms so check_timeout can meet its 200 ms deadline.
         let poll = if pen.active() {
             pads.feedback_poll_interval()
@@ -828,7 +871,7 @@ pub(super) fn input_thread(
                 if grants.load(Ordering::Relaxed) & punktfunk_core::quic::GRANT_GAMEPAD != 0 =>
             {
                 if let punktfunk_core::quic::RichInput::Motion { pad, .. } = rich {
-                    motion_cadence.record(pad, std::time::Instant::now());
+                    counters.note_motion(motion_cadence.record(pad, std::time::Instant::now()));
                 }
                 pads.apply_rich(rich);
             }
@@ -858,6 +901,7 @@ pub(super) fn input_thread(
                             pad_mask |= 1 << idx;
                             let frame = pad_state[idx].frame(idx, pad_mask);
                             pads.handle(&punktfunk_core::input::GamepadEvent::State(frame));
+                            pad_feed.publish(|| pads.feed_frame(idx, &pad_state[idx], pad_mask));
                         }
                     }
                     InputKind::GamepadState => {
@@ -879,6 +923,9 @@ pub(super) fn input_thread(
                                     pad_mask |= 1 << idx;
                                     let frame = pad_state[idx].frame(idx, pad_mask);
                                     pads.handle(&punktfunk_core::input::GamepadEvent::State(frame));
+                                    pad_feed.publish(|| {
+                                        pads.feed_frame(idx, &pad_state[idx], pad_mask)
+                                    });
                                 }
                             }
                         }
@@ -899,6 +946,8 @@ pub(super) fn input_thread(
                                 pad_state[idx] = PadState::default();
                                 let frame = pad_state[idx].frame(idx, pad_mask);
                                 pads.handle(&punktfunk_core::input::GamepadEvent::State(frame));
+                                pad_feed
+                                    .publish(|| pads.feed_frame(idx, &pad_state[idx], pad_mask));
                                 tracing::info!(pad = idx, "gamepad unplugged (native detach)");
                             } else {
                                 pads.release_unbuilt(idx);
@@ -1286,7 +1335,9 @@ mod tests {
                     Arc::new(std::sync::Mutex::new(
                         punktfunk_core::video_fit::Reframe::default(),
                     )),
+                    Arc::new(crate::pad_feed::PadFeed::new()),
                     stop,
+                    Arc::new(crate::session_status::SessionCounters::default()),
                 )
             })
         };

@@ -300,6 +300,13 @@ packaged `/usr` and `~/.local` layouts. Point `PUNKTFUNK_SCRIPTING` at it (see
 whose `PATH` is much shorter than your shell's — a runner that `plugins add` finds and the console
 doesn't is that difference, and the env var is the fix.
 
+**A plugin can't read a file in your home (Linux)** — the runner starts with an empty home and
+gets back only what plugins work in: their packages and state, your scripts, and the usual game
+library roots. Anything else is yours to grant, with `systemctl --user edit punktfunk-scripting`
+and a `BindReadOnlyPaths=%h/<path>` (or `ReadWritePaths=/mnt/games` for a path outside the home).
+The host's admin token and identity key stay out of reach either way — see
+[Security](/docs/security).
+
 **A plugin's interface won't load** — see
 [Connection & discovery](/docs/troubleshooting-connect#a-plugins-interface-doesnt-load): plugin UIs
 are served on **TCP 47993**, so the port has to be open *and* its certificate accepted.

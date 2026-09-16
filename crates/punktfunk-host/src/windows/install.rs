@@ -545,9 +545,10 @@ pub fn web_main(args: &[String]) -> Result<()> {
 
 /// Print the console login password, the one affordance a silent install leaves.
 ///
-/// The file is ACL'd to Administrators + SYSTEM, so a non-elevated read fails on permission
-/// rather than absence. The two need different next moves, which is why this reads the file
-/// itself instead of the Option-returning `service::read_env_file_value`.
+/// Readable until the first sign-in only: the console then replaces the clear-text line with a
+/// salted hash, and the way back in is to write a new password into the file, not to read one out.
+/// The file is ACL'd to Administrators + SYSTEM, so a non-elevated read fails on permission rather
+/// than absence, and the two need different next moves.
 fn web_password() -> Result<()> {
     let path = pf_paths::config_dir().join("web-password");
     let text = std::fs::read_to_string(&path).map_err(|e| match e.kind() {
@@ -559,18 +560,29 @@ fn web_password() -> Result<()> {
         ),
         _ => anyhow::anyhow!("Couldn't read the console password — {e}"),
     })?;
-    // Same split as `service::read_env_file_value`: first non-empty line, value after the `=`.
-    let value = text
-        .lines()
-        .find(|l| !l.trim().is_empty())
-        .map(str::trim)
-        .map(|l| l.split_once('=').map_or(l, |(_, v)| v).trim())
-        .filter(|v| !v.is_empty())
-        .context(
-            "The console password file is empty, so the console admits nobody. Put a PUNKTFUNK_UI_PASSWORD line back and restart the host service.",
-        )?;
-    println!("{value}");
-    Ok(())
+    let mut hashed = false;
+    for line in text.lines() {
+        let Some((key, value)) = line.trim().split_once('=') else {
+            continue;
+        };
+        match (key.trim(), value.trim()) {
+            ("PUNKTFUNK_UI_PASSWORD", pw) if !pw.is_empty() => {
+                println!("{pw}");
+                return Ok(());
+            }
+            ("PUNKTFUNK_UI_PASSWORD_HASH", h) if !h.is_empty() => hashed = true,
+            _ => {}
+        }
+    }
+    bail!(
+        "{} Set a new one: put a PUNKTFUNK_UI_PASSWORD=<your-password> line in {}, then run `punktfunk-host service restart`.",
+        if hashed {
+            "The console password is stored as a salted hash, so it can't be read back."
+        } else {
+            "The console password file carries no password, so the console admits nobody."
+        },
+        path.display()
+    )
 }
 
 fn web_setup(args: &[String]) -> Result<()> {
@@ -657,6 +669,8 @@ fn web_setup(args: &[String]) -> Result<()> {
 
 /// Non-empty `--password-file` (fresh) > keep existing (upgrade) > random. Writes
 /// `PUNKTFUNK_UI_PASSWORD=<pw>\n` (LF, no BOM) and ACLs it to Administrators + SYSTEM only.
+/// The console replaces that line with a salted hash the first time the password signs in, so
+/// an upgrade keeping the existing file keeps the hash.
 fn set_web_password(pw_path: &Path, pw_file: Option<&str>) {
     // Non-admin owner means planted under `%ProgramData%` CREATOR OWNER before this install.
     // `FileExists` would treat it as an upgrade and keep the attacker's password. Rename aside;

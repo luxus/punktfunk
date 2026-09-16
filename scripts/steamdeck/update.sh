@@ -150,8 +150,16 @@ if [ -f "$CONFIG/web.env" ] && find "$CONFIG/web.env" -maxdepth 0 -perm /0077 2>
     chmod 600 "$CONFIG/web.env"
     warn "web.env was group/world-readable — an older install wrote it at the default umask."
     warn "Tightened to 0600, but that does NOT un-expose the password it already leaked to every"
-    warn "local account. Rotate it: edit PUNKTFUNK_UI_PASSWORD in $CONFIG/web.env, then"
+    warn "local account. Reset it: put a PUNKTFUNK_UI_PASSWORD line in $CONFIG/web.env, then"
     warn "  systemctl --user restart punktfunk-web"
+fi
+
+# The console binds loopback unless PUNKTFUNK_UI_BIND says otherwise, and this Deck's console has
+# been answering on every interface. Write that down before install.sh's new unit (which no longer
+# exports HOST=0.0.0.0) ever runs here, so a later re-run cannot take the console off the network.
+if [ -f "$CONFIG/web.env" ] && ! grep -q '^[[:space:]]*PUNKTFUNK_UI_BIND=' "$CONFIG/web.env"; then
+    printf '# Where the console listens: this install already served your network.\nPUNKTFUNK_UI_BIND=0.0.0.0\n' >> "$CONFIG/web.env"
+    ok "web.env: kept the console on your network (PUNKTFUNK_UI_BIND=0.0.0.0)"
 fi
 
 # Retrofit config that install.sh now writes but older installs predate (both idempotent):

@@ -29,7 +29,9 @@ import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.absolutePadding
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.Spacer
@@ -347,6 +349,9 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
                     }
                 }
             }
+            // The operator's per-session mute rides the control stream, so the badge learns it
+            // on this tick. The local bit is in the same mask — the toggle writes it at once.
+            ui.audioMute = NativeBridge.nativeAudioMute(handle)
             if (NativeBridge.nativeSessionEnded(handle)) {
                 // WHY it ended decides what the user is told. This used to show the "host may be
                 // asleep" line for EVERY ending — including a game the player had just quit and a
@@ -483,11 +488,12 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
     // Ending from a path that fires while the app is already away — minutes after the recomposer
     // paused, so the disposal that `onSessionEnded` schedules will not run until the user comes
     // back, leaving the host streaming to an empty room. Repeating is free: a stale handle makes
-    // every native call here a no-op, and the disposal runs the same ones.
-    fun endAway(deliberate: Boolean) {
+    // every native call here a no-op, and the disposal runs the same ones. `reason` decides where
+    // the app lands: `GAME_EXITED` returns a library launch to its own shelf.
+    fun endAway(deliberate: Boolean, reason: SessionEndReason = SessionEndReason.LOCAL) {
         if (deliberate) NativeBridge.nativeDisconnectQuit(handle) else NativeBridge.nativeClose(handle)
         StreamKeepAliveService.stop(context)
-        onSessionEnded(SessionEndReason.LOCAL)
+        onSessionEnded(reason)
     }
 
     // The ongoing notification goes up when the session starts, not when the user leaves: an app
@@ -559,6 +565,11 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
     var padSize by remember { mutableStateOf(IntSize.Zero) }
     val hinge = rememberFoldHinge()
     val split = if (padShown) hinge?.let { foldSplit(it, rootSize) } else null
+    // A safe-area mode asked the host for a picture narrower than the panel by the housing on each
+    // side, so the box it lands in is the safe rectangle rather than the whole width: a hole on one
+    // side would otherwise sit over a picture centred in the other. Absolute, not start/end — the
+    // cutout's sides are physical, and an RTL layout must not swap them.
+    val safe = if (initialSettings.width == SAFE_AREA_MODE) displaySafeInsets(context, initialSettings) else null
     Column(modifier = Modifier.fillMaxSize().background(Color.Black).onSizeChanged { rootSize = it }) {
         Box(
             modifier = Modifier
@@ -568,6 +579,16 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
                         Modifier.height(with(density) { split.videoPx.toDp() })
                     } else {
                         Modifier.weight(1f)
+                    },
+                )
+                .then(
+                    if (safe != null) {
+                        Modifier.absolutePadding(
+                            left = with(density) { safe.left.toDp() },
+                            right = with(density) { safe.right.toDp() },
+                        )
+                    } else {
+                        Modifier
                     },
                 )
                 .onSizeChanged { containerSize = it },
@@ -736,8 +757,17 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
                         "${SessionAccess.remainingLabel(ui.accessRemaining)} left"
                 else -> SessionAccess.label(ui.accessGrants)
             }
-            if (accessChip != null) {
-                AccessChip(accessChip, Modifier.align(Alignment.TopEnd).padding(12.dp))
+            // Same corner, stacked: the mute sentence stands whatever the stats tier, because a
+            // player who cannot hear is owed the reason even with chrome off.
+            if (accessChip != null || ui.audioMuteLabel != null) {
+                Column(
+                    Modifier.align(Alignment.TopEnd).padding(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                    horizontalAlignment = Alignment.End,
+                ) {
+                    ui.audioMuteLabel?.let { AccessChip(it) }
+                    accessChip?.let { AccessChip(it) }
+                }
             }
             // "Hold to quit" hint while the gamepad exit chord is armed — the exit debounces on a ~1 s
             // hold, so without this cue a couch user reads the (deliberately no-longer-instant) chord as
@@ -925,6 +955,9 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
                             val on = NativeBridge.nativePadMouse(handle)
                             NativeBridge.nativeSetPadMouse(handle, if ((on and t) == t) on and t.inv() else on or t)
                         },
+                        audioMute = { ui.audioMute },
+                        audioMuteLabel = { ui.audioMuteLabel },
+                        toggleStreamMute = { ui.muteStream(!ui.streamMuted) },
                         currentMode = { requestedMode },
                         requestMode = { w, h, hz ->
                             if (NativeBridge.nativeRequestMode(handle, w, h, hz)) {
@@ -958,7 +991,15 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
         }
         // Last, so it covers everything: the launched title's poster until its game is up.
         var launchHold by remember(session) { mutableStateOf(session.launchHold) }
-        launchHold?.let { LaunchHoldOverlay(it) { launchHold = null } }
+        launchHold?.let {
+            LaunchHoldOverlay(
+                it,
+                // Retry is the shelf the launch came off: ending as `GAME_EXITED` puts a library
+                // launch back on it, one press from the same tile.
+                onRetry = { endAway(true, SessionEndReason.GAME_EXITED) },
+                onShow = { launchHold = null },
+            )
+        }
     }
 }
 

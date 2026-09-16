@@ -9,16 +9,51 @@ import io.unom.punktfunk.kit.VideoDecoders
 import io.unom.punktfunk.kit.security.ClientIdentity
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import java.util.concurrent.atomic.AtomicBoolean
 
 /** Handshake budget for a normal / library-launch connect (not the long request-access park). */
 const val CONNECT_TIMEOUT_MS = 10_000
 
 /**
- * The one place [NativeBridge.nativeConnect] is assembled — shared by [ConnectScreen] and the library
- * launcher ([LibraryScreen]). Derives the mode / HDR / gamepad settings the host needs from
- * [settings]. [pinHex] is the pinned fingerprint (empty ⇒ TOFU). [launch] is a store-qualified library
- * id (`steam:<appid>` / `custom:<id>`) to boot straight into a game, or `null` for the desktop.
- * Returns the session handle, or `0` on failure. Call off the main thread.
+ * The one session this process owns, and the one dial allowed to be in flight.
+ *
+ * Process-wide (null = not streaming), published by the composition that owns the stream.
+ * `launchMode` is `standard`, so a `punktfunk://` link arrives as a second activity instance that
+ * knows nothing about the first; static state is what crosses that gap, and the process dying
+ * resets it.
+ *
+ * It also gates [connectToHost]. The console's native shell and its event pump outlive the screen
+ * that raised them, so a `Launch` behind a live stream still reaches the dial: the host admits it
+ * by `mode-conflict: JOIN` at the owner's mode and this side neither shows nor closes it. One
+ * launch, one session.
+ */
+object SessionGate {
+    /** The host a live stream is on. */
+    data class Live(val hostId: String?)
+
+    @Volatile
+    var live: Live? = null
+
+    private val dialing = AtomicBoolean(false)
+
+    /** Claim the dial, or `false` when a session or another dial holds it. Pair with [release]. */
+    fun take(): Boolean = live == null && dialing.compareAndSet(false, true)
+
+    fun release() {
+        dialing.set(false)
+    }
+}
+
+/**
+ * The one place [NativeBridge.nativeConnect] is assembled — shared by [ConnectScreen], the library
+ * launcher ([LibraryScreen]) and the console shell. Derives the mode / HDR / gamepad settings the
+ * host needs from [settings]. [pinHex] is the pinned fingerprint (empty ⇒ TOFU). [launch] is a
+ * store-qualified library id (`steam:<appid>` / `custom:<id>`) to boot straight into a game, or
+ * `null` for the desktop. [dialer] names the shell and path that asked, for the log and the wire.
+ *
+ * Gated by [SessionGate]: a dial behind a live session, or beside one already in flight, returns
+ * `0` without touching the host. Returns the session handle, or `0` on failure. Call off the main
+ * thread.
  */
 suspend fun connectToHost(
     context: Context,
@@ -28,7 +63,32 @@ suspend fun connectToHost(
     port: Int,
     pinHex: String,
     launch: String?,
+    dialer: String,
     timeoutMs: Int = CONNECT_TIMEOUT_MS,
+): Long {
+    // One launch, one session: every shell's connect lands here, so the refusal lives here too.
+    if (!SessionGate.take()) {
+        Log.w("punktfunk", "dial refused ($dialer): this device already has a session or a dial in hand")
+        return 0L
+    }
+    try {
+        return dial(context, settings, identity, host, port, pinHex, launch, dialer, timeoutMs)
+    } finally {
+        SessionGate.release()
+    }
+}
+
+/** [connectToHost] with the gate already taken. */
+private suspend fun dial(
+    context: Context,
+    settings: Settings,
+    identity: ClientIdentity,
+    host: String,
+    port: Int,
+    pinHex: String,
+    launch: String?,
+    dialer: String,
+    timeoutMs: Int,
 ): Long {
     // Advertise HDR only when the user enabled it AND this device's display can present it (else the
     // host sends a proper SDR stream rather than PQ the panel would mis-tone-map).
@@ -111,6 +171,9 @@ suspend fun connectToHost(
             // silencing it for the session. Free to ask for — an older host just ignores it.
             keepHostAudio = settings.keepHostAudio,
             videoFit = settings.videoFit,
+            // Which build, and which shell and path, opened this session — the host's
+            // `handshake complete` `client=` field.
+            dialer = "android ${appVersion(context)} $dialer",
         )
         NativeBridge.nativeConnect(request.toJson())
     }

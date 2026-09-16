@@ -286,6 +286,7 @@ impl StreamState {
             && crate::vdisplay::dedicated_game_exited(self.cur_node_id)
         {
             tracing::info!("dedicated game session: the game exited — ending the session cleanly");
+            crate::events::SessionEndReason::GameExited.latch(&self.end_reason);
             self.quit.store(true, Ordering::SeqCst);
             self.conn
                 .close(punktfunk_core::quic::APP_EXITED_CLOSE_CODE, b"game exited");

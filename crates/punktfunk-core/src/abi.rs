@@ -2859,6 +2859,56 @@ pub unsafe extern "C" fn punktfunk_connection_next_audio(
     })
 }
 
+/// Mute this client's own speakers. Local only: the host keeps encoding and a session joined
+/// to the same display keeps hearing the game. Audio keeps arriving and decoding — zero only
+/// what you queue for the device — so unmute lands in step instead of re-syncing. Does not
+/// clear `PUNKTFUNK_AUDIO_MUTE_HOST`.
+///
+/// # Safety
+/// `c` is a valid connection handle. Callable from any thread.
+#[cfg(feature = "quic")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn punktfunk_connection_set_audio_muted(
+    c: *mut PunktfunkConnection,
+    muted: bool,
+) -> PunktfunkStatus {
+    guard(|| {
+        // SAFETY: caller handle or null; `as_ref` never dereferences null.
+        let c = match unsafe { c.as_ref() } {
+            Some(c) => c,
+            None => return PunktfunkStatus::NullPointer,
+        };
+        c.inner.set_audio_muted(muted);
+        PunktfunkStatus::Ok
+    })
+}
+
+/// Why this session is silent: `PUNKTFUNK_AUDIO_MUTE_LOCAL`, `PUNKTFUNK_AUDIO_MUTE_HOST`,
+/// both, or `0`. Name the reason in the overlay from this — a local unmute leaves an
+/// operator mute standing, and the player is owed the difference.
+///
+/// # Safety
+/// `c` is a valid connection handle; `out` is NULL or writable for one `u8`.
+#[cfg(feature = "quic")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn punktfunk_connection_audio_mute(
+    c: *mut PunktfunkConnection,
+    out: *mut u8,
+) -> PunktfunkStatus {
+    guard(|| {
+        // SAFETY: caller handle or null; `as_ref` never dereferences null.
+        let c = match unsafe { c.as_ref() } {
+            Some(c) => c,
+            None => return PunktfunkStatus::NullPointer,
+        };
+        if !out.is_null() {
+            // SAFETY: `out` is non-null and the caller guarantees it is writable for one `u8`.
+            unsafe { *out = c.inner.audio_mute() };
+        }
+        PunktfunkStatus::Ok
+    })
+}
+
 /// Host-resolved audio channel count: `2` (stereo), `6` (5.1) or `8` (7.1).
 /// `*out` is filled when non-NULL. Raw `0xC9` Opus is encoded for this layout
 /// ([`crate::audio::layout_for`]); or use [`punktfunk_connection_next_audio_pcm`].
@@ -3212,6 +3262,40 @@ pub unsafe extern "C" fn punktfunk_connection_set_pad_mouse(
             None => return PunktfunkStatus::NullPointer,
         };
         match c.inner.set_pad_mouse(mask) {
+            Ok(()) => PunktfunkStatus::Ok,
+            Err(e) => e.status(),
+        }
+    })
+}
+
+/// Replace the controller-mouse layout from a JSON document: `settings` (the `pointer` and
+/// `scroll` multipliers, `deadzone`, `long_press_ms`), a `buttons` table of pad button to
+/// `mouse:left` / `key:Escape`, and a `chords` array of `buttons` + `press`
+/// (`any` / `short` / `long` / `hold`) + `keys`. NULL restores the shipped table. A pad already
+/// in controller mouse keeps the layout it entered with. `InvalidArg` on a document that does
+/// not parse, and the live layout is left alone.
+///
+/// # Safety
+/// `c` is a valid connection handle; `json` is a NUL-terminated UTF-8 string or NULL.
+/// Callable from any thread.
+#[cfg(feature = "quic")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn punktfunk_connection_set_pad_mouse_layout(
+    c: *mut PunktfunkConnection,
+    json: *const std::os::raw::c_char,
+) -> PunktfunkStatus {
+    guard(|| {
+        // SAFETY: caller handle or null; `as_ref` never dereferences null.
+        let c = match unsafe { c.as_ref() } {
+            Some(c) => c,
+            None => return PunktfunkStatus::NullPointer,
+        };
+        // SAFETY: caller C string or null, borrowed for this call only.
+        let doc = match unsafe { opt_cstr(json) } {
+            Ok(d) => d,
+            Err(()) => return PunktfunkStatus::InvalidArg,
+        };
+        match c.inner.set_pad_mouse_layout(doc) {
             Ok(()) => PunktfunkStatus::Ok,
             Err(e) => e.status(),
         }
@@ -6022,8 +6106,8 @@ mod abi_version_tests {
     #[test]
     fn abi_version_is_pinned() {
         // Current ABI. A bump must update this pin.
-        assert_eq!(crate::ABI_VERSION, 32);
-        assert_eq!(super::punktfunk_abi_version(), 32);
+        assert_eq!(crate::ABI_VERSION, 34);
+        assert_eq!(super::punktfunk_abi_version(), 34);
     }
 
     #[test]

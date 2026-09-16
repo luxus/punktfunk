@@ -76,6 +76,19 @@ fn kwin_available() -> bool {
         .get_or_init(|| crate::vdisplay::available().contains(&crate::vdisplay::Compositor::Kwin))
 }
 
+/// Can any backend here put a launch on a workspace of its own
+/// (`vdisplay::claim_workspace`)? Cached: see [`kwin_available`].
+#[cfg(target_os = "linux")]
+fn workspace_placement_available() -> bool {
+    use crate::vdisplay::Compositor;
+    static PRESENT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *PRESENT.get_or_init(|| {
+        crate::vdisplay::available()
+            .iter()
+            .any(|c| matches!(c, Compositor::Hyprland | Compositor::Wlroots))
+    })
+}
+
 /// Whether a gamescope backend is usable on this host. Cached: see the call site.
 fn gamescope_present() -> bool {
     #[cfg(target_os = "linux")]
@@ -138,6 +151,13 @@ pub(crate) fn display_settings_state() -> DisplaySettingsState {
     // advertise it off Linux — a stored pin would never take effect.
     if cfg!(target_os = "linux") {
         enforced.push("capture_monitor".into());
+    }
+    // Hyprland and sway only. KWin is a later step, and Mutter/GNOME, gamescope and Windows
+    // have no per-output workspace to aim a launch at, so the axis would store and do nothing
+    // there — the dead control this gate exists to prevent.
+    #[cfg(target_os = "linux")]
+    if workspace_placement_available() {
+        enforced.push("launch_workspace".into());
     }
     // KWin only. wlroots, Hyprland, Mutter and the Windows CCD isolate all darken every head
     // they find, so the keep-list would store and do nothing there — the dead control this

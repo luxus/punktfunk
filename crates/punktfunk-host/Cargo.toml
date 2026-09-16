@@ -129,10 +129,9 @@ hex = "0.4"
 # measurement — not one to inherit silently. `std` covers everything we call (`Engine::encode`,
 # `decode` to a `Vec`).
 base64 = { version = "0.23", default-features = false, features = ["std"] }
-# Blocking HTTP for the library cover-art warmer (no-auth GOG api.gog.com + Xbox displaycatalog),
-# run on a background thread off the hot path. `ureq` is small + sync (no tokio here) and bundles
-# webpki roots (no system cert dependency). Cross-platform so the fetch/parse code is compiled +
-# checked everywhere even though only the Windows GOG/Xbox providers need it today.
+# Blocking HTTP for the library art store: the proxy fetches a cover the first time a client asks
+# for one, on a `spawn_blocking` thread off the async runtime. `ureq` is small + sync (no tokio
+# here) and bundles webpki roots (no system cert dependency).
 # ⚠ `rustls-no-provider`, NEVER the default `rustls` feature — that one pulls `_ring`, which would
 # put the ring backend back into a tree that has deliberately moved to aws-lc-rs.
 ureq = { version = "3", default-features = false, features = [

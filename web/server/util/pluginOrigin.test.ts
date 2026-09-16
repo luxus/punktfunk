@@ -6,7 +6,11 @@
 // is only in devtools. That is exactly how `http://host:47992` shipped as the permitted ancestor of
 // an `https://host:47992` console.
 import { describe, expect, test } from "bun:test";
-import { frameAncestorSource, isPluginUiPath } from "./pluginOrigin";
+import {
+	frameAncestorSource,
+	isLoopbackBind,
+	isPluginUiPath,
+} from "./pluginOrigin";
 
 describe("frameAncestorSource", () => {
 	test("uses the listener's scheme, NOT the request's", () => {
@@ -111,5 +115,25 @@ describe("isPluginUiPath", () => {
 		// A near-miss must not be swept in by a loose startsWith.
 		expect(isPluginUiPath("/plugin-uix")).toBe(false);
 		expect(isPluginUiPath("/plugin-ui-admin")).toBe(false);
+	});
+});
+
+describe("isLoopbackBind", () => {
+	// Settings shows the network notice on `false`, so a false negative tells an operator their
+	// console is private when the LAN can reach it. Everything not provably local reads as public.
+	test("knows the addresses that answer only here", () => {
+		expect(isLoopbackBind("127.0.0.1")).toBe(true);
+		expect(isLoopbackBind("127.0.0.53")).toBe(true);
+		expect(isLoopbackBind("::1")).toBe(true);
+		expect(isLoopbackBind("localhost")).toBe(true);
+		// No stamp at all: `vite dev`, where the notice would be noise.
+		expect(isLoopbackBind(null)).toBe(true);
+	});
+
+	test("calls everything else reachable", () => {
+		expect(isLoopbackBind("0.0.0.0")).toBe(false);
+		expect(isLoopbackBind("::")).toBe(false);
+		expect(isLoopbackBind("192.168.1.21")).toBe(false);
+		expect(isLoopbackBind("100.64.0.3")).toBe(false);
 	});
 });

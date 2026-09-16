@@ -25,7 +25,7 @@
 // Not [`WIRE_VERSION`]. The C surface can grow without a wire byte changing.
 // Pin the integer in `abi.rs` (`abi_version_is_pinned`). Per-bump notes live
 // in `CHANGELOG.md`.
-#define PUNKTFUNK_ABI_VERSION 32
+#define PUNKTFUNK_ABI_VERSION 34
 
 // punktfunk/1 wire version. `Hello`/`Welcome` carry it; hosts equality-check it.
 //
@@ -343,6 +343,18 @@
 #define PUNKTFUNK_AUDIO_BITS_16 16
 
 #define PUNKTFUNK_AUDIO_BITS_24 24
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// This client silenced its own speakers ([`NativeClient::set_audio_muted`]). The host keeps
+// sending, so a session joined to the same sink still hears the game.
+#define PUNKTFUNK_AUDIO_MUTE_LOCAL (1 << 0)
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// The operator muted this session from the console ([`crate::quic::AudioState`]). The host
+// stopped encoding this session's audio, so a local unmute brings nothing back.
+#define PUNKTFUNK_AUDIO_MUTE_HOST (1 << 1)
+#endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Two missed 500 ms legacy refreshes. A quieter host is treated as gone.
@@ -714,6 +726,12 @@
 // host-global wiring, so any live session that asked wins until it ends.
 #define PUNKTFUNK_CLIENT_CAP_KEEP_HOST_AUDIO 32
 
+// [`Hello::client_caps`]: the client parses the tagged extension block after Welcome's
+// frozen positional layout ([`EXT_TAG_PADDING`](super::EXT_TAG_PADDING)). The host
+// appends a block only toward this bit, so a client that leaves it clear still gets the
+// Welcome byte-identical to today's. `0x80` is the last free `client_caps` bit.
+#define PUNKTFUNK_CLIENT_CAP_EXT 64
+
 // [`Welcome::host_caps`]: the session is on the lossless audio plane
 // ([`AUDIO_PCM_MAGIC`](super::datagram::AUDIO_PCM_MAGIC), `0xD3`). A wire statement, not
 // an offer: the client must open from
@@ -737,6 +755,11 @@
 // `PT_TOUCH`. Without the bit a passthrough client falls back to trackpad — otherwise
 // contacts vanish with no error (`design/touch-client-overlay.md`).
 #define PUNKTFUNK_HOST_CAP2_TOUCH 2
+
+// [`Welcome::host_caps2`](crate::quic::Welcome::host_caps2): the host parses the tagged
+// extension block after `Start`'s 6 bytes. The client appends one only after seeing this
+// bit — Hello is first contact, with no host capability known yet, and stays frozen.
+#define PUNKTFUNK_HOST_CAP2_EXT 4
 
 // [`Hello::video_codecs`]: H.264 / AVC. The software encode path emits H.264, so a client
 // that wants to stream from a GPU-less host must advertise this.
@@ -888,6 +911,16 @@
 // [`AccessUpdate`]. 0x58: 0x50–0x51 are cursor; 0x40–0x44 are clipboard.
 #define PUNKTFUNK_MSG_ACCESS_UPDATE 88
 
+// [`AudioState`]. 0x59: next after [`MSG_ACCESS_UPDATE`].
+#define PUNKTFUNK_MSG_AUDIO_STATE 89
+
+// [`LaunchOutcome`]. 0x5A: next after [`MSG_AUDIO_STATE`].
+#define PUNKTFUNK_MSG_LAUNCH_OUTCOME 90
+
+// Longest [`LaunchOutcome::message`] in UTF-8 bytes. One sentence plus a cause;
+// a host cannot make the client hold more than this.
+#define PUNKTFUNK_LAUNCH_MESSAGE_MAX 200
+
 #define PUNKTFUNK_AUDIO_MAGIC 201
 
 #define PUNKTFUNK_RUMBLE_MAGIC 202
@@ -1022,6 +1055,30 @@
 // [`Welcome::audio_codec`]: raw interleaved LE PCM on `0xD3` (`crate::audio::pcm`).
 // `2` because [`AUDIO_CODEC_FLAC_RESERVED`] holds `1`.
 #define PUNKTFUNK_AUDIO_CODEC_PCM 2
+
+// Extension tag `1`: no-op filler. Carries nothing, so a peer skips it like any tag it
+// does not know. Tag `0` is reserved. Every tag is allocated here with a doc line, as
+// `quic/caps.rs` does for bits, and an id is never reused for a second meaning: a peer
+// that skips an unknown id cannot tell two meanings apart.
+#define PUNKTFUNK_EXT_TAG_PADDING 1
+
+// Extension tag `2` on `Start`: what the client calls itself, UTF-8, no NUL — its build and
+// the shell that dialled (`"android 0.38.0 console/library"`). A label for the host's log, never
+// a fact it acts on: two sessions from one device are told apart here instead of by capture.
+// Bounded by [`EXT_CLIENT_MAX`]; a longer value is truncated on a char boundary by
+// [`client_label`].
+#define PUNKTFUNK_EXT_TAG_CLIENT 2
+
+// Longest [`EXT_TAG_CLIENT`] value in UTF-8 bytes. A log field, so short.
+#define PUNKTFUNK_EXT_CLIENT_MAX 96
+
+// Largest extension block on the wire, its `ext_len` header included. The block is read
+// before the peer is trusted, so this bounds what one message makes the other side hold.
+#define PUNKTFUNK_EXT_MAX_BYTES 4096
+
+// Most entries in one block. Tags are unique, so this only bounds a flood of zero-length
+// entries inside [`EXT_MAX_BYTES`].
+#define PUNKTFUNK_EXT_MAX_ENTRIES 64
 
 #define PUNKTFUNK_MSG_PAIR_REQUEST 16
 
@@ -2385,6 +2442,27 @@ PunktfunkStatus punktfunk_connection_next_audio(PunktfunkConnection *c,
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// Mute this client's own speakers. Local only: the host keeps encoding and a session joined
+// to the same display keeps hearing the game. Audio keeps arriving and decoding — zero only
+// what you queue for the device — so unmute lands in step instead of re-syncing. Does not
+// clear `PUNKTFUNK_AUDIO_MUTE_HOST`.
+//
+// # Safety
+// `c` is a valid connection handle. Callable from any thread.
+PunktfunkStatus punktfunk_connection_set_audio_muted(PunktfunkConnection *c, bool muted);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Why this session is silent: `PUNKTFUNK_AUDIO_MUTE_LOCAL`, `PUNKTFUNK_AUDIO_MUTE_HOST`,
+// both, or `0`. Name the reason in the overlay from this — a local unmute leaves an
+// operator mute standing, and the player is owed the difference.
+//
+// # Safety
+// `c` is a valid connection handle; `out` is NULL or writable for one `u8`.
+PunktfunkStatus punktfunk_connection_audio_mute(PunktfunkConnection *c, uint8_t *out);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // Host-resolved audio channel count: `2` (stereo), `6` (5.1) or `8` (7.1).
 // `*out` is filled when non-NULL. Raw `0xC9` Opus is encoded for this layout
 // ([`crate::audio::layout_for`]); or use [`punktfunk_connection_next_audio_pcm`].
@@ -2494,6 +2572,20 @@ PunktfunkStatus punktfunk_connection_set_pad_audio_caps(PunktfunkConnection *c,
 // # Safety
 // `c` is a valid connection handle. Callable from any thread.
 PunktfunkStatus punktfunk_connection_set_pad_mouse(PunktfunkConnection *c, uint16_t mask);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Replace the controller-mouse layout from a JSON document: `settings` (the `pointer` and
+// `scroll` multipliers, `deadzone`, `long_press_ms`), a `buttons` table of pad button to
+// `mouse:left` / `key:Escape`, and a `chords` array of `buttons` + `press`
+// (`any` / `short` / `long` / `hold`) + `keys`. NULL restores the shipped table. A pad already
+// in controller mouse keeps the layout it entered with. `InvalidArg` on a document that does
+// not parse, and the live layout is left alone.
+//
+// # Safety
+// `c` is a valid connection handle; `json` is a NUL-terminated UTF-8 string or NULL.
+// Callable from any thread.
+PunktfunkStatus punktfunk_connection_set_pad_mouse_layout(PunktfunkConnection *c, const char *json);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)

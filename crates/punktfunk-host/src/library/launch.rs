@@ -31,6 +31,13 @@ pub struct LaunchTarget {
     pub detect: DetectSpec,
     /// Linux: the host-run shell command. Windows: always `None`; spawn is by library id.
     pub command: Option<String>,
+    /// Open this launch on an empty workspace of the streamed head, where the
+    /// compositor can place it ([`crate::library::OnWindow::own_workspace`]).
+    pub own_workspace: bool,
+    /// The entry's own placement block, applied to the game's first window.
+    /// `own_workspace` above is the workspace key already resolved against the
+    /// host policy; the rest is read when that window appears.
+    pub on_window: crate::library::OnWindow,
 }
 
 /// Map a store-qualified library id to a [`LaunchTarget`] from the host's library.

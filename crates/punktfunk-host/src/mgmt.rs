@@ -365,6 +365,16 @@ fn api_router_parts() -> (Router<Arc<MgmtState>>, utoipa::openapi::OpenApi) {
         .routes(routes!(native::deny_pending_device))
         .routes(routes!(session::stop_session))
         .routes(routes!(session::request_idr))
+        // Per-session forms of the same three verbs; the id-less ones above stay host-wide.
+        .routes(routes!(session::stop_one_session))
+        .routes(routes!(session::request_session_idr))
+        .routes(routes!(session::set_session_audio))
+        .routes(routes!(session::set_session_access))
+        // The registry's other side: what finished sessions came to.
+        .routes(routes!(session::get_recent_sessions))
+        .routes(routes!(session::get_session_windows))
+        .routes(routes!(session::act_on_session_window))
+        .routes(routes!(session::stream_session_pads))
         .routes(routes!(
             session::get_session_settings,
             session::set_session_settings

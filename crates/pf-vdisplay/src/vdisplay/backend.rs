@@ -98,11 +98,16 @@ pub struct VirtualOutput {
     #[cfg(target_os = "linux")]
     pub expect_exact_dims: bool,
     /// Compositor `wl_output.name` (Hyprland `PF-<pid>-<n>`, sway `HEADLESS-N`, mirrored connector)
-    /// so the host can aim absolute input (`pf_inject::set_stream_output`). Protocol-stable across
-    /// clients. `None` when mapping does not need it (KWin/Mutter libei-by-region; gamescope owns
-    /// the seat). Carried only: this crate must not depend on pf-inject.
+    /// for direct capture and absolute input (`pf_inject::set_stream_output`). Protocol-stable
+    /// across clients. `None` when capture must not open the head by name (KWin, see
+    /// [`input_output`](Self::input_output); Mutter libei-by-region; gamescope owns the seat).
+    /// Carried only: this crate must not depend on pf-inject.
     #[cfg(target_os = "linux")]
     pub output_name: Option<String>,
+    /// `wl_output.name` absolute input aims at when `output_name` is `None`: KWin's
+    /// `Virtual-<name>`. Without it KWin lands on whichever head matches the client's size.
+    #[cfg(target_os = "linux")]
+    pub input_output: Option<String>,
     /// This gamescope instance's `GAMESCOPE_WAYLAND_DISPLAY` (`gamescope-N`) — the seat key every
     /// `/proc` discovery filters on, so a launch, an exit watch and a cursor source stay on the
     /// seat that owns them. Kept across reuse. `None` for every other backend.
@@ -147,6 +152,8 @@ impl VirtualOutput {
             expect_exact_dims: false,
             #[cfg(target_os = "linux")]
             output_name: None,
+            #[cfg(target_os = "linux")]
+            input_output: None,
             #[cfg(target_os = "linux")]
             seat: None,
             #[cfg(target_os = "linux")]

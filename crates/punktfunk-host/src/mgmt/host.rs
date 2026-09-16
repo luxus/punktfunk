@@ -108,12 +108,21 @@ pub(crate) struct RuntimeStatus {
     /// Native-plane pairings (separate store).
     native_paired_clients: u32,
     /// Live sessions on both planes. Native admits concurrent sessions so this can exceed 1;
-    /// `session`/`stream` are one representative.
+    /// `session`/`stream` are one representative and `sessions` is the list.
     active_sessions: u32,
+    /// Every live session, one row each — what the per-session routes take an id from.
+    sessions: Vec<SessionRow>,
     /// GameStream launch if present, else the first live native session. `null` when idle.
+    /// `session_id` says which row of `sessions` this is.
     session: Option<SessionInfo>,
-    /// Active stream parameters. `null` when idle.
+    /// Active stream parameters of that same session. `null` when idle.
     stream: Option<StreamInfo>,
+    /// Which `sessions` row `session`/`stream` describe. `null` when idle, or when the
+    /// representative is the GameStream stream (the compat plane has no id).
+    // `value_type`: an `Option<u64>` alone generates as `never` in the SDK.
+    #[schema(value_type = u64, required = false)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<u64>,
     /// Launched titles: live sessions plus `state: "grace"` reconnect-window rows. Empty for a desktop-only stream.
     games: Vec<ActiveGame>,
     /// Windows audio-wiring verdict; absent off-Windows and before the first pass. Present while idle.
@@ -324,7 +333,10 @@ fn audio_wiring() -> Option<AudioWiring> {
 
 #[derive(Serialize, ToSchema)]
 pub(crate) struct ActiveGame {
-    /// Streaming session; `null` while waiting out the reconnect window.
+    /// Streaming session; `null` while waiting out the reconnect window. Pass it to
+    /// `DELETE /session/{id}` to stop that one session.
+    // `value_type`: an `Option<u64>` alone generates as `never` in the SDK.
+    #[schema(value_type = u64, required = false)]
     #[serde(skip_serializing_if = "Option::is_none")]
     session_id: Option<u64>,
     /// Client-supplied device name of the session that launched it; may be empty.
@@ -344,6 +356,39 @@ pub(crate) struct ActiveGame {
     /// Seconds until this game is ended — only present on a `grace` row.
     #[serde(skip_serializing_if = "Option::is_none")]
     grace_remaining_s: Option<u64>,
+}
+
+/// One live session as the Dashboard lists it: who, where, since when, and the state
+/// the per-session routes change.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct SessionRow {
+    /// Pass to `DELETE /session/{id}` and friends. `null` on the compat plane, which
+    /// has no per-session handle — stop it with the host-wide `DELETE /session`.
+    // `value_type`: an `Option<u64>` alone generates as `never` in the SDK.
+    #[schema(value_type = u64, required = false)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<u64>,
+    plane: crate::events::Plane,
+    /// Fingerprint prefix, or peer IP for an anonymous client.
+    client: String,
+    /// Display name (trust store, else the name the client sent). `null` if nameless.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_name: Option<String>,
+    /// `WxH@Hz`.
+    #[schema(example = "3840x2160@120")]
+    mode: String,
+    hdr: bool,
+    /// Sharing another session's display rather than owning one. Which session it joined
+    /// is not reported yet — the two registries do not share ids (issue #1095).
+    join: bool,
+    /// Audio is held back for this session alone (`PUT /session/{id}/audio`).
+    muted: bool,
+    /// `full` | `controller` | `view` | `custom`, live — not the pairing's stored level.
+    /// `null` on the compat plane, which is ungoverned.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    access_level: Option<String>,
+    /// Seconds since the stream started.
+    uptime_s: u64,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -550,6 +595,42 @@ pub(crate) async fn get_status(State(st): State<Arc<MgmtState>>) -> Json<Runtime
     // Native plane, published by the video loop; lives outside `AppState` (see `session_status`).
     let native = crate::session_status::snapshot();
 
+    // One row per live session, for the Dashboard's list and the per-session routes. The
+    // compat plane keeps its `id: null` row: it is counted in `active_sessions`, so leaving
+    // it out would read as a session the host lost.
+    let mut sessions: Vec<SessionRow> = native
+        .iter()
+        .map(|s| SessionRow {
+            id: Some(s.id),
+            plane: crate::events::Plane::Native,
+            client: s.client.clone(),
+            client_name: s.client_name.clone(),
+            mode: crate::events::mode_str(s.width, s.height, s.fps),
+            hdr: s.hdr,
+            join: s.join,
+            muted: s.muted,
+            access_level: Some(super::native::access_level(Some(s.grants)).to_string()),
+            uptime_s: s.uptime_s,
+        })
+        .collect();
+    if gs_video {
+        sessions.push(SessionRow {
+            id: None,
+            plane: crate::events::Plane::Gamestream,
+            client: gs_launch
+                .and_then(|l| l.peer_ip.map(|ip| ip.to_string()))
+                .unwrap_or_default(),
+            client_name: None,
+            mode: gs_launch
+                .map(|l| crate::events::mode_str(l.width, l.height, l.fps))
+                .unwrap_or_default(),
+            hdr: false,
+            join: false,
+            muted: false,
+            access_level: None,
+            uptime_s: 0,
+        });
+    }
     // Detail card is singular: GameStream if live, else the first native session. `active_sessions` is the true count.
     let session = gs_launch
         .map(|l| SessionInfo {
@@ -608,6 +689,12 @@ pub(crate) async fn get_status(State(st): State<Arc<MgmtState>>) -> Json<Runtime
             .len() as u32,
         native_paired_clients: st.native.as_ref().map_or(0, |n| n.status().paired_clients),
         active_sessions: native.len() as u32 + u32::from(gs_video),
+        // A GameStream launch takes the singular slot and has no id; otherwise it is the
+        // first native session, and naming its id is what makes the two readings agree.
+        session_id: (gs_launch.is_none())
+            .then(|| native.first().map(|s| s.id))
+            .flatten(),
+        sessions,
         session,
         stream,
         display: display_health(),

@@ -536,6 +536,7 @@ impl VirtualDisplay for GamescopeDisplay {
                 pool_gen: None,
                 expect_exact_dims: false,
                 output_name: None, // EIS seat, not a wlr virtual pointer to aim by name
+                input_output: None,
                 seat: None,
                 pid: None,
             });
@@ -711,6 +712,7 @@ fn create_managed_session(client: &str, mode: Mode, hdr: bool) -> Result<Virtual
             pool_gen: None,
             expect_exact_dims: false,
             output_name: None, // EIS seat, not a wlr virtual pointer to aim by name
+            input_output: None,
             seat: None,
             pid: None,
         });
@@ -811,6 +813,7 @@ fn managed_output(node_id: u32, mode: Mode) -> VirtualOutput {
         pool_gen: None,
         expect_exact_dims: false,
         output_name: None, // EIS seat, not a wlr virtual pointer to aim by name
+        input_output: None,
         seat: None,
         pid: None,
     }

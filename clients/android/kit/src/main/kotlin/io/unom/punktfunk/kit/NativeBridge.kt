@@ -380,6 +380,21 @@ object NativeBridge {
     external fun nativeSetMicMuted(handle: Long, muted: Boolean)
 
     /**
+     * Silence this device's speakers. Local: nothing reaches the host, so a second client joined
+     * to the same display keeps hearing the game. Audio keeps arriving and keeps decoding — only
+     * what is queued for playback is zeroed — so the decoder holds its state and unmute lands in
+     * step instead of re-priming the ring. Per session, never persisted. No-op on `0`.
+     */
+    external fun nativeSetStreamMuted(handle: Long, muted: Boolean)
+
+    /**
+     * Why this session is silent: `1` this device, `2` the host's own per-session mute, `3` both,
+     * `0` audible. Name the reason in the overlay from this — a local unmute leaves an operator
+     * mute standing. `0` on a `0` handle.
+     */
+    external fun nativeAudioMute(handle: Long): Int
+
+    /**
      * Start tier-A DualSense pad audio: render the host's `0xD1` streams on the pad's own
      * 4-channel USB audio device.
      *

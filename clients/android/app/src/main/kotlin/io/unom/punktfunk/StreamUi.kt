@@ -55,9 +55,43 @@ internal class StreamUi(
     /** The stats HUD tier, cycled live by the three-finger tap or the Select + X chord. */
     var statsVerbosity by mutableStateOf(initialVerbosity)
 
+    /**
+     * Why the stream is silent: `1` this device, `2` the host's per-session mute, `3` both. The
+     * local bit is written here the moment the player flips it; the host's arrives on the poll.
+     */
+    var audioMute by mutableIntStateOf(0)
+
     /** The one place mute is toggled — Compose state + the native flag, always together. */
     fun mute(muted: Boolean) {
         micMuted = muted
         NativeBridge.nativeSetMicMuted(handle, muted)
+    }
+
+    /** Same, for this device's speakers. Never reaches the host — see [NativeBridge.nativeSetStreamMuted]. */
+    fun muteStream(muted: Boolean) {
+        audioMute = if (muted) audioMute or AUDIO_MUTE_LOCAL else audioMute and AUDIO_MUTE_LOCAL.inv()
+        NativeBridge.nativeSetStreamMuted(handle, muted)
+    }
+
+    /** This device's own toggle, apart from the host's. */
+    val streamMuted: Boolean get() = audioMute and AUDIO_MUTE_LOCAL != 0
+
+    /**
+     * The overlay's sentence for the mute mask, `null` while the stream is audible. Twin of the
+     * Rust `audio_mute_label`: unmuting locally must not read as sound being back.
+     */
+    val audioMuteLabel: String?
+        get() = when {
+            audioMute and AUDIO_MUTE_HOST != 0 && audioMute and AUDIO_MUTE_LOCAL != 0 ->
+                "Muted by the host and on this device"
+            audioMute and AUDIO_MUTE_HOST != 0 -> "Muted by the host"
+            audioMute and AUDIO_MUTE_LOCAL != 0 -> "Muted on this device"
+            else -> null
+        }
+
+    companion object {
+        /** `punktfunk_core::client::AUDIO_MUTE_LOCAL` / `AUDIO_MUTE_HOST`, as the JNI reports them. */
+        const val AUDIO_MUTE_LOCAL = 1
+        const val AUDIO_MUTE_HOST = 2
     }
 }

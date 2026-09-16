@@ -6,7 +6,7 @@
 //!
 //! Goldens pin the strings. Design: `design/installer-v2-windows.md`.
 
-use super::choices::{NetworkAnswer, WinChoices};
+use super::choices::{NetworkAnswer, WinChoices, LAN_BIND, LOOPBACK_BIND};
 use super::plan::Artifact;
 use super::{WinFacts, MGMT_PORT_MOVED};
 use crate::facts::DOCS;
@@ -62,10 +62,26 @@ pub fn choices_summary(ui: &dyn Reporter, choices: &WinChoices, artifact: Artifa
                 yn(choices.start_service)
             ));
             ui.line(&format!("  Tray autostart: {}", yn(choices.tray_autostart)));
+            // A silent install never sees the wizard, so this is the only place it is told who
+            // can reach the console.
+            ui.line(&format!(
+                "  Web console reachable from: {}",
+                bind_label(choices)
+            ));
         }
         Artifact::Client => {
             ui.line(&format!("  Desktop shortcut: {}", yn(choices.desktop_icon)));
         }
+    }
+}
+
+/// The bind in the words the wizard's row uses. `None` leaves host.env untouched.
+fn bind_label(choices: &WinChoices) -> String {
+    match choices.web_bind.as_deref() {
+        None => "what host.env already says".to_string(),
+        Some(LOOPBACK_BIND) => "this PC only".to_string(),
+        Some(LAN_BIND) => "this local network".to_string(),
+        Some(addr) => addr.to_string(),
     }
 }
 
@@ -74,7 +90,15 @@ pub fn outro(ui: &dyn Reporter, facts: &WinFacts, choices: &WinChoices, artifact
     ui.line("  Done. Next:");
     match artifact {
         Artifact::Host => {
-            ui.line("  1. Open the web console:  https://<this-PC>:47992  (the certificate is the host's own — continue past the warning)");
+            // The URL has to be the one that answers: a loopback console is not at this PC's
+            // network address, and printing it there reads as a failed install.
+            match choices.web_bind.as_deref() {
+                Some(LOOPBACK_BIND) => {
+                    ui.line("  1. Open the web console:  https://127.0.0.1:47992  (the certificate is the host's own — continue past the warning)");
+                    ui.line("     It answers on this PC only. Set PUNKTFUNK_UI_BIND in host.env to reach it from another device.");
+                }
+                _ => ui.line("  1. Open the web console:  https://<this-PC>:47992  (the certificate is the host's own — continue past the warning)"),
+            }
             if !facts.web_password_present {
                 ui.line(
                     "     password: punktfunk-host web password  (from an elevated PowerShell)",

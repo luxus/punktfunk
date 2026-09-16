@@ -8,6 +8,7 @@
   Public-network firewall rules: keep the box's setting
   Start the service: yes
   Tray autostart: yes
+  Web console reachable from: what host.env already says
 ==> Stopping the running host for the upgrade
   ok would stop the service, every tray, and the console/plugin tasks
 ==> Files → C:\Program Files\punktfunk

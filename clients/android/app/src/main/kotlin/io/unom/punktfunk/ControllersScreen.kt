@@ -489,7 +489,8 @@ private fun Sc2BluetoothRow(
 /**
  * The Steam Controller 2 card — capture-side state, since a (claimed or lizard-mode) SC2 never
  * appears as a gamepad InputDevice. Shows the transport, whether the capture is live (driving
- * these menus now; streamed as-is in a session), and a grant button when USB access is missing.
+ * these menus now; streamed as-is in a session), a grant button when USB access is missing, and
+ * the rumble test a captured pad has no vibrator for.
  */
 @Composable
 private fun Sc2Row(usbDev: android.hardware.usb.UsbDevice?, activity: MainActivity?) {
@@ -533,12 +534,25 @@ private fun Sc2Row(usbDev: android.hardware.usb.UsbDevice?, activity: MainActivi
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
-                active -> Text(
-                    "Captured — streams as-is: the host presents a real Steam Controller 2 " +
-                        "that its Steam drives directly (trackpads, gyro, haptics).",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
+                active -> {
+                    Text(
+                        "Captured — streams as-is: the host presents a real Steam Controller 2 " +
+                            "that its Steam drives directly (trackpads, gyro, haptics).",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    // The pad has left the input stack, so [testRumble]'s vibrator path cannot
+                    // reach it; the capture writes the grip-rumble report itself. Nothing reads
+                    // back, so both messages say what was done, never that a motor ran. `active`
+                    // is only ever true with an activity behind it.
+                    OutlinedButton(onClick = {
+                        val sent = activity.testSc2Rumble()
+                        val msg =
+                            if (sent) "Sent a rumble to the controller."
+                            else "Couldn't reach the controller."
+                        Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                    }) { Text("Test rumble") }
+                }
                 usbDev != null && !permitted -> {
                     Text(
                         "Needs USB access to be captured.",

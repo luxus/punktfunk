@@ -18,6 +18,8 @@ import android.hardware.usb.UsbDevice
  * **Lizard keep-alive:** the firmware watchdog re-enables lizard mode (built-in kb/mouse
  * emulation) after a few seconds of silence, so [Sc2Device.DISABLE_LIZARD] +
  * [Sc2Device.NORMALIZE_JOYSTICKS] are re-sent on SDL's cadence — the generic link's keep-alive.
+ * [Sc2Device.ENABLE_LIZARD] goes back on release, so the pad drives the OS again at once rather
+ * than after the watchdog.
  */
 class Sc2UsbLink(
     context: Context,
@@ -38,6 +40,7 @@ class Sc2UsbLink(
             },
             keepAliveFeatures = listOf(Sc2Device.DISABLE_LIZARD, Sc2Device.NORMALIZE_JOYSTICKS),
             keepAliveMs = Sc2Device.LIZARD_REFRESH_MS,
+            releaseFeatures = listOf(Sc2Device.ENABLE_LIZARD),
         ),
         onReport,
         onClosed,
@@ -60,6 +63,6 @@ class Sc2UsbLink(
     fun writeRaw(kind: Int, data: ByteArray) =
         link.writeRaw(kind, data, Sc2Device.outputCoalesceKey(data))
 
-    /** Stop the read loop and release the interfaces. Idempotent; does not fire the closed callback. */
+    /** Restore lizard mode, stop the read loop, release the interfaces. Idempotent; fires no callback. */
     fun stop() = link.stop()
 }

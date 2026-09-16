@@ -11,6 +11,11 @@
 //! `mgmt_port` and everything after it sit at 69 or 101. A field that lands at 68 is read
 //! as `cipher` by shipped clients (fail-closed). Evidence: `design/hi-res-audio.md`,
 //! `design/shard-payload-reneg.md`, tests in this module.
+//!
+//! That layout is frozen. A new field goes in the tagged extension block after it
+//! ([`encode_ext_block`]), gated by [`CLIENT_CAP_EXT`] on Welcome and [`HOST_CAP2_EXT`] on
+//! Start, so a peer that did not ask never sees a byte past the layout it knows. Hello is
+//! first contact — the client does not know the host yet — and carries no block.
 
 use super::*;
 use crate::config::{
@@ -117,6 +122,102 @@ pub const AUDIO_CODEC_FLAC_RESERVED: u8 = 1;
 /// [`Welcome::audio_codec`]: raw interleaved LE PCM on `0xD3` (`crate::audio::pcm`).
 /// `2` because [`AUDIO_CODEC_FLAC_RESERVED`] holds `1`.
 pub const AUDIO_CODEC_PCM: u8 = 2;
+
+/// Extension tag `1`: no-op filler. Carries nothing, so a peer skips it like any tag it
+/// does not know. Tag `0` is reserved. Every tag is allocated here with a doc line, as
+/// `quic/caps.rs` does for bits, and an id is never reused for a second meaning: a peer
+/// that skips an unknown id cannot tell two meanings apart.
+pub const EXT_TAG_PADDING: u16 = 1;
+
+/// Extension tag `2` on `Start`: what the client calls itself, UTF-8, no NUL — its build and
+/// the shell that dialled (`"android 0.38.0 console/library"`). A label for the host's log, never
+/// a fact it acts on: two sessions from one device are told apart here instead of by capture.
+/// Bounded by [`EXT_CLIENT_MAX`]; a longer value is truncated on a char boundary by
+/// [`client_label`].
+pub const EXT_TAG_CLIENT: u16 = 2;
+
+/// Longest [`EXT_TAG_CLIENT`] value in UTF-8 bytes. A log field, so short.
+pub const EXT_CLIENT_MAX: usize = 96;
+
+/// `s` as an [`EXT_TAG_CLIENT`] value: trimmed, control characters dropped, truncated to
+/// [`EXT_CLIENT_MAX`] on a char boundary. Empty in means empty out, which is "say nothing".
+pub fn client_label(s: &str) -> String {
+    let mut out: String = s.trim().chars().filter(|c| !c.is_control()).collect();
+    while out.len() > EXT_CLIENT_MAX {
+        out.pop();
+    }
+    out
+}
+
+/// Largest extension block on the wire, its `ext_len` header included. The block is read
+/// before the peer is trusted, so this bounds what one message makes the other side hold.
+pub const EXT_MAX_BYTES: usize = 4096;
+
+/// Most entries in one block. Tags are unique, so this only bounds a flood of zero-length
+/// entries inside [`EXT_MAX_BYTES`].
+pub const EXT_MAX_ENTRIES: usize = 64;
+
+/// Encode `ext_len u16 || (tag u16 || len u16 || value)*`, the block that follows the
+/// frozen positional layout. `Err` on a repeated tag, a value past `u16::MAX`, or a block
+/// past [`EXT_MAX_BYTES`] / [`EXT_MAX_ENTRIES`] — the rules [`decode_ext_block`] enforces,
+/// so a peer never emits what the other side would reject.
+pub fn encode_ext_block(entries: &[(u16, &[u8])]) -> Result<Vec<u8>> {
+    let bad = || PunktfunkError::InvalidArg("bad handshake extension");
+    let dup = || PunktfunkError::InvalidArg("duplicate handshake extension tag");
+    if entries.len() > EXT_MAX_ENTRIES {
+        return Err(bad());
+    }
+    let mut b = vec![0u8, 0u8];
+    for (i, (tag, value)) in entries.iter().enumerate() {
+        if entries[..i].iter().any(|(seen, _)| seen == tag) {
+            return Err(dup());
+        }
+        let len = u16::try_from(value.len()).map_err(|_| bad())?;
+        b.extend_from_slice(&tag.to_le_bytes());
+        b.extend_from_slice(&len.to_le_bytes());
+        b.extend_from_slice(value);
+    }
+    if b.len() > EXT_MAX_BYTES {
+        return Err(bad());
+    }
+    let len = (b.len() - 2) as u16;
+    b[0..2].copy_from_slice(&len.to_le_bytes());
+    Ok(b)
+}
+
+/// Parse a block written by [`encode_ext_block`]. An unknown tag comes back untouched for
+/// the caller to skip, never an error — that is what lets a newer peer talk to an older
+/// one. `Err` on a truncated or oversized block or a repeated tag: the handshake fails
+/// closed rather than act on half of what the peer meant.
+pub fn decode_ext_block(b: &[u8]) -> Result<Vec<(u16, &[u8])>> {
+    let bad = || PunktfunkError::InvalidArg("bad handshake extension");
+    let dup = || PunktfunkError::InvalidArg("duplicate handshake extension tag");
+    let len = b
+        .get(0..2)
+        .map(|s| u16::from_le_bytes(s.try_into().unwrap()) as usize)
+        .ok_or_else(bad)?;
+    if len + 2 > EXT_MAX_BYTES {
+        return Err(bad());
+    }
+    let mut rest = b.get(2..2 + len).ok_or_else(bad)?;
+    let mut out: Vec<(u16, &[u8])> = Vec::new();
+    while !rest.is_empty() {
+        let head = rest.get(0..4).ok_or_else(bad)?;
+        let tag = u16::from_le_bytes([head[0], head[1]]);
+        let value_len = u16::from_le_bytes([head[2], head[3]]) as usize;
+        // Bounds-checked before the split: a length a peer made up must not slice.
+        let value = rest.get(4..4 + value_len).ok_or_else(bad)?;
+        if out.len() == EXT_MAX_ENTRIES {
+            return Err(bad());
+        }
+        if out.iter().any(|&(seen, _)| seen == tag) {
+            return Err(dup());
+        }
+        out.push((tag, value));
+        rest = &rest[4 + value_len..];
+    }
+    Ok(out)
+}
 
 /// `host → client`: the complete session offer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -438,6 +539,46 @@ impl Hello {
 
 impl Welcome {
     pub fn encode(&self) -> Vec<u8> {
+        self.encode_positional(false)
+    }
+
+    /// The positional layout plus a tagged extension block. The host calls this only
+    /// toward a client that set [`CLIENT_CAP_EXT`]; every other client gets [`encode`]
+    /// byte for byte. Forcing every placeholder puts the block at a fixed offset.
+    ///
+    /// [`encode`]: Welcome::encode
+    pub fn encode_ext(&self, entries: &[(u16, &[u8])]) -> Result<Vec<u8>> {
+        let block = encode_ext_block(entries)?;
+        let mut b = self.encode_positional(true);
+        debug_assert_eq!(b.len(), Self::ext_off(self.cipher));
+        b.extend_from_slice(&block);
+        Ok(b)
+    }
+
+    /// Entries a host appended to this Welcome; empty when it sent none (an older host, or
+    /// one that saw no [`CLIENT_CAP_EXT`]). Unknown tags come back for the caller to skip.
+    pub fn decode_ext(b: &[u8]) -> Result<Vec<(u16, &[u8])>> {
+        let off = Self::ext_off(b.get(68).copied().unwrap_or(CIPHER_AES_128_GCM));
+        if b.len() <= off {
+            return Ok(Vec::new());
+        }
+        decode_ext_block(&b[off..])
+    }
+
+    /// Where the block sits: the positional layout at its full 89 bytes, 121 with the
+    /// ChaCha key. A block forces every placeholder, so `cipher` alone locates it.
+    fn ext_off(cipher: u8) -> usize {
+        if cipher == CIPHER_CHACHA20_POLY1305 {
+            121
+        } else {
+            89
+        }
+    }
+
+    /// `force_tail` emits every optional field at its placeholder value so an extension
+    /// block lands at a fixed offset. `false` leaves the chain alone, which is what keeps
+    /// a default AES Welcome at 68 bytes.
+    fn encode_positional(&self, force_tail: bool) -> Vec<u8> {
         let mut b = Vec::with_capacity(64);
         b.extend_from_slice(MAGIC);
         b.extend_from_slice(&self.abi_version.to_le_bytes());
@@ -475,15 +616,16 @@ impl Welcome {
             self.key_chacha.is_some(),
             "key_chacha present iff cipher == 1"
         );
-        // Later tail fields force every earlier placeholder (cipher=0, mgmt=0, …).
-        // Without that, an AES Welcome carrying mgmt_port puts the port's low byte at
-        // 68, where shipped clients fail-close on unknown cipher. Audio presence is
-        // codec ≠ Opus so a 48 kHz/16-bit PCM session is not silent-Opus on the wire.
-        let mgmt_present = self.mgmt_port != 0;
-        let access_present = self.grants != super::access::GRANT_ALL || self.expires_in_secs != 0;
-        let audio_present = self.audio_codec != AUDIO_CODEC_OPUS;
-        let caps2_present = self.host_caps2 != 0;
-        let layout_present = self.audio_layout != 0;
+        // Frozen: a new field goes in the extension block, never here. A later tail field
+        // forces every earlier placeholder (cipher=0, mgmt=0, …) — without that an AES
+        // Welcome carrying mgmt_port puts the port's low byte at 68, where shipped clients
+        // fail-close on unknown cipher. Audio presence is codec ≠ Opus, never silent Opus.
+        let mgmt_present = self.mgmt_port != 0 || force_tail;
+        let access_present =
+            self.grants != super::access::GRANT_ALL || self.expires_in_secs != 0 || force_tail;
+        let audio_present = self.audio_codec != AUDIO_CODEC_OPUS || force_tail;
+        let caps2_present = self.host_caps2 != 0 || force_tail;
+        let layout_present = self.audio_layout != 0 || force_tail;
         if self.cipher != CIPHER_AES_128_GCM
             || mgmt_present
             || access_present
@@ -713,6 +855,24 @@ impl Start {
         Ok(Start {
             client_udp_port: u16::from_le_bytes([b[4], b[5]]),
         })
+    }
+
+    /// Start plus a tagged extension block at its fixed 6 bytes. The client sends one only
+    /// after a Welcome carrying [`HOST_CAP2_EXT`]; Hello is frozen, so this is where a
+    /// client-side extension rides.
+    pub fn encode_ext(&self, entries: &[(u16, &[u8])]) -> Result<Vec<u8>> {
+        let mut b = self.encode();
+        b.extend_from_slice(&encode_ext_block(entries)?);
+        Ok(b)
+    }
+
+    /// Entries a client appended to this Start; empty when it sent none. Call after
+    /// [`Start::decode`] has accepted the prefix.
+    pub fn decode_ext(b: &[u8]) -> Result<Vec<(u16, &[u8])>> {
+        if b.len() <= 6 {
+            return Ok(Vec::new());
+        }
+        decode_ext_block(&b[6..])
     }
 }
 
@@ -2207,5 +2367,176 @@ mod tests {
         bad_depth[39] = 32;
         assert_eq!(Hello::decode(&bad_depth).unwrap().audio_bits, BITS_16);
         assert!(depth_is_supported(Hello::decode(&renc).unwrap().audio_bits));
+    }
+
+    #[test]
+    fn welcome_ext_block_wire_and_back_compat() {
+        // The gate bits are each their own; a client that sets neither sees today's bytes.
+        assert_eq!(CLIENT_CAP_EXT.count_ones(), 1);
+        assert_eq!(
+            CLIENT_CAP_EXT
+                & (CLIENT_CAP_CURSOR
+                    | CLIENT_CAP_PHASE_LOCK
+                    | CLIENT_CAP_AUDIO_RED
+                    | CLIENT_CAP_PAD_AUDIO
+                    | CLIENT_CAP_AUDIO_HIRES
+                    | CLIENT_CAP_KEEP_HOST_AUDIO),
+            0
+        );
+        assert_eq!(HOST_CAP2_EXT & (HOST_CAP2_REPEAT_MARK | HOST_CAP2_TOUCH), 0);
+
+        let base = Welcome {
+            abi_version: 2,
+            udp_port: 7000,
+            mode: Mode {
+                width: 1920,
+                height: 1080,
+                refresh_hz: 60,
+            },
+            fec: FecConfig {
+                scheme: FecScheme::Gf16,
+                fec_percent: 20,
+                max_data_per_block: 4096,
+            },
+            shard_payload: 1200,
+            encrypt: true,
+            key: [7u8; 16],
+            salt: [9, 8, 7, 6],
+            frames: 0,
+            compositor: CompositorPref::Auto,
+            gamepad: GamepadPref::Auto,
+            bitrate_kbps: 50_000,
+            bit_depth: 8,
+            color: ColorInfo::SDR_BT709,
+            chroma_format: CHROMA_IDC_420,
+            audio_channels: 2,
+            codec: CODEC_HEVC,
+            host_caps: 0,
+            mgmt_port: 0,
+            grants: GRANT_ALL,
+            expires_in_secs: 0,
+            cipher: CIPHER_AES_128_GCM,
+            key_chacha: None,
+            audio_codec: AUDIO_CODEC_OPUS,
+            audio_rate_hz: SAMPLE_RATE_HZ,
+            audio_bits: BITS_16,
+            audio_layout: 0,
+            audio_frame_us: 0,
+            host_caps2: 0,
+        };
+
+        // No CLIENT_CAP_EXT: the host calls plain encode and the wire is the 68-byte Welcome.
+        let legacy = base.encode();
+        assert_eq!(legacy.len(), 68);
+        assert!(Welcome::decode_ext(&legacy).unwrap().is_empty());
+        // A positional tail is not a block: mgmt_port alone still decodes to no entries.
+        let mgmt = Welcome {
+            mgmt_port: 47991,
+            ..base
+        };
+        assert!(Welcome::decode_ext(&mgmt.encode()).unwrap().is_empty());
+
+        // With the bit: the same 68 bytes, the forced placeholders, then ext_len + one entry.
+        let enc = base.encode_ext(&[(EXT_TAG_PADDING, &[][..])]).unwrap();
+        assert_eq!(&enc[..68], &legacy[..]);
+        assert_eq!(enc[68], CIPHER_AES_128_GCM, "placeholder, not a block byte");
+        assert_eq!(enc.len(), 89 + 2 + 4);
+        assert_eq!(&enc[89..91], &4u16.to_le_bytes());
+        assert_eq!(
+            Welcome::decode(&enc).unwrap(),
+            base,
+            "every placeholder decodes to what its absence meant"
+        );
+        assert_eq!(
+            Welcome::decode_ext(&enc).unwrap(),
+            vec![(EXT_TAG_PADDING, &[][..])]
+        );
+
+        // An unknown tag is carried, not fatal: the rest of the block and every positional
+        // field still decode. This is what lets a newer host talk to an older client.
+        let enc = base
+            .encode_ext(&[(0xBEEF, &[1, 2, 3][..]), (EXT_TAG_PADDING, &[][..])])
+            .unwrap();
+        assert_eq!(Welcome::decode(&enc).unwrap(), base);
+        assert_eq!(
+            Welcome::decode_ext(&enc).unwrap(),
+            vec![(0xBEEF, &[1, 2, 3][..]), (EXT_TAG_PADDING, &[][..])]
+        );
+
+        // The ChaCha key shifts the block 32 bytes, like every other tail field.
+        let cha = Welcome {
+            cipher: CIPHER_CHACHA20_POLY1305,
+            key_chacha: Some([3u8; 32]),
+            ..base
+        };
+        let cenc = cha.encode_ext(&[(EXT_TAG_PADDING, &[][..])]).unwrap();
+        assert_eq!(cenc.len(), 121 + 2 + 4);
+        assert_eq!(Welcome::decode(&cenc).unwrap(), cha);
+        assert_eq!(
+            Welcome::decode_ext(&cenc).unwrap(),
+            vec![(EXT_TAG_PADDING, &[][..])]
+        );
+
+        // Client side: the block rides Start, after its fixed 6 bytes.
+        let start = Start {
+            client_udp_port: 41000,
+        };
+        let senc = start.encode_ext(&[(EXT_TAG_PADDING, &[][..])]).unwrap();
+        assert_eq!(&senc[..6], &start.encode()[..]);
+        assert_eq!(Start::decode(&senc).unwrap(), start);
+        assert_eq!(
+            Start::decode_ext(&senc).unwrap(),
+            vec![(EXT_TAG_PADDING, &[][..])]
+        );
+        assert!(Start::decode_ext(&start.encode()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn ext_block_rejects_a_duplicate_tag_a_truncation_and_a_flood() {
+        let good = encode_ext_block(&[(EXT_TAG_PADDING, &[7][..])]).unwrap();
+        assert_eq!(good, vec![5, 0, 1, 0, 1, 0, 7]);
+        assert_eq!(
+            decode_ext_block(&good).unwrap(),
+            vec![(EXT_TAG_PADDING, &[7][..])]
+        );
+
+        // A tag appears once. Fail closed on both sides, the stance cipher >= 2 takes.
+        assert!(
+            encode_ext_block(&[(EXT_TAG_PADDING, &[][..]), (EXT_TAG_PADDING, &[][..])]).is_err()
+        );
+        assert!(decode_ext_block(&[8, 0, 1, 0, 0, 0, 1, 0, 0, 0]).is_err());
+
+        // Every truncation of a good block, plus a value length reaching past the block.
+        for cut in 0..good.len() {
+            assert!(decode_ext_block(&good[..cut]).is_err(), "cut {cut}");
+        }
+        assert!(decode_ext_block(&[4, 0, 1, 0, 9, 0]).is_err());
+
+        // Caps: neither a made-up ext_len nor a flood of entries allocates.
+        assert!(decode_ext_block(&[0xff, 0xff]).is_err());
+        assert!(encode_ext_block(&[(EXT_TAG_PADDING, &[0u8; EXT_MAX_BYTES][..])]).is_err());
+        let flood: Vec<(u16, &[u8])> = (0..=EXT_MAX_ENTRIES as u16).map(|t| (t, &[][..])).collect();
+        assert!(encode_ext_block(&flood).is_err());
+    }
+
+    #[test]
+    fn client_label_is_bounded_and_rides_start() {
+        // A ≤ 96-byte label survives whole; the tag is skipped by a peer that does not know it.
+        let label = client_label("  android 0.38.0 console/library\n ");
+        assert_eq!(label, "android 0.38.0 console/library");
+        let enc = Start {
+            client_udp_port: 4770,
+        }
+        .encode_ext(&[(EXT_TAG_CLIENT, label.as_bytes())])
+        .unwrap();
+        assert_eq!(Start::decode(&enc).unwrap().client_udp_port, 4770);
+        assert_eq!(
+            Start::decode_ext(&enc).unwrap(),
+            vec![(EXT_TAG_CLIENT, label.as_bytes())]
+        );
+        // A multi-byte tail truncates on a char boundary, never mid-code-point.
+        let long = client_label(&"é".repeat(80));
+        assert!(long.len() <= EXT_CLIENT_MAX);
+        assert_eq!(long.chars().count(), EXT_CLIENT_MAX / 2);
     }
 }

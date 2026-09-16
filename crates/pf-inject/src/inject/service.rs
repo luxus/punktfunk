@@ -62,6 +62,7 @@ fn injector_service_thread(
     let mut injector: Option<Box<dyn InputInjector>> = None;
     let mut open_backend: Option<Backend> = None;
     let mut last_failed: Option<std::time::Instant> = None;
+    let mut warped_gen = crate::aim_gen();
     while let Ok(first) = rx.recv() {
         let mut batch = vec![first];
         while let Ok(ev) = rx.try_recv() {
@@ -121,7 +122,12 @@ fn injector_service_thread(
             }
         }
         if let Some(inj) = injector.as_mut() {
-            for ev in coalesce(batch) {
+            for ev in warp_onto_stream_head(
+                coalesce(batch),
+                crate::aim_gen(),
+                &mut warped_gen,
+                crate::stream_extent(),
+            ) {
                 if let Err(e) = inj.inject(&ev) {
                     // Portal / EIS worker died. Drop and reopen on a later event (gamescope respawns).
                     tracing::warn!(error = %format!("{e:#}"), "inject failed — reopening injector");
@@ -134,6 +140,50 @@ fn injector_service_thread(
         }
     }
     tracing::debug!("injector service stopped (host shutting down)");
+}
+
+/// Centre of the streamed head: a sample at half of `extent`, which is the head's own mode when
+/// [`crate::stream_extent`] knows it — libei resolves its region by that size — and `2×2`
+/// otherwise, since every other backend normalizes the position and takes any extent.
+fn head_centre(extent: Option<(u16, u16)>) -> InputEvent {
+    let (w, h) = extent.filter(|(w, h)| *w > 1 && *h > 1).unwrap_or((2, 2));
+    InputEvent {
+        kind: InputKind::MouseMoveAbs,
+        _pad: [0; 3],
+        code: 0,
+        x: i32::from(w / 2),
+        y: i32::from(h / 2),
+        flags: (u32::from(w) << 16) | u32::from(h),
+    }
+}
+
+/// Start a session's first pointer motion on the streamed head. The host pointer sits wherever
+/// the operator left it — on an extended desktop that is another monitor, and a relative delta
+/// has no way to cross onto the streamed one. Absolute motion already lands there and only
+/// clears the debt. One warp per capture bring-up ([`crate::aim_gen`]), and only once the client
+/// actually moves, so an idle session never takes the operator's pointer.
+fn warp_onto_stream_head(
+    events: Vec<InputEvent>,
+    aim: u64,
+    warped_gen: &mut u64,
+    extent: Option<(u16, u16)>,
+) -> Vec<InputEvent> {
+    if aim == *warped_gen {
+        return events;
+    }
+    let Some(at) = events
+        .iter()
+        .position(|e| matches!(e.kind, InputKind::MouseMove | InputKind::MouseMoveAbs))
+    else {
+        return events;
+    };
+    *warped_gen = aim;
+    if events[at].kind == InputKind::MouseMoveAbs {
+        return events;
+    }
+    let mut out = events;
+    out.insert(at, head_centre(extent));
+    out
 }
 
 /// Sum adjacent relative-mouse and same-axis, same-precision scroll. Buttons, keys, moves, and type
@@ -206,6 +256,65 @@ mod tests {
             (out[4].kind, out[4].code, out[4].x),
             (InputKind::MouseScroll, 1, 1)
         );
+    }
+
+    fn warp(events: Vec<InputEvent>, aim: u64, warped: &mut u64) -> Vec<InputEvent> {
+        warp_onto_stream_head(events, aim, warped, Some((3840, 2160)))
+    }
+
+    /// The operator's pointer is on another monitor and a delta cannot cross to the stream, so
+    /// the session's first move starts at the streamed head's centre — and only the first.
+    #[test]
+    fn the_first_relative_move_of_a_session_warps() {
+        let mut warped = 0;
+        let out = warp(vec![mk(InputKind::MouseMove, 0, 5, 5)], 1, &mut warped);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].kind, InputKind::MouseMoveAbs);
+        // Centre at the head's own mode, so a region resolved by size still matches.
+        assert_eq!(
+            (out[0].x, out[0].y, out[0].flags),
+            (1920, 1080, (3840 << 16) | 2160)
+        );
+        assert_eq!(out[1].kind, InputKind::MouseMove);
+        let out = warp(vec![mk(InputKind::MouseMove, 0, 5, 5)], 1, &mut warped);
+        assert_eq!(out.len(), 1);
+        // The next bring-up owes its own warp.
+        let out = warp(vec![mk(InputKind::MouseMove, 0, 5, 5)], 2, &mut warped);
+        assert_eq!(out.len(), 2);
+    }
+
+    /// An unpublished mode still warps: every backend but libei normalizes the position.
+    #[test]
+    fn an_unknown_mode_warps_at_the_neutral_extent() {
+        let mut warped = 0;
+        let out = warp_onto_stream_head(
+            vec![mk(InputKind::MouseMove, 0, 5, 5)],
+            1,
+            &mut warped,
+            None,
+        );
+        assert_eq!((out[0].x, out[0].y, out[0].flags), (1, 1, (2 << 16) | 2));
+    }
+
+    /// An absolute sample (TV remote, touch, pen) already lands on the streamed head. Warping
+    /// first would drag the pointer through the centre on every session's first sample.
+    #[test]
+    fn an_absolute_move_pays_the_debt_without_a_warp() {
+        let mut warped = 0;
+        let out = warp(vec![mk(InputKind::MouseMoveAbs, 0, 7, 7)], 1, &mut warped);
+        assert_eq!(out.len(), 1);
+        let out = warp(vec![mk(InputKind::MouseMove, 0, 5, 5)], 1, &mut warped);
+        assert_eq!(out.len(), 1);
+    }
+
+    /// Keys and buttons must not spend the warp: the pointer has not moved yet.
+    #[test]
+    fn a_keystroke_leaves_the_warp_owed() {
+        let mut warped = 0;
+        let out = warp(vec![mk(InputKind::KeyDown, 30, 0, 0)], 1, &mut warped);
+        assert_eq!(out.len(), 1);
+        let out = warp(vec![mk(InputKind::MouseMove, 0, 5, 5)], 1, &mut warped);
+        assert_eq!(out.len(), 2);
     }
 
     #[test]

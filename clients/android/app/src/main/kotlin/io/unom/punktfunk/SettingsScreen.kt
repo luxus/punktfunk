@@ -731,7 +731,8 @@ private fun DisplaySettings(s: Settings, update: (Settings) -> Unit, context: an
     // The safe-area row carries its resolved size the same way the native row does. On a display with
     // no cutout and square corners this equals the native mode — the row stays, honestly showing that
     // it changes nothing here, rather than silently vanishing on some devices and not others.
-    val (sw, sh, _) = safeDisplayMode(context)
+    val insets = displaySafeInsets(context, s)
+    val (sw, sh, _) = safeDisplayMode(context, s)
     // "Custom…" picked while the stored size is still a preset — keeps the size fields visible
     // until an edit actually makes it custom (or a preset is re-picked). Custom itself is detected
     // from the stored size, never flagged (see [isCustomResolution]), so nothing new persists.
@@ -801,6 +802,39 @@ private fun DisplaySettings(s: Settings, update: (Settings) -> Unit, context: an
                     update(s.copy(height = h))
                 }
             }
+        }
+        // The safe area is the one row whose number nobody can check by eye, and the report it came
+        // from was a measured screenshot. Shown only while it is the mode in play.
+        if (s.width == SAFE_AREA_MODE) {
+            Text(
+                "Cutout ${insets.left} px left, ${insets.right} px right; corner radius " +
+                    "${insets.corner} px. This panel reads $nw × $nh, so the stream is $sw × $sh, " +
+                    "placed ${SafeArea.offsetX(nw, insets.left, insets.right)} px in. The two sides " +
+                    "are read apart only while the device is in landscape.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            ToggleRow(
+                title = "Clear rounded corners",
+                subtitle = "Pull the picture in by the corner radius too. It costs that width on " +
+                    "every row to uncover two small arcs — worth it for a HUD that lives in a corner.",
+                checked = s.safeAreaClearCorners,
+                onCheckedChange = { on -> update(s.copy(safeAreaClearCorners = on)) },
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                InsetField("Left inset", s.safeAreaLeftPx, Modifier.weight(1f)) { v ->
+                    update(s.copy(safeAreaLeftPx = v))
+                }
+                InsetField("Right inset", s.safeAreaRightPx, Modifier.weight(1f)) { v ->
+                    update(s.copy(safeAreaRightPx = v))
+                }
+            }
+            Text(
+                "Leave the two fields empty to follow the display. Type a number when the panel " +
+                    "covers more glass than it reports.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
 
         SettingDropdown(
@@ -1412,6 +1446,29 @@ private fun ResolutionField(
         singleLine = true,
         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
         modifier = modifier.onFocusChanged { if (!it.isFocused) text = if (value > 0) value.toString() else "" },
+    )
+}
+
+/** One safe-area override. Digits only, empty = [SafeArea.AUTO_INSET] (follow the display), and
+ * capped at 999 px — an inset past that is a typo, not a phone. */
+@Composable
+private fun InsetField(
+    label: String,
+    value: Int,
+    modifier: Modifier = Modifier,
+    onCommit: (Int) -> Unit,
+) {
+    var text by remember { mutableStateOf(if (value >= 0) value.toString() else "") }
+    OutlinedTextField(
+        value = text,
+        onValueChange = { raw ->
+            text = raw.filter { it.isDigit() }.take(3)
+            onCommit(text.toIntOrNull() ?: SafeArea.AUTO_INSET)
+        },
+        label = { Text(label) },
+        singleLine = true,
+        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+        modifier = modifier.onFocusChanged { if (!it.isFocused) text = if (value >= 0) value.toString() else "" },
     )
 }
 

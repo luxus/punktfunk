@@ -6,10 +6,22 @@
 //! (`pf_client_core::trust` JSON). Android is [`SnapshotStore`] — the host
 //! pushes a snapshot in and polls `saved_gen` out.
 //!
-//! Presets are `(id, name)` in display order. The console lists and pins;
-//! it does not create. Design: `design/client-settings-profiles.md`.
+//! Presets are `(id, name)` in display order, with their overrides beside them so a
+//! settings row can say when a host's bound preset outranks the global. The console
+//! lists and pins; it does not create. Design: `design/client-settings-profiles.md`.
 
+use pf_client_core::presets::SettingsOverlay;
 use pf_client_core::trust::{KnownHosts, Settings};
+use std::collections::HashMap;
+
+/// One catalog entry as a host pushes it: the overrides are in the console's settings
+/// encoding, empty when the host sent none.
+#[derive(Clone, Debug, Default)]
+pub struct PresetEntry {
+    pub id: String,
+    pub name: String,
+    pub overrides: SettingsOverlay,
+}
 
 pub trait SettingsStore: Send + Sync {
     /// Called at construction and immediately before every mutation. Cache rather
@@ -19,6 +31,8 @@ pub trait SettingsStore: Send + Sync {
     /// in memory and shows it as done.
     fn save(&self, settings: &Settings);
     fn presets(&self) -> Vec<(String, String)>;
+    /// Each preset's overrides by id. Loaded once per screen, like `presets`.
+    fn preset_overrides(&self) -> HashMap<String, SettingsOverlay>;
     /// The store behind the carousel: copy-link reads a record's id from it, and the
     /// start-screen policy needs `paired` on every record, not only the drawn ones.
     fn known_hosts(&self) -> KnownHosts;
@@ -44,6 +58,14 @@ impl SettingsStore for FileSettingsStore {
             .presets
             .into_iter()
             .map(|p| (p.id, p.name))
+            .collect()
+    }
+
+    fn preset_overrides(&self) -> HashMap<String, SettingsOverlay> {
+        pf_client_core::presets::PresetsFile::load()
+            .presets
+            .into_iter()
+            .map(|p| (p.id, p.overrides))
             .collect()
     }
 
@@ -82,14 +104,14 @@ pub struct SnapshotStore {
 
 struct SnapshotInner {
     settings: Settings,
-    presets: Vec<(String, String)>,
+    presets: Vec<PresetEntry>,
     known_hosts: KnownHosts,
     /// Bumped on every `save`. The host compares against what it last persisted.
     saved_gen: u64,
 }
 
 impl SnapshotStore {
-    pub fn new(settings: Settings, presets: Vec<(String, String)>) -> SnapshotStore {
+    pub fn new(settings: Settings, presets: Vec<PresetEntry>) -> SnapshotStore {
         SnapshotStore {
             inner: std::sync::Mutex::new(SnapshotInner {
                 settings,
@@ -105,7 +127,7 @@ impl SnapshotStore {
         self.inner.lock().unwrap().settings = settings;
     }
 
-    pub fn set_presets(&self, presets: Vec<(String, String)>) {
+    pub fn set_presets(&self, presets: Vec<PresetEntry>) {
         self.inner.lock().unwrap().presets = presets;
     }
 
@@ -137,7 +159,19 @@ impl SettingsStore for SnapshotStore {
     }
 
     fn presets(&self) -> Vec<(String, String)> {
-        self.inner.lock().unwrap().presets.clone()
+        let g = self.inner.lock().unwrap();
+        g.presets
+            .iter()
+            .map(|p| (p.id.clone(), p.name.clone()))
+            .collect()
+    }
+
+    fn preset_overrides(&self) -> HashMap<String, SettingsOverlay> {
+        let g = self.inner.lock().unwrap();
+        g.presets
+            .iter()
+            .map(|p| (p.id.clone(), p.overrides.clone()))
+            .collect()
     }
 
     fn known_hosts(&self) -> KnownHosts {
@@ -154,7 +188,14 @@ mod tests {
 
     #[test]
     fn snapshot_store_round_trips_and_counts_saves() {
-        let store = SnapshotStore::new(Settings::default(), vec![("p1".into(), "Work".into())]);
+        let store = SnapshotStore::new(
+            Settings::default(),
+            vec![PresetEntry {
+                id: "p1".into(),
+                name: "Work".into(),
+                overrides: Default::default(),
+            }],
+        );
         assert_eq!(store.snapshot().1, 0);
         let mut s = store.load();
         s.ui_palette = "mint".into();

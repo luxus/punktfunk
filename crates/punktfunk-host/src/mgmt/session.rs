@@ -1,9 +1,22 @@
-//! Session-tagged management HTTP handlers: stop, IDR, end-game, session⇄game lifetime.
+//! Session-tagged management HTTP handlers: stop, IDR, mute, live access,
+//! end-game, session⇄game lifetime.
 //!
 //! `DELETE /session` is a deliberate stop: skip keep-alive linger and apply
 //! `game_on_session_end`. Policy: `design/session-game-lifetime.md`.
+//!
+//! Each verb comes in two forms. The id-less one is host-wide and unchanged; the
+//! `/{id}` one takes an id from `GET /status` and touches that session only. An id
+//! nothing is streaming is a 404, never another session's teardown.
+//!
+//! `GET /{id}/pads` is the read-only live view of what the host injects
+//! ([`crate::pad_feed`]).
+//! `GET /session/last` is the other side of the same registry: what a session came
+//! to, once nothing is streaming any more.
 
 use super::shared::*;
+use crate::pad_feed::PadFrame;
+use crate::vdisplay::Toplevel;
+use axum::response::sse::{Event, KeepAlive, Sse};
 use std::sync::atomic::Ordering;
 
 /// Stop the session
@@ -32,10 +45,421 @@ pub(crate) async fn stop_session(State(st): State<Arc<MgmtState>>) -> StatusCode
     StatusCode::NO_CONTENT
 }
 
+/// Stop one session
+///
+/// Same deliberate stop as `DELETE /session`, for the one id. Every other live
+/// session keeps streaming.
+#[utoipa::path(
+    delete,
+    path = "/session/{id}",
+    tag = "session",
+    operation_id = "stopOneSession",
+    params(("id" = u64, Path, description = "Session id from `GET /status`")),
+    responses(
+        (status = NO_CONTENT, description = "Session stopped"),
+        (status = NOT_FOUND, description = "No live session with that id", body = ApiError),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+    )
+)]
+pub(crate) async fn stop_one_session(Path(id): Path<u64>) -> Response {
+    if !crate::session_status::stop_quit(id) {
+        return no_such_session();
+    }
+    tracing::info!(session = id, "management API: one session stopped");
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// Request a keyframe on one session
+#[utoipa::path(
+    post,
+    path = "/session/{id}/idr",
+    tag = "session",
+    operation_id = "requestSessionIdr",
+    params(("id" = u64, Path, description = "Session id from `GET /status`")),
+    responses(
+        (status = ACCEPTED, description = "Keyframe requested"),
+        (status = NOT_FOUND, description = "No live session with that id", body = ApiError),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+    )
+)]
+pub(crate) async fn request_session_idr(Path(id): Path<u64>) -> Response {
+    if !crate::session_status::force_idr(id) {
+        return no_such_session();
+    }
+    StatusCode::ACCEPTED.into_response()
+}
+
+/// Mute or unmute one session
+///
+/// Drops this session's audio at the wire, nothing else: the capturer and the sink
+/// stay up, so a session sharing the display keeps hearing. The client is told, so
+/// its overlay can name the silence instead of the player guessing.
+#[utoipa::path(
+    put,
+    path = "/session/{id}/audio",
+    tag = "session",
+    operation_id = "setSessionAudio",
+    params(("id" = u64, Path, description = "Session id from `GET /status`")),
+    request_body = SessionAudioRequest,
+    responses(
+        (status = NO_CONTENT, description = "Applied"),
+        (status = NOT_FOUND, description = "No live session with that id", body = ApiError),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+    )
+)]
+pub(crate) async fn set_session_audio(
+    Path(id): Path<u64>,
+    ApiJson(req): ApiJson<SessionAudioRequest>,
+) -> Response {
+    let Some(controls) = crate::session_status::controls(id) else {
+        return no_such_session();
+    };
+    controls.set_muted(req.muted);
+    tracing::info!(
+        session = id,
+        muted = req.muted,
+        "management API: session audio"
+    );
+    StatusCode::NO_CONTENT.into_response()
+}
+
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct SessionAudioRequest {
+    /// `true` stops audio leaving for this session.
+    muted: bool,
+}
+
+/// Change one session's access level
+///
+/// Re-points the LIVE grant set — the mask the input thread already checks every
+/// event against — so a guest gets the pad, or loses it, without reconnecting.
+/// The pairing's stored access is untouched, and a later edit to it wins.
+///
+/// The ceiling is the pairing's own mask: what is asked for is ANDed with it, so this
+/// route can narrow or restore, never grant a device something it was not paired for.
+/// The applied mask comes back, which is how a caller sees the clamp.
+#[utoipa::path(
+    put,
+    path = "/session/{id}/access",
+    tag = "session",
+    operation_id = "setSessionAccess",
+    params(("id" = u64, Path, description = "Session id from `GET /status`")),
+    request_body = SessionAccessRequest,
+    responses(
+        (status = OK, description = "Applied mask, after the pairing clamp", body = SessionAccess),
+        (status = BAD_REQUEST, description = "No level or grants, an unknown level, or reserved bits", body = ApiError),
+        (status = NOT_FOUND, description = "No live session with that id", body = ApiError),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+    )
+)]
+pub(crate) async fn set_session_access(
+    Path(id): Path<u64>,
+    ApiJson(req): ApiJson<SessionAccessRequest>,
+) -> Response {
+    let requested = match (req.grants, req.level.as_deref()) {
+        (Some(g), _) => {
+            if let Some(bad) = super::native::reject_reserved(g) {
+                return bad;
+            }
+            g
+        }
+        (None, Some(level)) => match super::native::grants_for_level(level) {
+            Some(g) => g,
+            None => {
+                return api_error(
+                    StatusCode::BAD_REQUEST,
+                    "Access level must be full, controller or view.",
+                )
+            }
+        },
+        (None, None) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "Send an access level or a grants mask.",
+            )
+        }
+    };
+    let Some(controls) = crate::session_status::controls(id) else {
+        return no_such_session();
+    };
+    let grants = controls.set_grants(requested);
+    tracing::info!(
+        session = id,
+        requested,
+        grants,
+        "management API: session access re-pointed"
+    );
+    Json(SessionAccess {
+        grants,
+        level: super::native::access_level(Some(grants)).to_string(),
+    })
+    .into_response()
+}
+
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct SessionAccessRequest {
+    /// `full` | `controller` | `view`. Ignored when `grants` is present.
+    #[schema(example = "controller")]
+    level: Option<String>,
+    /// Exact `GRANT_*` mask, for a level the three names do not cover. Reserved bits are 400.
+    #[schema(value_type = u32, required = false, example = 1)]
+    grants: Option<u32>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub(crate) struct SessionAccess {
+    /// What now governs the session — the request ANDed with the pairing's mask.
+    grants: u32,
+    /// `full` | `controller` | `view` | `custom`, derived from `grants`.
+    level: String,
+}
+
+/// Recently finished sessions
+///
+/// What each session came to — mode, codec, bitrate, frames, bring-up, and why it ended
+/// — newest first, at most the last eight. This is the whole of what the host knows, so
+/// the answer is what a bug report should carry.
+///
+/// A host that has not streamed since it started answers with an empty list.
+#[utoipa::path(
+    get,
+    path = "/session/last",
+    tag = "session",
+    operation_id = "getRecentSessions",
+    responses(
+        (status = OK, description = "Finished sessions, newest first; empty if none", body = RecentSessions),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+    )
+)]
+pub(crate) async fn get_recent_sessions() -> Json<RecentSessions> {
+    Json(RecentSessions {
+        sessions: crate::session_status::recent(),
+    })
+}
+
+#[derive(Serialize, ToSchema)]
+pub(crate) struct RecentSessions {
+    /// Newest first. Bounded in memory and lost on a host restart — this is the last
+    /// few sessions, not a history.
+    sessions: Vec<crate::events::SessionSummary>,
+}
+
+/// List this session's windows
+///
+/// The toplevels on the head this session streams, so a client in a full-screen
+/// game can see what is behind it. Free to every session: those windows are
+/// already in the pixels it receives. The operator's other monitors are not in
+/// the payload, whatever the caller's access.
+#[utoipa::path(
+    get,
+    path = "/session/{id}/windows",
+    tag = "session",
+    operation_id = "getSessionWindows",
+    params(("id" = u64, Path, description = "Session id from `GET /status`")),
+    responses(
+        (status = OK, description = "Windows on this session's head", body = Vec<Toplevel>),
+        (status = NOT_FOUND, description = "No live session with that id", body = ApiError),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+    )
+)]
+pub(crate) async fn get_session_windows(Path(id): Path<u64>) -> Response {
+    let Some(controls) = crate::session_status::controls(id) else {
+        return no_such_session();
+    };
+    Json(session_windows(&controls)).into_response()
+}
+
+/// Act on one of this session's windows
+///
+/// Focus, full-screen or close by id, gated on the session's LIVE grants — the
+/// same mask the input thread checks every event against. A view-only guest is
+/// refused all three; a controller-only guest raises a window but never closes
+/// one. An id this session's head does not currently hold is a 404, so a stale
+/// id cannot act on whatever now answers to it.
+#[utoipa::path(
+    post,
+    path = "/session/{id}/windows/{window}",
+    tag = "session",
+    operation_id = "actOnSessionWindow",
+    params(
+        ("id" = u64, Path, description = "Session id from `GET /status`"),
+        ("window" = String, Path, description = "Window id from `GET /session/{id}/windows`"),
+    ),
+    request_body = WindowActionRequest,
+    responses(
+        (status = NO_CONTENT, description = "The compositor accepted the verb"),
+        (status = FORBIDDEN, description = "This session's access does not cover the verb", body = ApiError),
+        (status = NOT_FOUND, description = "No such session, or no such window on its head", body = ApiError),
+        (status = BAD_GATEWAY, description = "The compositor refused the verb", body = ApiError),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+    )
+)]
+pub(crate) async fn act_on_session_window(
+    Path((id, window)): Path<(u64, String)>,
+    ApiJson(req): ApiJson<WindowActionRequest>,
+) -> Response {
+    let Some(controls) = crate::session_status::controls(id) else {
+        return no_such_session();
+    };
+    // The live mask, read now: a console re-point or an expiry between the
+    // client's fetch and this call must land before the verb does.
+    let grants = controls.grants.load(Ordering::Relaxed);
+    if !req.action.permitted_by(grants) {
+        tracing::info!(
+            session = id,
+            verb = req.action.as_str(),
+            grants,
+            "management API: a window verb this session's access does not cover"
+        );
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "This device's access doesn't cover that — ask the host's operator to widen it.",
+        );
+    }
+    act_on_window(&controls, &window, req.action, id)
+}
+
+/// The verb, once the grant gate has passed. Split out so the platform arms do
+/// not sit inside the handler.
+#[cfg(target_os = "linux")]
+fn act_on_window(
+    controls: &crate::session_status::SessionControls,
+    window: &str,
+    verb: crate::vdisplay::WindowVerb,
+    id: u64,
+) -> Response {
+    let Some(head) = controls.head() else {
+        return no_such_window();
+    };
+    match crate::vdisplay::window_action(head.compositor, &head.output, verb, window) {
+        Ok(()) => {
+            tracing::info!(
+                session = id,
+                verb = verb.as_str(),
+                window,
+                "management API: acted on a window of this session's head"
+            );
+            StatusCode::NO_CONTENT.into_response()
+        }
+        // The id check and the dispatch share one error: either way this session
+        // has no window to act on, and neither answer names the operator's desk.
+        Err(e) => {
+            tracing::info!(
+                session = id, verb = verb.as_str(), window, error = %format!("{e:#}"),
+                "management API: window verb not applied"
+            );
+            no_such_window()
+        }
+    }
+}
+
+/// A host with no compositor to ask has no window to act on.
+#[cfg(not(target_os = "linux"))]
+fn act_on_window(
+    _controls: &crate::session_status::SessionControls,
+    _window: &str,
+    _verb: crate::vdisplay::WindowVerb,
+    _id: u64,
+) -> Response {
+    no_such_window()
+}
+
+/// Windows on this session's head, or none before capture names it.
+#[cfg(target_os = "linux")]
+fn session_windows(
+    controls: &crate::session_status::SessionControls,
+) -> Vec<crate::vdisplay::Toplevel> {
+    controls.head().map_or_else(Vec::new, |h| {
+        crate::vdisplay::list_toplevels(h.compositor, &h.output)
+    })
+}
+
+/// No compositor here reports toplevels.
+#[cfg(not(target_os = "linux"))]
+fn session_windows(
+    _controls: &crate::session_status::SessionControls,
+) -> Vec<crate::vdisplay::Toplevel> {
+    Vec::new()
+}
+
+/// Watch this session's pads (SSE)
+///
+/// One frame per pad state the host applies — what it injects, not what the client
+/// says it sent — so a controller question is answered from the host's own hand
+/// instead of an evdev dump. `data:` is a [`PadFrame`]; `event:` is `pad.state`.
+/// Attaching replays every live pad, so a button already held draws at once.
+///
+/// Console lane only, like the window routes: a paired certificate is not bound to
+/// a session id, and this is the operator's own machine watching its own input.
+///
+/// Nothing is published while nobody is attached, so a console on another page —
+/// or none at all — costs the input thread one atomic load per pad event.
+#[utoipa::path(
+    get,
+    path = "/session/{id}/pads",
+    tag = "session",
+    operation_id = "streamSessionPads",
+    params(("id" = u64, Path, description = "Session id from `GET /status`")),
+    responses(
+        (status = OK, description = "SSE stream; each frame's `data:` is one PadFrame", body = PadFrame, content_type = "text/event-stream"),
+        (status = NOT_FOUND, description = "No live session with that id", body = ApiError),
+        (status = SERVICE_UNAVAILABLE, description = "Concurrent event-stream cap reached — retry shortly", body = ApiError),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+    )
+)]
+pub(crate) async fn stream_session_pads(Path(id): Path<u64>) -> Response {
+    let Some(controls) = crate::session_status::controls(id) else {
+        return no_such_session();
+    };
+    let Some(slot) = super::events::try_acquire_slot() else {
+        return super::events::stream_cap_reached();
+    };
+    // Subscribing arms the resync; the input thread answers on its next wake (≤ 4 ms).
+    let rx = controls.pads.subscribe();
+    let stream = futures_util::stream::unfold((rx, slot), |(mut rx, slot)| async move {
+        // Lagged: drop a consumer too slow for a stick sweep rather than buffer it.
+        // Closed: the session ended, and its pads went with it.
+        let frame = rx.recv().await.ok()?;
+        let ev = Event::default()
+            .event("pad.state")
+            .data(serde_json::to_string(&frame).unwrap_or_else(|_| "{}".to_string()));
+        Some((Ok::<_, std::convert::Infallible>(ev), (rx, slot)))
+    });
+    Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(super::events::KEEP_ALIVE))
+        .into_response()
+}
+
+/// One refusal for "gone" and "not yours": telling them apart would confirm a
+/// window exists on a head this session may not see.
+fn no_such_window() -> Response {
+    api_error(
+        StatusCode::NOT_FOUND,
+        "That window isn't on this session's screen any more.",
+    )
+}
+
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct WindowActionRequest {
+    /// `focus` | `fullscreen` | `close`.
+    #[schema(example = "focus")]
+    action: crate::vdisplay::WindowVerb,
+}
+
+/// One id, one 404 — never a reach across to another session.
+fn no_such_session() -> Response {
+    api_error(
+        StatusCode::NOT_FOUND,
+        "No session with that id is streaming.",
+    )
+}
+
 /// End waiting games
 ///
-/// Ends games waiting out the reconnect window. Does not touch a live session
-/// (`DELETE /session` plus `game_on_session_end`).
+/// Ends games waiting out the reconnect window. With `streaming` and an
+/// `app_id`, also ends that title where it is still on a live session — the
+/// move a player has after a launch that never produced a game. The session
+/// itself stays up (`DELETE /session` plus `game_on_session_end`).
 #[utoipa::path(
     post,
     path = "/game/end",
@@ -49,7 +473,18 @@ pub(crate) async fn stop_session(State(st): State<Arc<MgmtState>>) -> StatusCode
     )
 )]
 pub(crate) async fn end_game(ApiJson(req): ApiJson<EndGameRequest>) -> Response {
-    let ended = crate::gamelease::end_pending(req.app_id.as_deref());
+    let mut ended = crate::gamelease::end_pending(req.app_id.as_deref());
+    // Named title only. The id-less form stays "every waiting game", which is
+    // what the console's one button has always meant.
+    if req.streaming && req.app_id.is_some() {
+        for shared in crate::session_status::live_games(req.app_id.as_deref()) {
+            if !shared.is_trackable() || shared.is_terminating() {
+                continue;
+            }
+            crate::gamelease::terminate(shared, "ended from the management API");
+            ended += 1;
+        }
+    }
     if ended == 0 {
         return api_error(StatusCode::CONFLICT, "no game is waiting to be ended");
     }
@@ -62,6 +497,11 @@ pub(crate) struct EndGameRequest {
     /// Store-qualified id (`steam:570`); omit to end every waiting game.
     #[serde(default)]
     pub app_id: Option<String>,
+    /// Also end `app_id` where it is on a live session, not only where it is
+    /// waiting out a reconnect window. Ignored without `app_id`.
+    #[serde(default)]
+    #[schema(required = false)]
+    pub streaming: bool,
 }
 
 #[derive(Serialize, ToSchema)]

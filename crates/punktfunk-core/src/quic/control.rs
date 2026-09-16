@@ -1025,6 +1025,145 @@ impl AccessUpdate {
     }
 }
 
+/// [`AudioState`]. 0x59: next after [`MSG_ACCESS_UPDATE`].
+pub const MSG_AUDIO_STATE: u8 = 0x59;
+
+/// `host → client` ([`MSG_AUDIO_STATE`]): the operator muted this session from the
+/// console. The host stops sending audio datagrams; nothing on the client's side is
+/// broken, so the client says so instead of concealing a gap. Latest-wins,
+/// best-effort — older clients just go quiet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AudioState {
+    pub muted: bool,
+}
+
+impl AudioState {
+    pub fn encode(&self) -> Vec<u8> {
+        // magic[0..4] type[4] muted[5]
+        let mut b = Vec::with_capacity(6);
+        b.extend_from_slice(CTL_MAGIC);
+        b.push(MSG_AUDIO_STATE);
+        b.push(u8::from(self.muted));
+        b
+    }
+
+    pub fn decode(b: &[u8]) -> Result<AudioState> {
+        if b.len() != 6 || &b[0..4] != CTL_MAGIC || b[4] != MSG_AUDIO_STATE {
+            return Err(PunktfunkError::InvalidArg("bad AudioState"));
+        }
+        Ok(AudioState { muted: b[5] != 0 })
+    }
+}
+
+/// [`LaunchOutcome`]. 0x5A: next after [`MSG_AUDIO_STATE`].
+pub const MSG_LAUNCH_OUTCOME: u8 = 0x5A;
+
+/// Longest [`LaunchOutcome::message`] in UTF-8 bytes. One sentence plus a cause;
+/// a host cannot make the client hold more than this.
+pub const LAUNCH_MESSAGE_MAX: usize = 200;
+
+/// How a session's library launch turned out.
+///
+/// Wire values are append-only: an unknown byte decodes to [`Self::Spawned`], the
+/// one reading under which an older client keeps waiting instead of raising an
+/// alarm it cannot justify. The host's own vocabulary maps onto this one — no
+/// second set of names to drift.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LaunchOutcomeKind {
+    /// The host started the title for this session.
+    Spawned = 0,
+    /// Not started: an earlier session's copy is verified up, and this session
+    /// took that one over.
+    Adopted = 1,
+    /// Adopted, but the host cannot see the process — it may be up, it may be
+    /// gone. The player is owed the "start it again" move.
+    AdoptedUnknown = 2,
+    /// The host declined before trying: unknown id, no command, nothing to run.
+    Refused = 3,
+    /// Started and gone within seconds, with nothing left that looks like the game.
+    Failed = 4,
+}
+
+impl LaunchOutcomeKind {
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Adopted,
+            2 => Self::AdoptedUnknown,
+            3 => Self::Refused,
+            4 => Self::Failed,
+            _ => Self::Spawned,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Spawned => "spawned",
+            Self::Adopted => "adopted",
+            Self::AdoptedUnknown => "adopted-unknown",
+            Self::Refused => "refused",
+            Self::Failed => "failed",
+        }
+    }
+
+    /// Did the player get the game they asked for? `false` is what a client
+    /// turns into a message; the rest needs no words.
+    pub fn needs_telling(self) -> bool {
+        matches!(self, Self::AdoptedUnknown | Self::Refused | Self::Failed)
+    }
+}
+
+/// `host → client` ([`MSG_LAUNCH_OUTCOME`]): what became of this session's launch.
+///
+/// Sent once the launch resolves, and again if the game dies on the spot — so it
+/// is a control message, not a `Welcome` field: the answer is not known while the
+/// handshake runs. `message` is the host's own sentence, empty when it has none.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LaunchOutcome {
+    pub kind: LaunchOutcomeKind,
+    /// Plain sentence for the player, already stripped and capped by [`Self::new`].
+    pub message: String,
+}
+
+impl LaunchOutcome {
+    /// Trims, drops control characters, and truncates to [`LAUNCH_MESSAGE_MAX`] on a
+    /// char boundary. Empty in means empty out, which is "say nothing".
+    pub fn new(kind: LaunchOutcomeKind, message: &str) -> Self {
+        let mut message: String = message.trim().chars().filter(|c| !c.is_control()).collect();
+        while message.len() > LAUNCH_MESSAGE_MAX {
+            message.pop();
+        }
+        LaunchOutcome { kind, message }
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        // magic[0..4] type[4] kind[5] len[6] message[7..]
+        let msg = self.message.as_bytes();
+        let mut b = Vec::with_capacity(7 + msg.len());
+        b.extend_from_slice(CTL_MAGIC);
+        b.push(MSG_LAUNCH_OUTCOME);
+        b.push(self.kind as u8);
+        b.push(msg.len() as u8);
+        b.extend_from_slice(msg);
+        b
+    }
+
+    pub fn decode(b: &[u8]) -> Result<LaunchOutcome> {
+        let bad = || PunktfunkError::InvalidArg("bad LaunchOutcome");
+        if b.len() < 7 || &b[0..4] != CTL_MAGIC || b[4] != MSG_LAUNCH_OUTCOME {
+            return Err(bad());
+        }
+        let len = b[6] as usize;
+        if len > LAUNCH_MESSAGE_MAX || b.len() != 7 + len {
+            return Err(bad());
+        }
+        Ok(LaunchOutcome {
+            kind: LaunchOutcomeKind::from_u8(b[5]),
+            message: std::str::from_utf8(&b[7..]).map_err(|_| bad())?.to_string(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::config::Mode;
@@ -1565,5 +1704,71 @@ mod tests {
         assert!(CursorRenderMode::decode(&bytes).is_err());
         assert!(AccessUpdate::decode(&[bytes.as_slice(), &[0]].concat()).is_err());
         assert!(AccessUpdate::decode(&bytes[..bytes.len() - 1]).is_err());
+    }
+
+    /// Same six-byte shape as `CursorRenderMode`, so the type byte is the only thing
+    /// that tells them apart — decode must reject the neighbour, not read its flag.
+    #[test]
+    fn audio_state_roundtrip() {
+        for muted in [true, false] {
+            let m = AudioState { muted };
+            assert_eq!(AudioState::decode(&m.encode()).unwrap(), m);
+        }
+        let bytes = AudioState { muted: true }.encode();
+        assert_eq!(bytes[4], MSG_AUDIO_STATE);
+        assert!(CursorRenderMode::decode(&bytes).is_err());
+        assert!(AudioState::decode(&CursorRenderMode { client_draws: true }.encode()).is_err());
+        assert!(AudioState::decode(&bytes[..bytes.len() - 1]).is_err());
+    }
+
+    /// Every variant back off the wire, and the length byte honoured: the message is
+    /// the only variable-length payload in this family, so a lie about it must not slice.
+    #[test]
+    fn launch_outcome_roundtrip() {
+        for kind in [
+            LaunchOutcomeKind::Spawned,
+            LaunchOutcomeKind::Adopted,
+            LaunchOutcomeKind::AdoptedUnknown,
+            LaunchOutcomeKind::Refused,
+            LaunchOutcomeKind::Failed,
+        ] {
+            for text in [
+                "",
+                "Couldn't start Quail \u{2014} it isn't installed on the host.",
+            ] {
+                let m = LaunchOutcome::new(kind, text);
+                assert_eq!(LaunchOutcome::decode(&m.encode()).unwrap(), m);
+                assert_eq!(m.encode()[4], MSG_LAUNCH_OUTCOME);
+                assert_eq!(m.encode()[5], kind as u8);
+            }
+        }
+        // Unknown kind reads as Spawned: an older client waits rather than alarms.
+        let mut bytes = LaunchOutcome::new(LaunchOutcomeKind::Failed, "x").encode();
+        bytes[5] = 200;
+        assert_eq!(
+            LaunchOutcome::decode(&bytes).unwrap().kind,
+            LaunchOutcomeKind::Spawned
+        );
+        assert!(!LaunchOutcomeKind::Spawned.needs_telling());
+        assert!(LaunchOutcomeKind::Failed.needs_telling());
+
+        let good = LaunchOutcome::new(LaunchOutcomeKind::Failed, "x").encode();
+        assert!(LaunchOutcome::decode(&good[..good.len() - 1]).is_err());
+        assert!(LaunchOutcome::decode(&[good.as_slice(), &[0]].concat()).is_err());
+        assert!(LaunchOutcome::decode(&AudioState { muted: true }.encode()).is_err());
+        assert!(AudioState::decode(&good).is_err());
+    }
+
+    /// The message is capped and stripped where it is built, not where it is shown:
+    /// a control character from a game's own output must never reach a terminal.
+    #[test]
+    fn launch_outcome_message_is_bounded_and_plain() {
+        let long = LaunchOutcome::new(LaunchOutcomeKind::Failed, &"\u{e9}".repeat(400));
+        assert!(long.message.len() <= LAUNCH_MESSAGE_MAX);
+        assert_eq!(LaunchOutcome::decode(&long.encode()).unwrap(), long);
+        assert_eq!(
+            LaunchOutcome::new(LaunchOutcomeKind::Refused, "  a\u{7}b\n  ").message,
+            "ab"
+        );
     }
 }

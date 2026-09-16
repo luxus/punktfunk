@@ -47,9 +47,9 @@ struct CreateOptions {
     fallback_ui: bool,
     /// The settings snapshot the shell starts from (`pf_client_core::trust::Settings` JSON).
     settings: pf_client_core::trust::Settings,
-    /// The preset catalog as `[[id, name], …]`.
+    /// The preset catalog as `[{id, name, overrides}, …]`.
     #[serde(default)]
-    presets: Vec<(String, String)>,
+    presets: Vec<PresetJson>,
     /// The known-hosts records (`KnownHosts` JSON) — for building `punktfunk://` links.
     #[serde(default)]
     known_hosts: pf_client_core::trust::KnownHosts,
@@ -197,7 +197,10 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleCrea
         let Some(opts) = json_arg::<CreateOptions>(env, &options) else {
             return Ok(0);
         };
-        let store = Arc::new(SnapshotStore::new(opts.settings, opts.presets));
+        let store = Arc::new(SnapshotStore::new(
+            opts.settings,
+            opts.presets.into_iter().map(Into::into).collect(),
+        ));
         store.set_known_hosts(opts.known_hosts);
         let console_opts = ConsoleOptions {
             device_name: opts.device_name,
@@ -775,11 +778,32 @@ json_pusher!(
 );
 
 json_pusher!(
-/// `NativeBridge.nativeConsoleSetPresets(handle, json)` — the preset catalog `[[id, name]]`.
+/// `NativeBridge.nativeConsoleSetPresets(handle, json)` — the preset catalog
+/// `[{id, name, overrides}]`.
     Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleSetPresets,
-    Vec<(String, String)>,
-    |h, p| h.store.set_presets(p)
+    Vec<PresetJson>,
+    |h, p| h.store.set_presets(p.into_iter().map(Into::into).collect())
 );
+
+/// One catalog entry as Kotlin sends it. `overrides` is the console's settings encoding;
+/// an overlay the console cannot read leaves that one preset unmarked, not the catalog empty.
+#[derive(serde::Deserialize)]
+struct PresetJson {
+    id: String,
+    name: String,
+    #[serde(default)]
+    overrides: serde_json::Value,
+}
+
+impl From<PresetJson> for pf_console_ui::store::PresetEntry {
+    fn from(p: PresetJson) -> Self {
+        pf_console_ui::store::PresetEntry {
+            id: p.id,
+            name: p.name,
+            overrides: serde_json::from_value(p.overrides).unwrap_or_default(),
+        }
+    }
+}
 
 json_pusher!(
 /// `NativeBridge.nativeConsoleSetKnownHosts(handle, json)` — the known-hosts records

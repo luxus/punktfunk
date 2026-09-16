@@ -459,7 +459,303 @@ fn fake_native_session(
         // Desktop stream: no game row.
         game: None,
         capture_health: Arc::new(std::sync::Mutex::new(None)),
+        join: false,
+        controls: crate::session_status::SessionControls::open(),
+        bit_depth: 8,
+        chroma: crate::encode::ChromaFormat::Yuv420,
+        end_reason: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+        counters: Arc::new(crate::session_status::SessionCounters::default()),
     })
+}
+
+/// A live session plus the flags a stop sets. `fake_native_session` is the same thing
+/// where only the `/status` shape matters.
+fn fake_session_with_flags(
+    client: &str,
+) -> (
+    crate::session_status::LiveSessionGuard,
+    Arc<std::sync::atomic::AtomicBool>,
+    Arc<std::sync::atomic::AtomicBool>,
+    Arc<std::sync::atomic::AtomicBool>,
+) {
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let quit = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let idr = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let controls = crate::session_status::SessionControls::open();
+    // Controller-only pairing: the ceiling every per-session re-point below is clamped to.
+    controls.ceiling.store(
+        punktfunk_core::quic::GRANT_PRESET_CONTROLLER_ONLY,
+        Ordering::Relaxed,
+    );
+    controls.grants.store(
+        punktfunk_core::quic::GRANT_PRESET_CONTROLLER_ONLY,
+        Ordering::Relaxed,
+    );
+    let guard = crate::session_status::register(crate::session_status::Registration {
+        mode: Arc::new(std::sync::atomic::AtomicU64::new(
+            (1920u64 << 32) | (1080u64 << 16) | 60,
+        )),
+        bitrate_kbps: Arc::new(std::sync::atomic::AtomicU32::new(20_000)),
+        codec: Codec::H265,
+        stop: stop.clone(),
+        quit: quit.clone(),
+        force_idr: idr.clone(),
+        client: client.into(),
+        client_name: None,
+        hdr: false,
+        ttff_ms: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        last_resize_ms: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        game: None,
+        capture_health: Arc::new(std::sync::Mutex::new(None)),
+        join: false,
+        controls,
+        bit_depth: 8,
+        chroma: crate::encode::ChromaFormat::Yuv420,
+        end_reason: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+        counters: Arc::new(crate::session_status::SessionCounters::default()),
+    });
+    (guard, stop, quit, idr)
+}
+
+/// Every per-session route on an id nothing is streaming: a 404 in the ApiError envelope,
+/// never a panic and never another session's teardown.
+#[tokio::test]
+async fn a_per_session_route_404s_an_unknown_id() {
+    let _serial = SESSION_REGISTRY_LOCK.lock().await;
+    let app = test_app(test_state(), None);
+    let (_live, stop, _quit, idr) = fake_session_with_flags("aabbccddeeff");
+    let ghost = u64::MAX;
+
+    for req in [
+        axum::http::Request::delete(format!("/api/v1/session/{ghost}"))
+            .body(Body::empty())
+            .unwrap(),
+        axum::http::Request::post(format!("/api/v1/session/{ghost}/idr"))
+            .body(Body::empty())
+            .unwrap(),
+        put_json(
+            &format!("/api/v1/session/{ghost}/audio"),
+            serde_json::json!({ "muted": true }),
+        ),
+        put_json(
+            &format!("/api/v1/session/{ghost}/access"),
+            serde_json::json!({ "level": "view" }),
+        ),
+    ] {
+        let (status, body) = send(&app, req).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body["error"].is_string(), "ApiError envelope: {body}");
+    }
+    assert!(
+        !stop.load(Ordering::SeqCst),
+        "the live session is untouched"
+    );
+    assert!(!idr.load(Ordering::Relaxed));
+}
+
+/// `GET /session/last` answers a host that has streamed and a host that has not: a list,
+/// never a 404 and never a 500. A stopped session arrives on it with the reason attached.
+#[tokio::test]
+async fn the_last_session_route_answers_before_and_after_a_session() {
+    let _serial = SESSION_REGISTRY_LOCK.lock().await;
+    let app = test_app(test_state(), None);
+
+    let (status, body) = send(&app, get_req("/api/v1/session/last")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body["sessions"].is_array(),
+        "always a list, empty on a host that has not streamed: {body}"
+    );
+
+    let one = fake_session_with_flags("aabbccddeeff").0;
+    let id = one.id;
+    let del = axum::http::Request::delete(format!("/api/v1/session/{id}"))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(send(&app, del).await.0, StatusCode::NO_CONTENT);
+    drop(one);
+
+    let (status, body) = send(&app, get_req("/api/v1/session/last")).await;
+    assert_eq!(status, StatusCode::OK);
+    // By id: the ring is process-global and bounded, so a count is not a claim.
+    let mine = body["sessions"]
+        .as_array()
+        .expect("a list")
+        .iter()
+        .find(|s| s["id"] == id)
+        .unwrap_or_else(|| panic!("session {id} is on the list: {body}"));
+    assert_eq!(mine["ended"], "stopped_by_operator");
+    assert_eq!(mine["mode"], "1920x1080@60");
+    assert_eq!(mine["codec"], "hevc");
+    // No video loop ran, so it has no totals to claim — absent, not zero.
+    assert!(mine.get("frames_sent").is_none(), "{mine}");
+}
+
+/// The point of the whole issue: with two clients on one host, stopping one must leave the
+/// other streaming — and the id-less `DELETE /session` must still take both.
+#[tokio::test]
+async fn a_per_session_stop_drops_only_that_session() {
+    let _serial = SESSION_REGISTRY_LOCK.lock().await;
+    let app = test_app(test_state(), None);
+    let (one, stop1, quit1, idr1) = fake_session_with_flags("aabbccddeeff");
+    let (_two, stop2, quit2, idr2) = fake_session_with_flags("112233445566");
+
+    let del = axum::http::Request::delete(format!("/api/v1/session/{}", one.id))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(send(&app, del).await.0, StatusCode::NO_CONTENT);
+    assert!(stop1.load(Ordering::SeqCst) && quit1.load(Ordering::SeqCst));
+    assert!(
+        !stop2.load(Ordering::SeqCst),
+        "the other client keeps streaming"
+    );
+
+    // Same for the keyframe: one id, one encoder.
+    let post = axum::http::Request::post(format!("/api/v1/session/{}/idr", one.id))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(send(&app, post).await.0, StatusCode::ACCEPTED);
+    assert!(idr1.load(Ordering::Relaxed));
+    assert!(!idr2.load(Ordering::Relaxed));
+
+    // The id-less form is unchanged: every live session, as every existing caller expects.
+    let all = axum::http::Request::delete("/api/v1/session")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(send(&app, all).await.0, StatusCode::NO_CONTENT);
+    assert!(stop2.load(Ordering::SeqCst) && quit2.load(Ordering::SeqCst));
+}
+
+/// Mute is per session: the other client on the same display keeps its audio, and the
+/// state is on `/status` so the operator sees why one of them is silent.
+///
+/// The wire half — that a muted session stops sending datagrams — needs two real clients
+/// on a real host; this covers the flag the audio thread reads.
+#[tokio::test]
+async fn muting_one_session_leaves_the_other_hearing() {
+    let _serial = SESSION_REGISTRY_LOCK.lock().await;
+    let app = test_app(test_state(), None);
+    let (one, ..) = fake_session_with_flags("aabbccddeeff");
+    let (two, ..) = fake_session_with_flags("112233445566");
+    let muted = |id: u64| {
+        crate::session_status::controls(id)
+            .unwrap()
+            .muted
+            .load(Ordering::SeqCst)
+    };
+
+    let (status, _) = send(
+        &app,
+        put_json(
+            &format!("/api/v1/session/{}/audio", one.id),
+            serde_json::json!({ "muted": true }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(muted(one.id));
+    assert!(
+        !muted(two.id),
+        "the session sharing the sink still hears it"
+    );
+
+    let (_, body) = send(&app, get_req("/api/v1/status")).await;
+    let row = |id: u64| {
+        body["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == id)
+            .cloned()
+            .unwrap()
+    };
+    assert_eq!(row(one.id)["muted"], true, "{body}");
+    assert_eq!(row(two.id)["muted"], false);
+
+    // Unmute puts it back without touching the sibling.
+    let (status, _) = send(
+        &app,
+        put_json(
+            &format!("/api/v1/session/{}/audio", one.id),
+            serde_json::json!({ "muted": false }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(!muted(one.id));
+}
+
+/// A live re-point moves the mask the input thread reads, and cannot widen past the
+/// pairing: these sessions are paired controller-only, so `full` comes back clamped.
+#[tokio::test]
+async fn a_live_access_change_applies_to_the_running_session() {
+    let _serial = SESSION_REGISTRY_LOCK.lock().await;
+    let app = test_app(test_state(), None);
+    let (one, ..) = fake_session_with_flags("aabbccddeeff");
+    let (two, ..) = fake_session_with_flags("112233445566");
+    let grants = |id: u64| {
+        crate::session_status::controls(id)
+            .unwrap()
+            .grants
+            .load(Ordering::Relaxed)
+    };
+    let before_other = grants(two.id);
+
+    let (status, body) = send(
+        &app,
+        put_json(
+            &format!("/api/v1/session/{}/access", one.id),
+            serde_json::json!({ "level": "view" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["level"], "view", "{body}");
+    assert_eq!(
+        grants(one.id),
+        punktfunk_core::quic::GRANT_PRESET_VIEW_ONLY,
+        "the live mask moved, with no reconnect"
+    );
+    assert_eq!(
+        grants(two.id),
+        before_other,
+        "the other session is untouched"
+    );
+
+    // Handing the pad back: `full` is asked for, the controller-only pairing is what lands.
+    let (status, body) = send(
+        &app,
+        put_json(
+            &format!("/api/v1/session/{}/access", one.id),
+            serde_json::json!({ "level": "full" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["grants"].as_u64().unwrap() as u32,
+        punktfunk_core::quic::GRANT_PRESET_CONTROLLER_ONLY,
+        "clamped to the pairing's ceiling: {body}"
+    );
+    assert_eq!(
+        grants(one.id),
+        punktfunk_core::quic::GRANT_PRESET_CONTROLLER_ONLY
+    );
+
+    // Neither field, an unknown level, and a reserved bit are all 400s.
+    for bad in [
+        serde_json::json!({}),
+        serde_json::json!({ "level": "admin" }),
+        serde_json::json!({ "grants": punktfunk_core::quic::GRANT_RESERVED }),
+    ] {
+        let (status, body) = send(
+            &app,
+            put_json(&format!("/api/v1/session/{}/access", one.id), bad),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["error"].is_string());
+    }
 }
 
 /// A native session must read as streaming in `/local/summary`. The GameStream `streaming` flag
@@ -1500,9 +1796,32 @@ fn every_route_is_classified_for_the_plugin_and_cert_lanes() {
             true,
             false,
         ),
-        // Session control.
+        // Session control. Per-session stop/keyframe/mute ride the host-wide lane; the live
+        // access re-point does not — that is access administration.
         ("DELETE", "/api/v1/session", true, false),
         ("POST", "/api/v1/session/idr", true, false),
+        ("DELETE", "/api/v1/session/{id}", true, false),
+        ("POST", "/api/v1/session/{id}/idr", true, false),
+        ("PUT", "/api/v1/session/{id}/audio", true, false),
+        ("PUT", "/api/v1/session/{id}/access", false, false),
+        // Finished sessions: the same facts `/status` already shows a plugin about a live
+        // one. Not the cert lane — it names every other client that streamed here.
+        ("GET", "/api/v1/session/last", true, false),
+        // Window list and verbs: console lane only. A window list names titles on
+        // the operator's desk, like the rosters the cert lane withholds, and a cert
+        // caller is not bound to a session id — it could spend another session's
+        // grants. The client's own switcher needs a session-bound lane, not this.
+        ("GET", "/api/v1/session/{id}/windows", false, false),
+        (
+            "POST",
+            "/api/v1/session/{id}/windows/{window}",
+            false,
+            false,
+        ),
+        // Live pad feed: console lane only, for the same reason as the window list —
+        // a cert caller is not bound to a session id, so it could watch another
+        // session's controller. A plugin has no use for a 250 Hz input tap.
+        ("GET", "/api/v1/session/{id}/pads", false, false),
         ("GET", "/api/v1/session/settings", true, false),
         ("PUT", "/api/v1/session/settings", true, false),
         ("POST", "/api/v1/game/end", true, false),
@@ -3171,6 +3490,7 @@ async fn library_stats_ride_on_the_entry() {
         role: Default::default(),
         icon: None,
         detect: None,
+        on_window: None,
         meta: Default::default(),
     })
     .expect("seed one custom title");
@@ -3236,6 +3556,11 @@ fn a_recorded_launch_credits_its_run_to_the_library_stats() {
             launch_stamp,
             // Recorded: this is what makes the run count.
             procs: Some(std::sync::Arc::new(std::sync::Mutex::new(Vec::new()))),
+            #[cfg(target_os = "linux")]
+            workspace: None,
+            #[cfg(target_os = "linux")]
+            window_stage: None,
+            outcome: None,
         },
         Box::new(|| {}),
     );
@@ -3646,6 +3971,7 @@ async fn custom_entry_hints_round_trip_and_survive_an_update() {
             exe: Some("/usr/bin/eden".into()),
             ..Default::default()
         }),
+        on_window: None,
         meta: Default::default(),
     })
     .expect("seed one custom title");

@@ -1,7 +1,9 @@
 # punktfunk web console pre-start — systemd USER one-shot.
 #
-# Two jobs, both of which must happen BEFORE the console's first exec:
+# Three jobs, all of which must happen BEFORE the console's exec:
 #
+#  0. Write host.env's PUNKTFUNK_UI_BIND once, so a console that already served this box's LAN
+#     keeps that reach when the shipped default changes under it (see web-init.sh).
 #  1. Generate the console login password (PUNKTFUNK_UI_PASSWORD) in the streaming user's
 #     ~/.config/punktfunk on first start, surfaced to the --user journal for retrieval. A .deb
 #     postinst runs as root (wrong $HOME), so credential generation must happen as the user —
@@ -24,7 +26,11 @@ Description=punktfunk web console pre-start (login password; waits for the host)
 
 [Service]
 Type=oneshot
-RemainAfterExit=yes
+# NOT RemainAfterExit: an active oneshot is never re-run, so a `systemctl --user restart
+# punktfunk-web` in a live session skipped both jobs above — including the bind line the console
+# is about to read. Inactive, `Wants=` pulls it again and `After=` still waits for it, so every
+# console start goes through the gate. Steady state costs nothing: the host's files already exist.
+RemainAfterExit=no
 ExecStart=/usr/share/punktfunk-web/web-init.sh
 
 [Install]

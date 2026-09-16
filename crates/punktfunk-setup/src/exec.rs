@@ -276,6 +276,8 @@ impl Executor<'_> {
     /// The console's login password, in the file its unit reads as an `EnvironmentFile`.
     /// 0600 and never echoed — `web-init.sh` writes a generated one only when this is absent,
     /// so landing it before the units start is what makes the user's own password the one.
+    /// The console salts and hashes this line the first time it signs someone in, and the file
+    /// then holds only the hash; writing a fresh line back here is how the password is reset.
     fn web_password(&self, password: &str) {
         let path = self.paths.config.join("punktfunk/web-password");
         let shown = path.display().to_string().replace('\\', "/");

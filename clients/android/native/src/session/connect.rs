@@ -360,6 +360,9 @@ struct ConnectRequest {
     /// The `video_fit` setting (`"fit"`/`"crop"`/`"stretch"`); absent reads as fit.
     #[serde(default)]
     video_fit: String,
+    /// Build plus the shell that dialled; rides `Start`'s extension block as the host's log label.
+    #[serde(default)]
+    dialer: String,
 }
 
 /// `NativeBridge.nativeConnect(requestJson): Long` — see [`ConnectRequest`]. Returns an opaque
@@ -419,7 +422,11 @@ fn connect(req: ConnectRequest) -> jlong {
         pad_audio_ok,
         keep_host_audio,
         video_fit,
+        dialer,
     } = req;
+    // Which shell asked, for the host's `handshake complete` line. Set before the dial: core reads
+    // it once the host says it parses the block.
+    punktfunk_core::client::set_client_label(&dialer);
     let launch = launch.filter(|s| !s.is_empty());
     let device_name = device_name
         .map(|s| s.trim().to_string())

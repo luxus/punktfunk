@@ -43,6 +43,22 @@ export function pluginOriginPort(): number | null {
 	return Number.isInteger(port) && port > 0 ? port : null;
 }
 
+/**
+ * The address both listeners actually bound, or `null` under `vite dev` (which never stamps one).
+ *
+ * Read from what the entry SET after the bind, never from the environment we inherited: a stale
+ * `PUNKTFUNK_UI_BIND` would otherwise have Settings tell the operator the console is on their
+ * network when it is not, which is the one direction this notice must never be wrong in.
+ */
+export function boundAddress(): string | null {
+	return process.env.PUNKTFUNK_UI_BIND_ACTIVE || null;
+}
+
+/** Whether that address answers only on this machine. */
+export function isLoopbackBind(bind: string | null): boolean {
+	return bind === null || /^(127\.|::1$|localhost$)/.test(bind);
+}
+
 /** The console's own port, for the plugin origin's `frame-ancestors`. */
 export function consoleOriginPort(): number | null {
 	const raw = process.env.PUNKTFUNK_UI_CONSOLE_PORT_ACTIVE;

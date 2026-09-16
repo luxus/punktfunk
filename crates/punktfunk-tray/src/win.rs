@@ -588,8 +588,9 @@ fn elevate_service(hwnd: HWND, verb: &str) -> bool {
 
 /// Open the web console at `path` (`""` = dashboard).
 fn open_web_console(hwnd: HWND, path: &str) {
-    // `127.0.0.1`, not `localhost`: the console is IPv4-only (`HOST=0.0.0.0`); Windows
-    // resolves `localhost` to ::1 first. Same literal as the poller probe.
+    // `127.0.0.1`, not `localhost`: the console binds one IPv4 address (`PUNKTFUNK_UI_BIND`,
+    // 127.0.0.1 by default) and Windows resolves `localhost` to ::1 first. Same literal as the
+    // poller probe, and it reaches the console under either default.
     shell_open(
         hwnd,
         &format!("https://127.0.0.1:{}/{path}", app().web_port),

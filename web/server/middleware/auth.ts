@@ -1,7 +1,7 @@
 // The single server-side gate. Runs for EVERY request to the deployed Bun/Nitro server
 // (pages, the /api proxy, everything) before routing. Unauthenticated requests are
-// redirected to /login (page navigations) or rejected 401 (/api). Fails CLOSED if
-// PUNKTFUNK_UI_PASSWORD is unset, so a misconfigured LAN-exposed server admits no one.
+// redirected to /login (page navigations) or rejected 401 (/api). Fails CLOSED when no password
+// is configured either way, so a misconfigured LAN-exposed server admits no one.
 import {
 	defineEventHandler,
 	getCookie,
@@ -15,13 +15,13 @@ import {
 	useSession,
 } from "h3";
 import {
+	authConfigured,
 	isPublicPath,
 	SESSION_NAME,
 	type SessionData,
 	safeNextPath,
 	sessionConfig,
 	sessionEpoch,
-	uiPassword,
 } from "../util/auth";
 import {
 	consoleOriginPort,
@@ -104,7 +104,11 @@ export default defineEventHandler(async (event) => {
 	//
 	// Gated on the cookie EXISTING, not just on the path: `useSession` issues a sealed one when it
 	// finds none, and the login page is the one place a visitor with no session is expected.
-	if (pathname === "/login" && uiPassword() && getCookie(event, SESSION_NAME)) {
+	if (
+		pathname === "/login" &&
+		authConfigured() &&
+		getCookie(event, SESSION_NAME)
+	) {
 		const session = await useSession<SessionData>(event, sessionConfig());
 		if (session.data.authenticated && session.data.epoch === sessionEpoch()) {
 			const next = getQuery(event).next;
@@ -119,9 +123,9 @@ export default defineEventHandler(async (event) => {
 	if (isPublicPath(pathname)) return;
 
 	// Misconfigured: refuse everything rather than serve open on the LAN.
-	if (!uiPassword()) {
+	if (!authConfigured()) {
 		setResponseStatus(event, 503);
-		return { error: "auth not configured: set PUNKTFUNK_UI_PASSWORD" };
+		return { error: "auth not configured: set PUNKTFUNK_UI_PASSWORD_HASH" };
 	}
 
 	const session = await useSession<SessionData>(event, sessionConfig());

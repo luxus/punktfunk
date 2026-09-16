@@ -348,6 +348,7 @@ impl Ring {
         self.facts.stats_tier.hash(&mut h);
         self.facts.mic_muted.hash(&mut h);
         self.facts.pad_mouse_on.hash(&mut h);
+        self.facts.audio_mute.hash(&mut h);
         self.facts.pad_mouse_target.hash(&mut h);
         self.facts.pointer_granted.hash(&mut h);
         self.facts.mode.hash(&mut h);
@@ -481,6 +482,23 @@ impl Ring {
                     if f.pad_mouse_on { "Mouse ✓" } else { "Mouse" },
                 )
             },
+            SlotId::StreamMute => Spec {
+                toggle: true,
+                // The shared sentence, so the slot never claims sound is back while the
+                // operator's mute stands.
+                state: punktfunk_core::client::audio_mute_label(f.audio_mute)
+                    .unwrap_or("On")
+                    .into(),
+                ..plain(
+                    "stream_mute",
+                    "Mute this stream",
+                    if f.audio_mute & punktfunk_core::client::AUDIO_MUTE_LOCAL != 0 {
+                        "Mute ✕"
+                    } else {
+                        "Mute"
+                    },
+                )
+            },
             SlotId::Host(id) if self.editing.is_some() => Spec {
                 armed: true,
                 ..plain(&format!("host:{id}"), preview_host_label(id), "Power")
@@ -553,6 +571,7 @@ impl Ring {
             SlotId::Stats => self.pending.push_back(RingCommand::CycleStats),
             SlotId::Mic => self.pending.push_back(RingCommand::ToggleMic),
             SlotId::PadMouse => self.pending.push_back(RingCommand::TogglePadMouse),
+            SlotId::StreamMute => self.pending.push_back(RingCommand::ToggleStreamMute),
             SlotId::Pad | SlotId::SendText => {}
             // The host's own overlay is about to take the screen: close first, like End stream.
             SlotId::Guide | SlotId::Qam => {
@@ -1493,6 +1512,49 @@ mod tests {
         assert_eq!(
             r.take_command(),
             Some(RingCommand::TapButton(wire::BTN_MISC1))
+        );
+    }
+
+    /// The player's own toggle and the operator's mute are separate facts: firing the slot
+    /// always asks for the local flip, and the slot never says "On" while the host is muting.
+    #[test]
+    fn the_mute_slot_names_whose_mute_it_is() {
+        use punktfunk_core::client::{AUDIO_MUTE_HOST, AUDIO_MUTE_LOCAL};
+
+        let mut r = Ring::new();
+        r.set_facts(&RingFacts { ..facts() });
+        assert_eq!(r.spec(&SlotId::StreamMute).state, "On");
+
+        r.input(RingInput::Toggle { x: 1.0, y: 1.0 });
+        r.fire(&SlotId::StreamMute);
+        assert_eq!(r.take_command(), Some(RingCommand::ToggleStreamMute));
+        assert!(r.open(), "a toggle leaves the ring open");
+
+        r.set_facts(&RingFacts {
+            audio_mute: AUDIO_MUTE_LOCAL,
+            ..facts()
+        });
+        assert_eq!(r.spec(&SlotId::StreamMute).state, "Muted on this device");
+        assert_eq!(r.spec(&SlotId::StreamMute).short, "Mute ✕");
+
+        r.set_facts(&RingFacts {
+            audio_mute: AUDIO_MUTE_HOST,
+            ..facts()
+        });
+        assert_eq!(r.spec(&SlotId::StreamMute).state, "Muted by the host");
+        assert_eq!(
+            r.spec(&SlotId::StreamMute).short,
+            "Mute",
+            "the face follows the player's own toggle; the badge carries the host's"
+        );
+
+        r.set_facts(&RingFacts {
+            audio_mute: AUDIO_MUTE_HOST | AUDIO_MUTE_LOCAL,
+            ..facts()
+        });
+        assert_eq!(
+            r.spec(&SlotId::StreamMute).state,
+            "Muted by the host and on this device"
         );
     }
 

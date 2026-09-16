@@ -16,7 +16,7 @@
 
 use std::cell::RefCell;
 
-use crate::choices::Action;
+use crate::choices::{Action, LAN_BIND, LOOPBACK_BIND};
 use crate::facts::Channel;
 use crate::ui::logo::{self, Intro, MARK_TEXT_ROWS};
 use crate::ui::summary::{Field, Item, Key as UiKey, Screen, Step};
@@ -424,27 +424,72 @@ impl<'a> Tui<'a> {
         }
     }
 
+    /// Where the console listens. Asked, not derived: the answer decides who on the network can
+    /// reach the pairing screen, and until now nobody was ever told it was every device.
+    ///
+    /// `None` on Esc leaves `current` standing, so backing out of a re-run never moves a console
+    /// someone already placed. "Any address" is deliberately not an option: a console on the open
+    /// internet is a route the operator builds on purpose, not one a list offers them.
+    pub fn web_bind(&self, ip: &str, current: &str) -> Option<String> {
+        let prompt =
+            "Where should the web console be reachable?\nIt is how you pair devices and change every setting.";
+        let options = [
+            "This machine only (https://127.0.0.1:47992)",
+            &format!("This local network (https://{ip}:47992)"),
+            "A specific address (e.g. a VPN interface)",
+        ];
+        // The cursor starts on what the box already answers, so Enter is always "leave it".
+        let initial = match current {
+            LOOPBACK_BIND => 0,
+            LAN_BIND => 1,
+            _ => 2,
+        };
+        match self.choose(prompt, &options, initial)? {
+            0 => Some(LOOPBACK_BIND.to_string()),
+            1 => Some(LAN_BIND.to_string()),
+            _ => self.ask_line(
+                "Type the address the console should listen on. It has to be an address this machine already has.",
+                "an IPv4 or IPv6 address · Esc leaves it unchanged",
+                "Enter accepts · Esc leaves it unchanged",
+                |typed| typed.parse::<std::net::IpAddr>().is_ok(),
+            ),
+        }
+    }
+
     /// Inline text entry for the console password. `None` on Esc — the caller reads that as
     /// "generate one after all", so there is no way to leave here with nothing set.
     fn ask_secret(&self) -> Option<String> {
+        self.ask_line(
+            "Type the console password. It is stored on this box only, and shown here as you type.",
+            &format!("at least {MIN_PASSWORD} characters · Esc generates one instead"),
+            "Enter accepts · Esc generates one instead",
+            |typed| typed.chars().count() >= MIN_PASSWORD,
+        )
+    }
+
+    /// One line of typed text, echoed. `accept` gates Enter and picks which hint shows; Esc
+    /// returns `None`, which every caller reads as "keep the default", never as a cancel.
+    fn ask_line(
+        &self,
+        prose: &str,
+        hint_short: &str,
+        hint_ok: &str,
+        accept: impl Fn(&str) -> bool,
+    ) -> Option<String> {
         let mut typed = String::new();
         let mut drawn = 0usize;
         loop {
             let bar = self.bar();
-            let short = typed.chars().count() < MIN_PASSWORD;
-            let hint = if short {
-                format!("at least {MIN_PASSWORD} characters · Esc generates one instead")
-            } else {
-                "Enter accepts · Esc generates one instead".to_string()
-            };
+            let short = !accept(&typed);
+            let hint = if short { hint_short } else { hint_ok };
             let mut frame = format!("{bar}\n");
-            frame.push_str(&self.prose("Type the console password. It is stored on this box only, and shown here as you type."));
+            frame.push_str(&self.prose(prose));
             frame.push_str(&format!(
                 "{bar}  {} {}\n",
                 self.accent(CURSOR),
                 self.highlight(&typed)
             ));
-            frame.push_str(&format!("{bar}  {}\n", self.dim(&hint)));
+            frame.push_str(&format!("{bar}  {}\n", self.dim(hint)));
             frame.push_str(&format!("{bar}\n"));
             if drawn > 0 {
                 self.term.borrow_mut().clear_last_lines(drawn);

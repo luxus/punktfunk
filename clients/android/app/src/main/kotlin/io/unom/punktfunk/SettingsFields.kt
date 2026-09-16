@@ -24,6 +24,17 @@ internal object SettingsFields {
             overlay({ it.height }, { o, v -> o.copy(height = v) })),
         field("hz", "refresh_hz", IntKind, { it.hz }, { s, v -> s.copy(hz = v) },
             overlay({ it.hz }, { o, v -> o.copy(hz = v) }), prefsKey = "hz"),
+        // Qualifiers on the safe-area resolution. `android.` keys, so they ride the console
+        // document's `Settings::extra` rather than needing a row in the shared shell.
+        field("safeAreaClearCorners", "android.safe_area_clear_corners", BoolKind,
+            { it.safeAreaClearCorners }, { s, v -> s.copy(safeAreaClearCorners = v) },
+            prefsKey = "safe_area_clear_corners"),
+        field("safeAreaLeftPx", "android.safe_area_left_px", IntKind,
+            { it.safeAreaLeftPx }, { s, v -> s.copy(safeAreaLeftPx = v) },
+            prefsKey = "safe_area_left_px"),
+        field("safeAreaRightPx", "android.safe_area_right_px", IntKind,
+            { it.safeAreaRightPx }, { s, v -> s.copy(safeAreaRightPx = v) },
+            prefsKey = "safe_area_right_px"),
         field("bitrateKbps", "bitrate_kbps", IntKind, { it.bitrateKbps }, { s, v -> s.copy(bitrateKbps = v) },
             overlay({ it.bitrateKbps }, { o, v -> o.copy(bitrateKbps = v) })),
         field("renderScale", "render_scale", DoubleKind, { it.renderScale }, { s, v -> s.copy(renderScale = v) },
@@ -156,6 +167,11 @@ internal object SettingsFields {
         }
         fun overlayFromJson(o: SettingsOverlay, j: JSONObject): SettingsOverlay =
             overlay?.let { ov -> kind.read(j, key)?.let { ov.set(o, it) } } ?: o
+
+        /** The override in the console document's encoding, under the console's key. */
+        fun overlayToConsoleJson(o: SettingsOverlay, j: JSONObject) {
+            overlay?.get?.invoke(o)?.let { consoleKind.write(j, consoleKey, it) }
+        }
 
         private val consoleKey get() = console?.key ?: key
         private val consoleKind get() = console?.kind ?: kind

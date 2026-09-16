@@ -9,10 +9,13 @@ import android.content.pm.PackageManager
 import android.hardware.usb.UsbManager
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
 import android.view.InputDevice
 import android.view.KeyCharacterMap
 import android.view.KeyEvent
+import android.view.ViewConfiguration
 import android.view.MotionEvent
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -115,7 +118,36 @@ class MainActivity : ComponentActivity() {
 
     /** The key-filtering service forwards to this window only while a stream has focus. */
     private fun syncKeyCapture() {
-        KeyCaptureService.stream = if (streamHandle != 0L && hasWindowFocus()) ::streamKey else null
+        val focused = streamHandle != 0L && hasWindowFocus()
+        if (!focused) cancelKeyRepeat()
+        KeyCaptureService.stream = if (focused) ::streamKey else null
+    }
+
+    /**
+     * Key repeat for the service path. Android synthesises repeats in the input dispatcher,
+     * and a key the accessibility filter consumed never reaches it, so a held key sent one
+     * DOWN. Armed only while the service is on; the dispatcher path repeats on its own.
+     */
+    private val keyRepeat = Handler(Looper.getMainLooper())
+    private var repeatVk = 0
+
+    private fun armKeyRepeat(handle: Long, vk: Int) {
+        cancelKeyRepeat()
+        repeatVk = vk
+        val delay = ViewConfiguration.getKeyRepeatDelay().toLong()
+        val tick = object : Runnable {
+            override fun run() {
+                if (streamHandle != handle || repeatVk != vk || !KeyCaptureService.running) return
+                NativeBridge.nativeSendKey(handle, vk, true, 0)
+                keyRepeat.postDelayed(this, delay)
+            }
+        }
+        keyRepeat.postDelayed(tick, ViewConfiguration.getKeyRepeatTimeout().toLong())
+    }
+
+    private fun cancelKeyRepeat() {
+        repeatVk = 0
+        keyRepeat.removeCallbacksAndMessages(null)
     }
 
     /**
@@ -282,7 +314,7 @@ class MainActivity : ComponentActivity() {
         // has to happen HERE, before this instance is resumed, not inside the composition (which
         // only ever sees the rare `onNewIntent` case). Finishing now leaves the streaming task in
         // front, untouched.
-        val live = liveStream
+        val live = SessionGate.live
         if (live != null && deepLinkFrom(intent) != null) {
             // Pointing at the host already being streamed is the one exception, and its right
             // answer is to do nothing: the intent has already brought the app forward, which is
@@ -478,6 +510,12 @@ class MainActivity : ComponentActivity() {
             startSc2MenuNav()
         }
     }
+
+    /**
+     * Buzz the captured SC2's own grip motors — the rumble test for a pad the input stack cannot
+     * see, so [testRumble] has no `InputDevice` to reach for. False when nothing is captured.
+     */
+    fun testSc2Rumble(): Boolean = sc2Menu?.testRumble() == true
 
     /** Release the menu-time SC2 capture (backgrounded / stream taking over). Idempotent. */
     fun stopSc2MenuNav() {
@@ -790,6 +828,14 @@ class MainActivity : ComponentActivity() {
                         if (down && imeShift) NativeBridge.nativeSendKey(handle, 0xA0, true, 0)
                         NativeBridge.nativeSendKey(handle, vk, down, 0)
                         if (!down && imeShift) NativeBridge.nativeSendKey(handle, 0xA0, false, 0)
+                        // The service path never sees a dispatcher repeat, so a held hardware
+                        // key repeats from here. Modifiers do not repeat on Android either; a
+                        // new key takes the repeat over, and its own release ends it.
+                        val hardware = event.deviceId != KeyCharacterMap.VIRTUAL_KEYBOARD && !fromPad(event)
+                        if (KeyCaptureService.running && hardware && !KeyEvent.isModifierKey(event.keyCode)) {
+                            if (down && event.repeatCount == 0) armKeyRepeat(handle, vk)
+                            else if (!down && vk == repeatVk) cancelKeyRepeat()
+                        }
                         return true // consumed — don't let the system also act on it
                     }
                 }
@@ -952,27 +998,10 @@ class MainActivity : ComponentActivity() {
     }
 
     /** Does [intent]'s link resolve to the host [live] is already streaming? */
-    private fun targetsHost(intent: Intent?, live: LiveStream): Boolean {
+    private fun targetsHost(intent: Intent?, live: SessionGate.Live): Boolean {
         val url = deepLinkFrom(intent) ?: return false
         val parsed = DeepLinks.parse(url) as? DeepLinkResult.Parsed ?: return false
         val target = DeepLinks.resolveHost(parsed.link, KnownHostStore(this).all())
         return target is HostResolution.Record && target.host.id == live.hostId
-    }
-
-    /** The host a live stream is on — see [liveStream]. */
-    data class LiveStream(val hostId: String?)
-
-    companion object {
-        /**
-         * The live stream, PROCESS-wide (null = not streaming), published by the composition that
-         * owns it.
-         *
-         * Deliberately not per-instance state: `launchMode` is `standard`, so a `punktfunk://`
-         * link arrives as a second activity instance that knows nothing about the first — and the
-         * one thing it must know is that a session is already running. Static state is what
-         * crosses that gap; the process dying resets it, which is also correct.
-         */
-        @Volatile
-        var liveStream: LiveStream? = null
     }
 }

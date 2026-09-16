@@ -47,6 +47,8 @@ struct Drawn {
     /// Access toast; occupies the hint pill's slot while up.
     notice: Option<String>,
     mic_muted: bool,
+    /// Standing mute badge: the sentence, or empty while the stream is audible.
+    audio_mute: String,
     /// UI scale in percent. Text is identical across monitors, so scale must live in the key.
     scale_pct: u16,
     /// Banner alpha, quantized: a fade step redraws, a steady alpha does not.
@@ -443,6 +445,7 @@ impl Overlay for SkiaOverlay {
             && ctx.access.is_none()
             && ctx.notice.is_none()
             && !ctx.mic_muted
+            && ctx.audio_mute.is_none()
             && banner_step == 0
             && resize_step == 0
             && ring_key == 0
@@ -461,6 +464,7 @@ impl Overlay for SkiaOverlay {
             access: ctx.access.map(str::to_owned),
             notice: ctx.notice.map(str::to_owned),
             mic_muted: ctx.mic_muted,
+            audio_mute: ctx.audio_mute.unwrap_or_default().to_owned(),
             scale_pct: (scale * 100.0).round() as u16,
             banner_step,
             resize_step,
@@ -493,13 +497,20 @@ impl Overlay for SkiaOverlay {
         if let Some(stats) = &want.stats {
             draw_osd_panel(canvas, font, stats, ctx.width, scale);
         }
-        // Top-right: never collides with the stats panel or the bottom pill, even at stats Off.
+        // Top-right, stacked in a fixed order: never collides with the stats panel or the
+        // bottom pill, even at stats Off.
+        let mut row = 0;
         if want.mic_muted {
-            draw_mic_muted_badge(canvas, font, ctx.width, scale);
+            draw_badge(canvas, font, "Microphone muted", ctx.width, row, scale);
+            row += 1;
         }
-        // Same corner as the badge (must survive stats Off); stacks under it when both are up.
+        if !want.audio_mute.is_empty() {
+            draw_badge(canvas, font, &want.audio_mute, ctx.width, row, scale);
+            row += 1;
+        }
+        // Same corner as the badges (must survive stats Off); stacks under them.
         if let Some(access) = &want.access {
-            draw_access_chip(canvas, font, access, ctx.width, want.mic_muted, scale);
+            draw_access_chip(canvas, font, access, ctx.width, row, scale);
         }
         // Access toast outranks the capture hint for its few seconds.
         if let Some(notice) = &want.notice {
@@ -770,11 +781,10 @@ fn role_color(role: Role) -> Color4f {
     }
 }
 
-/// Mic-mute badge (error-colour dot + words), top-right. From `mic_muted`, not
-/// the stats text, so it survives stats Off. Words: the runtime monospace may
-/// not ship a mute glyph. Persistent so mute state stays visible.
-fn draw_mic_muted_badge(canvas: &Canvas, base_font: &Font, width: u32, scale: f32) {
-    const LABEL: &str = "Microphone muted";
+/// Standing badge (error-colour dot + words), top-right at `row`. Drawn from state, not
+/// from the stats text, so it survives stats Off. Words: the runtime monospace may not ship
+/// a mute glyph. Persistent, because what it reports does not go away on its own.
+fn draw_badge(canvas: &Canvas, base_font: &Font, label: &str, width: u32, row: usize, scale: f32) {
     // Short; it fits any stream window, so take the display scale as-is.
     let font = &chrome_font(base_font, scale);
     let (_, metrics) = font.metrics();
@@ -782,11 +792,12 @@ fn draw_mic_muted_badge(canvas: &Canvas, base_font: &Font, width: u32, scale: f3
     let (pad_x, pad_y) = (base::PILL_PAD_X * scale, base::PILL_PAD_Y * scale);
     let dot_r = 4.0 * scale;
     let dot_gap = 8.0 * scale;
-    let text_w = font.measure_str(LABEL, None).0;
+    let text_w = font.measure_str(label, None).0;
     let w = text_w + 2.0 * dot_r + dot_gap + 2.0 * pad_x;
     let h = line_h + 2.0 * pad_y;
     let margin = base::OSD_MARGIN * scale;
-    let (x, y) = (width as f32 - w - margin, margin);
+    let x = width as f32 - w - margin;
+    let y = margin + row as f32 * (h + 8.0 * scale);
     canvas.draw_rrect(
         RRect::new_rect_xy(Rect::from_xywh(x, y, w, h), h / 2.0, h / 2.0),
         &fill(Color4f::new(0.0, 0.0, 0.0, 0.62)),
@@ -797,7 +808,7 @@ fn draw_mic_muted_badge(canvas: &Canvas, base_font: &Font, width: u32, scale: f3
         &fill(crate::theme::ERROR),
     );
     canvas.draw_str(
-        LABEL,
+        label,
         Point::new(
             x + pad_x + 2.0 * dot_r + dot_gap,
             y + pad_y - metrics.ascent,
@@ -807,16 +818,15 @@ fn draw_mic_muted_badge(canvas: &Canvas, base_font: &Font, width: u32, scale: f3
     );
 }
 
-/// Access chip: preset label + countdown, top-right, stacked under the mic
-/// badge when both are up. Standing, like the badge: must stay readable at
-/// every stats tier including Off. Omitted for a full-control permanent session
-/// (`None` from the run loop).
+/// Access chip: preset label + countdown, top-right, under whatever badges hold the
+/// corner. Standing, like them: must stay readable at every stats tier including Off.
+/// Omitted for a full-control permanent session (`None` from the run loop).
 fn draw_access_chip(
     canvas: &Canvas,
     base_font: &Font,
     text: &str,
     width: u32,
-    below_badge: bool,
+    rows_above: usize,
     scale: f32,
 ) {
     let font = &chrome_font(base_font, scale);
@@ -827,9 +837,9 @@ fn draw_access_chip(
     let w = text_w + 2.0 * pad_x;
     let h = line_h + 2.0 * pad_y;
     let margin = base::OSD_MARGIN * scale;
-    // One row down when the mic badge holds the corner (same height formula; the
-    // dot fits inside the shared line height).
-    let y = margin + if below_badge { h + 8.0 * scale } else { 0.0 };
+    // One row per badge already in the corner (same height formula; a badge's dot fits
+    // inside the shared line height).
+    let y = margin + rows_above as f32 * (h + 8.0 * scale);
     let x = width as f32 - w - margin;
     canvas.draw_rrect(
         RRect::new_rect_xy(Rect::from_xywh(x, y, w, h), h / 2.0, h / 2.0),

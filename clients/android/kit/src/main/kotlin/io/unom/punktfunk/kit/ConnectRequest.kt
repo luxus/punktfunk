@@ -76,6 +76,10 @@ data class ConnectRequest(
     /** The `video_fit` setting (`"fit"`/`"crop"`/`"stretch"`). Rides the Hello, so a host that
      *  frames the picture for another device (a join, a mirrored head) reframes it for this one. */
     val videoFit: String = "fit",
+    /** Build plus the shell and path that dialled (`"android 0.38.0 console/library"`). Rides the
+     *  `Start` extension block, and is the host's `handshake complete` `client=` field: it is how
+     *  two sessions from one device are told apart without a capture. */
+    val dialer: String = "",
 ) {
     fun toJson(): String = JSONObject()
         .put("host", host)
@@ -104,5 +108,6 @@ data class ConnectRequest(
         .put("pad_audio_ok", padAudioOk)
         .put("keep_host_audio", keepHostAudio)
         .put("video_fit", videoFit)
+        .put("dialer", dialer)
         .toString()
 }

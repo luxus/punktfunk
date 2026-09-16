@@ -167,8 +167,9 @@ impl PwAudioCapturer {
     /// Must keep the `punktfunk-speaker` prefix (claim-staleness and the
     /// graph-driver diagnostic match on it). Ignored in monitor mode.
     ///
-    /// `tap` taps that sink's monitor without minting or claiming it: the sink
-    /// belongs to the session this one joined.
+    /// `tap` taps that sink's monitor without minting it: the sink belongs to
+    /// the session this one joined. The tap still claims it, so the owner's
+    /// release cannot restore the default while this session reads it.
     pub fn open_named(
         channels: u32,
         rate_hz: u32,
@@ -214,7 +215,7 @@ impl PwAudioCapturer {
         // PipeWire not running must be an open error (callers' reopen backoff).
         // Stream-sink: the sink node must exist before we claim the default.
         let (ready_tx, ready_rx) = sync_channel::<Result<()>>(1);
-        let sink_name = nodes.sink.clone();
+        let sink_name = nodes.sink.clone().or_else(|| nodes.target.clone());
         // Opens at session start, so the consumer is live from the first chunk.
         let active = Arc::new(AtomicBool::new(true));
         let thread_active = Arc::clone(&active);
@@ -293,6 +294,10 @@ impl AudioCapturer for PwAudioCapturer {
 
     fn channels(&self) -> u32 {
         self.channels
+    }
+
+    fn sink_name(&self) -> Option<&str> {
+        self.sink_name.as_deref()
     }
 
     fn sample_rate(&self) -> u32 {

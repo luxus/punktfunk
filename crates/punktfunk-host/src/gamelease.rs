@@ -105,6 +105,10 @@ pub enum GameState {
     /// Distinct from [`Running`](Self::Running) — that would claim liveness
     /// the host cannot back up, and `session_on_game_exit` can never fire.
     Untracked = 3,
+    /// The game's own window is on the streamed head. Follows
+    /// [`Running`](Self::Running), often far later: the process is up while
+    /// Proton builds a prefix or a splash sits on a black window.
+    Window = 4,
 }
 
 impl GameState {
@@ -113,6 +117,7 @@ impl GameState {
             1 => Self::Running,
             2 => Self::Exited,
             3 => Self::Untracked,
+            4 => Self::Window,
             _ => Self::Launching,
         }
     }
@@ -123,6 +128,7 @@ impl GameState {
             Self::Running => "running",
             Self::Exited => "exited",
             Self::Untracked => "untracked",
+            Self::Window => "window",
         }
     }
 }
@@ -160,6 +166,8 @@ pub struct LeaseShared {
     was_running: AtomicBool,
     /// Last seen running, unix ms. 0 = never.
     last_seen_ms: AtomicU64,
+    /// Client to tell when this launch dies on the spot ([`LeaseRequest::outcome`]).
+    outcome: Option<OutcomeTx>,
 }
 
 impl LeaseShared {
@@ -207,6 +215,11 @@ pub struct GameLease {
     shared: Arc<LeaseShared>,
     /// Dropped, not joined: the watcher exits on `cancel` within `POLL`.
     watcher: Option<std::thread::JoinHandle<()>>,
+    /// Workspace this launch owns on the streamed head
+    /// ([`crate::vdisplay::WorkspaceClaim`]). Released in `Drop`, so a game
+    /// that crashed leaves the operator's workspace back where it was.
+    #[cfg(target_os = "linux")]
+    workspace: Option<crate::vdisplay::WorkspaceClaim>,
 }
 
 impl GameLease {
@@ -215,11 +228,17 @@ impl GameLease {
     }
 }
 
+/// Ends the watch and gives the workspace back. Runs on every exit, panic
+/// included: the session guard owns this handle.
 impl Drop for GameLease {
     fn drop(&mut self) {
         self.shared.cancel.store(true, Ordering::SeqCst);
         // Drop the JoinHandle; do not join. The watcher exits within `POLL`.
         drop(self.watcher.take());
+        #[cfg(target_os = "linux")]
+        if let Some(ws) = self.workspace.take() {
+            ws.release();
+        }
     }
 }
 
@@ -252,6 +271,27 @@ pub struct LeaseRequest {
     /// Adopted pids, published so the launch record outlives this watcher
     /// ([`crate::launchreg::LiveProcs`]). `None` if unrecorded.
     pub procs: Option<crate::launchreg::LiveProcs>,
+    /// Workspace the streamed head gave this launch, if any
+    /// ([`crate::library::adopt_launch_workspace`]). Released with the lease.
+    #[cfg(target_os = "linux")]
+    pub workspace: Option<crate::vdisplay::WorkspaceClaim>,
+    /// Head to watch for this game's window, and what to do with it.
+    /// `None` on a backend that reports no toplevels — the lease then runs
+    /// exactly as it did before the window stage existed.
+    #[cfg(target_os = "linux")]
+    pub window_stage: Option<WindowStage>,
+    /// Where to say this launch died on the spot. `None` leaves the finding in
+    /// the log, as it was before the client could be told.
+    pub outcome: Option<OutcomeTx>,
+}
+
+/// Where the window stage looks, and what it does with the first window it
+/// recognizes as the game's.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug)]
+pub struct WindowStage {
+    pub head: crate::session_status::StreamedHead,
+    pub on_window: crate::library::OnWindow,
 }
 
 /// Seconds since boot for adopt-against. Call **before** spawn
@@ -264,6 +304,32 @@ pub fn launch_clock() -> Option<f64> {
 }
 
 pub type OnExit = Box<dyn Fn() + Send + Sync>;
+
+/// Where a launch outcome goes: the session's control task writes it to the
+/// client. `None` for a lease with nobody streaming to tell.
+pub type OutcomeTx = tokio::sync::mpsc::UnboundedSender<punktfunk_core::quic::LaunchOutcome>;
+
+/// Did this launch die on the spot, or is it a hand-off to a game still coming up?
+///
+/// Only a *failing* exit inside [`SHIM_WINDOW`] with nothing left to recognize.
+/// A launcher hands off cleanly, and a Proton prefix build never reaches here at
+/// all: its shell exits with success and the scan waits out [`START_GRACE`].
+fn died_on_the_spot(quick: bool, success: bool, fallback: &LeaseKind) -> bool {
+    quick && !success && matches!(fallback, LeaseKind::Untracked)
+}
+
+/// What the player is told when a launch exits on the spot.
+///
+/// 127 and 126 are the shell's own "no such command" / "cannot execute"; named,
+/// because a number is not a next move. Anything else gets how long it lasted.
+fn early_exit_message(title: &str, code: Option<i32>, secs: f32) -> String {
+    let cause = match code {
+        Some(127) => "this host doesn't have that command".to_string(),
+        Some(126) => "this host can't run that command".to_string(),
+        _ => format!("it closed again after {secs:.1} s"),
+    };
+    format!("Couldn't start {title} — {cause}.")
+}
 
 /// Open a lease and start watching. `on_exit` fires **at most once**: game
 /// was seen running, then confirmed gone. Never for never-started, a shim,
@@ -280,6 +346,11 @@ pub fn open(req: LeaseRequest, on_exit: OnExit) -> GameLease {
         spawned,
         launch_stamp,
         procs,
+        #[cfg(target_os = "linux")]
+        workspace,
+        #[cfg(target_os = "linux")]
+        window_stage,
+        outcome,
     } = req;
 
     // Pin pid to start time before recycle. Unresolvable is dropped: a bare
@@ -326,6 +397,7 @@ pub fn open(req: LeaseRequest, on_exit: OnExit) -> GameLease {
         created_ms: now_ms(),
         was_running: AtomicBool::new(false),
         last_seen_ms: AtomicU64::new(0),
+        outcome,
     });
 
     if launcher {
@@ -351,7 +423,14 @@ pub fn open(req: LeaseRequest, on_exit: OnExit) -> GameLease {
         );
     }
 
-    let watcher = spawn_watcher(shared.clone(), child, procs, on_exit);
+    let watcher = spawn_watcher(
+        shared.clone(),
+        child,
+        procs,
+        on_exit,
+        #[cfg(target_os = "linux")]
+        window_stage,
+    );
     if watcher.is_none() {
         // No watcher: Nested still reports Running (gamescope node-death
         // watches it). Everything else, including spawn failure and no
@@ -362,7 +441,12 @@ pub fn open(req: LeaseRequest, on_exit: OnExit) -> GameLease {
             GameState::Untracked
         });
     }
-    GameLease { shared, watcher }
+    GameLease {
+        shared,
+        watcher,
+        #[cfg(target_os = "linux")]
+        workspace,
+    }
 }
 
 /// Watch thread. No thread for Untracked, Nested-with-empty-spec, or a
@@ -372,6 +456,7 @@ fn spawn_watcher(
     child: Option<std::process::Child>,
     procs: Option<crate::launchreg::LiveProcs>,
     on_exit: OnExit,
+    #[cfg(target_os = "linux")] window_stage: Option<WindowStage>,
 ) -> Option<std::thread::JoinHandle<()>> {
     // Untracked: nothing to observe. Nested with a spec: watch the game;
     // node-death misses a Steam launch that nests the resident client.
@@ -392,18 +477,176 @@ fn spawn_watcher(
     {
         std::thread::Builder::new()
             .name("pf1-gamelease".into())
-            .spawn(move || watch(shared, child, procs, on_exit))
+            .spawn(move || {
+                watch(
+                    shared,
+                    child,
+                    procs,
+                    on_exit,
+                    #[cfg(target_os = "linux")]
+                    window_stage,
+                )
+            })
             .ok()
     }
 }
 
-/// Wait for the game to appear, then for it to stay gone.
+/// Looks for the game's own window each poll, until it finds one.
+///
+/// Shares phase 2's tick rather than a thread of its own. The compositor's
+/// change token keeps an idle desk from spawning `hyprctl` every second; a
+/// backend with no token is read each time.
+#[cfg(target_os = "linux")]
+struct WindowWatch {
+    stage: WindowStage,
+    /// Last token seen. `None` re-reads: either nothing has been read yet, or
+    /// this backend cannot say when its windows moved.
+    token: Option<u64>,
+}
+
+#[cfg(target_os = "linux")]
+impl WindowWatch {
+    fn new(stage: WindowStage) -> Self {
+        WindowWatch { stage, token: None }
+    }
+
+    /// One tick. `true` once the window is found and the stage is spent —
+    /// placement is applied exactly once, on the first window.
+    fn poll(&mut self, shared: &Arc<LeaseShared>, live: &[crate::procscan::ProcRef]) -> bool {
+        let now = crate::vdisplay::toplevels_token(self.stage.head.compositor);
+        // A token that has not moved means no window opened, closed or was
+        // retitled since the last read, so the answer cannot have changed.
+        if now.is_some() && now == self.token {
+            return false;
+        }
+        self.token = now;
+        let all = crate::vdisplay::list_all_toplevels(self.stage.head.compositor);
+        let Some(win) = all.iter().find(|w| is_game_window(w, live, &shared.spec)) else {
+            return false;
+        };
+        shared.set_state(GameState::Window);
+        crate::events::emit(crate::events::EventKind::GameWindow {
+            game: game_event_ref(shared),
+            title: win.title.clone(),
+            app_id: win.app_id.clone(),
+        });
+        tracing::info!(
+            title = %shared.game.title,
+            window = %win.title,
+            app_id = %win.app_id,
+            output = %win.output,
+            "the launched game is on screen"
+        );
+        apply_on_window(&self.stage, win);
+        true
+    }
+}
+
+/// Is this toplevel the game's, rather than the launcher that opened it?
+///
+/// Pid first — that is the distinction the lease already makes, and Steam or
+/// Faugus opening before the game is not in `live`. Class is the fallback for
+/// a game whose window belongs to a pid the scan never adopted.
+#[cfg(target_os = "linux")]
+fn is_game_window(
+    win: &crate::vdisplay::Toplevel,
+    live: &[crate::procscan::ProcRef],
+    spec: &crate::library::DetectSpec,
+) -> bool {
+    if win.pid.is_some_and(|p| live.iter().any(|r| r.pid == p)) {
+        return true;
+    }
+    // Steam names an Xwayland game's class for its appid; a Wayland-native one
+    // usually sets the same app_id.
+    if let Some(app) = spec.steam_appid {
+        if win.app_id.eq_ignore_ascii_case(&format!("steam_app_{app}")) {
+            return true;
+        }
+    }
+    // The operator-typed name, matched the way `procscan` matches it: the image
+    // name, case-insensitively, with a Windows-style suffix tolerated.
+    spec.process_name.as_deref().is_some_and(|want| {
+        let want = want.strip_suffix(".exe").unwrap_or(want);
+        !want.is_empty() && win.app_id.eq_ignore_ascii_case(want)
+    })
+}
+
+/// Place the game's first window per the entry's `on_window`.
+///
+/// Best-effort and once: every step is a log line on refusal, and none of them
+/// is worth failing a launch that is already on screen.
+#[cfg(target_os = "linux")]
+fn apply_on_window(stage: &WindowStage, win: &crate::vdisplay::Toplevel) {
+    let head = &stage.head;
+    let on = &stage.on_window;
+    if on.wants_stream_output() && win.output != head.output {
+        match crate::vdisplay::move_toplevel_to_output(head.compositor, &win.id, &head.output) {
+            Ok(()) => tracing::info!(
+                from = %win.output, to = %head.output,
+                "carried the game's window onto the streamed head"
+            ),
+            Err(e) => tracing::warn!(
+                from = %win.output, to = %head.output, error = %format!("{e:#}"),
+                "game window not moved onto the streamed head — the player sees the desktop it \
+                 opened on instead"
+            ),
+        }
+    }
+    for (want, verb) in [
+        (on.wants_focus(), crate::vdisplay::WindowVerb::Focus),
+        (
+            on.wants_fullscreen(),
+            crate::vdisplay::WindowVerb::Fullscreen,
+        ),
+    ] {
+        if !want {
+            continue;
+        }
+        if let Err(e) = crate::vdisplay::window_action(head.compositor, &head.output, verb, &win.id)
+        {
+            tracing::warn!(
+                verb = verb.as_str(), error = %format!("{e:#}"),
+                "on_window step not applied to the game's window"
+            );
+        }
+    }
+}
+
+/// The launch exited on the spot: say so, and un-launch the registry record so
+/// the next attempt starts the title instead of adopting a corpse. That drop is
+/// what turns "needs a host restart" into "press it again".
+///
+/// Not [`finish`]: nothing ran, so there is no play time to credit and no game
+/// exit to end the session on.
+fn report_early_exit(shared: &LeaseShared, code: Option<i32>, ran: Duration) {
+    let said = early_exit_message(&shared.game.title, code, ran.as_secs_f32());
+    tracing::warn!(
+        title = %shared.game.title,
+        status = ?code,
+        ran_s = ran.as_secs_f32(),
+        "the launch command exited on the spot and nothing of this title is on the box — \
+         reporting the launch as failed and un-launching its record"
+    );
+    shared.set_state(GameState::Exited);
+    if let Some(p) = &shared.procs {
+        crate::launchreg::unlaunched(p);
+    }
+    if let Some(tx) = &shared.outcome {
+        let _ = tx.send(punktfunk_core::quic::LaunchOutcome::new(
+            punktfunk_core::quic::LaunchOutcomeKind::Failed,
+            &said,
+        ));
+    }
+}
+
+/// Wait for the game to appear, then for its window, then for it to stay gone.
 #[cfg(any(target_os = "linux", windows))]
 fn watch(
     shared: Arc<LeaseShared>,
     mut child: Option<std::process::Child>,
     procs: Option<crate::launchreg::LiveProcs>,
     on_exit: OnExit,
+    #[cfg(target_os = "linux")] window_stage: Option<WindowStage>,
 ) {
     let scanner = crate::procscan::Scanner::system();
     let cancelled = || shared.cancel.load(Ordering::Relaxed);
@@ -526,6 +769,10 @@ fn watch(
                         // Outlived the window, or failed. Game is gone; only
                         // a success after a real run counts as "played".
                         kind = fallback_kind();
+                        if died_on_the_spot(quick, status.success(), &kind) {
+                            report_early_exit(&shared, status.code(), spawned_at.elapsed());
+                            return;
+                        }
                         if matches!(kind, LeaseKind::Untracked) {
                             if spawned_at.elapsed() >= SHIM_WINDOW {
                                 shared.was_running.store(true, Ordering::Relaxed);
@@ -602,7 +849,11 @@ fn watch(
         std::thread::sleep(POLL);
     }
 
-    // Phase 2: wait for it to stay gone across [`EXIT_CONFIRM`].
+    // Phase 2: wait for the window, then for it to stay gone across
+    // [`EXIT_CONFIRM`]. The window watch shares this poll: a game that never
+    // shows one must still be exit-watched.
+    #[cfg(target_os = "linux")]
+    let mut stage = window_stage.map(WindowWatch::new);
     let mut run = credit.map(|id| RunClock::since(id, Instant::now()));
     let mut gone_since: Option<Instant> = None;
     let mut vetoed = false;
@@ -646,6 +897,12 @@ fn watch(
                 still
             }
         };
+        #[cfg(target_os = "linux")]
+        if let Some(w) = stage.as_mut() {
+            if w.poll(&shared, &live) {
+                stage = None;
+            }
+        }
         if !live.is_empty() || child_alive {
             publish(&live);
             known = live;
@@ -1438,6 +1695,11 @@ mod tests {
             launch_stamp: None,
             // Unrecorded; nothing here spawns.
             procs: None,
+            #[cfg(target_os = "linux")]
+            workspace: None,
+            #[cfg(target_os = "linux")]
+            window_stage: None,
+            outcome: None,
         }
     }
 
@@ -1619,6 +1881,83 @@ mod tests {
         let _ = victim.wait();
     }
 
+    /// The one rule that separates the reporter's dead launch from a Proton
+    /// prefix build: a *failing* exit inside the shim window with nothing left
+    /// to recognize. A launcher hands off with success and keeps its grace; a
+    /// title with detect signals keeps its grace whatever its wrapper did.
+    #[test]
+    fn only_a_failing_exit_with_nothing_left_to_watch_is_a_dead_launch() {
+        assert!(died_on_the_spot(true, false, &LeaseKind::Untracked));
+
+        // A launcher handing off. This is every Steam and Heroic launch.
+        assert!(!died_on_the_spot(true, true, &LeaseKind::Untracked));
+        // The game is recognizable another way — the scan gets START_GRACE.
+        assert!(!died_on_the_spot(true, false, &LeaseKind::Matched));
+        assert!(!died_on_the_spot(true, false, &LeaseKind::Reported));
+        // Past the shim window it ran; that exit is the game's, not a failure
+        // to start, and `finish` reports it with the play time.
+        assert!(!died_on_the_spot(false, false, &LeaseKind::Untracked));
+        assert!(!died_on_the_spot(false, true, &LeaseKind::Untracked));
+    }
+
+    /// The shell's own two codes are named; anything else gets how long it lasted.
+    #[test]
+    fn a_dead_launch_says_what_the_player_can_act_on() {
+        assert_eq!(
+            early_exit_message("Quail", Some(127), 0.2),
+            "Couldn't start Quail \u{2014} this host doesn't have that command."
+        );
+        assert_eq!(
+            early_exit_message("Quail", Some(126), 0.2),
+            "Couldn't start Quail \u{2014} this host can't run that command."
+        );
+        assert_eq!(
+            early_exit_message("Quail", Some(1), 0.24),
+            "Couldn't start Quail \u{2014} it closed again after 0.2 s."
+        );
+        // Killed by a signal: no code, same shape.
+        assert!(early_exit_message("Quail", None, 1.0).starts_with("Couldn't start Quail"));
+    }
+
+    /// The whole of ask 2 in one place: the client hears `failed`, and the
+    /// record stops covering — so the retry that follows starts the title
+    /// instead of adopting the launch that just died.
+    #[test]
+    fn a_dead_launch_is_reported_and_stops_covering_the_next_attempt() {
+        let (fp, app) = (Some("fp-dead"), Some("custom:dead"));
+        let first = crate::launchreg::claim(fp, app, false, Some(10.0));
+        first.launched();
+        let procs = first.procs().expect("recorded");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let lease = open(
+            LeaseRequest {
+                procs: Some(procs),
+                outcome: Some(tx),
+                ..req(app.unwrap(), DetectSpec::default(), false)
+            },
+            Box::new(|| {}),
+        );
+        let shared = lease.shared();
+        report_early_exit(&shared, Some(127), Duration::from_millis(200));
+
+        let said = rx.try_recv().expect("the client is told");
+        assert_eq!(said.kind, punktfunk_core::quic::LaunchOutcomeKind::Failed);
+        assert!(
+            said.message.contains("doesn't have that command"),
+            "{said:?}"
+        );
+        assert_eq!(shared.state(), GameState::Exited);
+
+        let retry = crate::launchreg::claim(fp, app, false, Some(99.0));
+        assert!(
+            retry.must_spawn(),
+            "the attempt after a dead launch must start the title, not adopt it"
+        );
+        retry.abandon();
+        drop(first);
+    }
+
     #[test]
     fn an_untracked_lease_is_never_terminated() {
         let l = open(
@@ -1733,6 +2072,11 @@ mod tests {
                 spawned: None,
                 launch_stamp: None,
                 procs: None,
+                #[cfg(target_os = "linux")]
+                workspace: None,
+                #[cfg(target_os = "linux")]
+                window_stage: None,
+                outcome: None,
             },
             Box::new(|| {
                 EXITS.fetch_add(1, Ordering::SeqCst);
@@ -1973,6 +2317,11 @@ mod tests {
                 spawned: None,
                 launch_stamp,
                 procs: None,
+                #[cfg(target_os = "linux")]
+                workspace: None,
+                #[cfg(target_os = "linux")]
+                window_stage: None,
+                outcome: None,
             },
             Box::new(|| {
                 EXITS.fetch_add(1, Ordering::SeqCst);
@@ -2027,8 +2376,79 @@ mod tests {
         assert_eq!(GameState::Exited.as_str(), "exited");
         assert_eq!(GameState::Untracked.as_str(), "untracked");
         assert_eq!(GameState::from_u8(1), GameState::Running);
+        assert_eq!(GameState::Window.as_str(), "window");
         assert_eq!(GameState::from_u8(3), GameState::Untracked);
+        assert_eq!(GameState::from_u8(4), GameState::Window);
         assert_eq!(GameState::from_u8(99), GameState::Launching);
+    }
+
+    /// A toplevel fixture; only the fields the matcher reads matter.
+    #[cfg(target_os = "linux")]
+    fn win(pid: Option<u32>, app_id: &str) -> crate::vdisplay::Toplevel {
+        crate::vdisplay::Toplevel {
+            id: "0x1".into(),
+            title: "t".into(),
+            app_id: app_id.into(),
+            pid,
+            focused: false,
+            fullscreen: false,
+            workspace: "1".into(),
+            output: "PF-1".into(),
+        }
+    }
+
+    /// The launcher that opens before the game is not the game's window: its
+    /// pid is not in the lease's, and its class is Steam's, not the appid's.
+    /// This is the whole point of the stage — landing on Steam's own window
+    /// would fire `game.window` while the game is still building a prefix.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_launchers_window_is_never_mistaken_for_the_games() {
+        let live = [crate::procscan::ProcRef {
+            pid: 4242,
+            start: 1,
+        }];
+        let spec = crate::library::DetectSpec::steam(570);
+        // The game: its pid was adopted by the scan.
+        assert!(is_game_window(
+            &win(Some(4242), "steam_app_570"),
+            &live,
+            &spec
+        ));
+        // Steam itself: live pid, but not one of ours.
+        assert!(!is_game_window(&win(Some(99), "steam"), &live, &spec));
+        // The game, on a pid the scan never adopted: the appid class carries it.
+        assert!(is_game_window(
+            &win(Some(77), "steam_app_570"),
+            &live,
+            &spec
+        ));
+        // A different game's window, same launcher.
+        assert!(!is_game_window(
+            &win(Some(78), "steam_app_1234"),
+            &live,
+            &spec
+        ));
+        // A window with no pid and no class we know is nobody's.
+        assert!(!is_game_window(&win(None, ""), &live, &spec));
+    }
+
+    /// The operator-typed name matches the way `procscan` matches it, and an
+    /// empty `process_name` must never match every window on the desk.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_typed_process_name_matches_a_class_without_matching_everything() {
+        let spec = crate::library::DetectSpec {
+            process_name: Some("Celeste.exe".into()),
+            ..Default::default()
+        };
+        assert!(is_game_window(&win(Some(5), "celeste"), &[], &spec));
+        assert!(!is_game_window(&win(Some(5), "steam"), &[], &spec));
+        let blank = crate::library::DetectSpec {
+            process_name: Some(String::new()),
+            ..Default::default()
+        };
+        assert!(!is_game_window(&win(Some(5), ""), &[], &blank));
     }
 
     /// Empty spec must report Untracked, never Running.

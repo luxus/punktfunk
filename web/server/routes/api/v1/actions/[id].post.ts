@@ -13,7 +13,7 @@ import { forwardJson } from "../../../../util/forward";
 export default defineEventHandler(async (event) => {
 	const id = getRouterParam(event, "id") ?? "";
 	const body = await readBody<{ password?: string }>(event);
-	confirmPassword(event, body?.password);
+	await confirmPassword(event, body?.password);
 	return forwardJson(
 		event,
 		`/api/v1/actions/${encodeURIComponent(id)}`,

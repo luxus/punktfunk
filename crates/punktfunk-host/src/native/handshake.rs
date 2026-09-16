@@ -291,6 +291,9 @@ pub(super) async fn negotiate(
     u16,
     Option<std::net::UdpSocket>,
     Start,
+    // What the client calls itself (`EXT_TAG_CLIENT` on `Start`); `None` from one that sent no
+    // block. Log only: two dialers from one device are told apart by that line.
+    Option<String>,
     Option<crate::vdisplay::Compositor>,
     // Gamescope sub-mode as a value, not process env — a concurrent connect would overwrite env.
     Option<crate::vdisplay::GamescopeRoute>,
@@ -655,7 +658,9 @@ pub(super) async fn negotiate(
                 punktfunk_core::quic::HOST_CAP2_TOUCH
             } else {
                 0
-            },
+            }
+            // Invites the client's `Start` extension block, which is where it names itself.
+            | punktfunk_core::quic::HOST_CAP2_EXT,
     };
     io::write_msg(send, &welcome.encode()).await?;
     bringup.mark("welcome");
@@ -729,8 +734,16 @@ pub(super) async fn negotiate(
         _ => None,
     };
 
-    let start =
-        Start::decode(&io::read_msg(recv).await?).map_err(|e| anyhow!("Start decode: {e:?}"))?;
+    let start_msg = io::read_msg(recv).await?;
+    let start = Start::decode(&start_msg).map_err(|e| anyhow!("Start decode: {e:?}"))?;
+    // What the client calls itself, when it sent one. A label for the log: a bad block fails the
+    // handshake (`decode_ext`'s rule), an unknown tag is skipped, and absence says nothing.
+    let client_label = Start::decode_ext(&start_msg)
+        .map_err(|e| anyhow!("Start extensions: {e:?}"))?
+        .into_iter()
+        .find(|(tag, _)| *tag == punktfunk_core::quic::EXT_TAG_CLIENT)
+        .map(|(_, v)| punktfunk_core::quic::client_label(&String::from_utf8_lossy(v)))
+        .filter(|s| !s.is_empty());
     bringup.mark("start");
     // `wire_mtu::spawn_watch` is started by `serve_session` once the control-task channels
     // exist; it also drives mid-session shard renegotiation (needs the control writer).
@@ -740,6 +753,7 @@ pub(super) async fn negotiate(
         udp_port,
         data_sock,
         start,
+        client_label,
         compositor,
         gamescope_route,
         prep,
@@ -801,10 +815,10 @@ async fn negotiate_video_format(
     // that latch is per-source and this gate already used this session's source.
     let capture_supports_hdr = crate::capture::capturer_supports_hdr_for(compositor);
     // SDR-10: Windows IDD expands BGRA 8→10 (`Rgb10a2Sdr`); only direct-NVENC ingests that
-    // packed RGB. HEVC only — NVENC packed-RGB → 10-bit AV1 is unverified. Linux has no
-    // SDR-10 chain (`resolved_backend_ingests_rgb_444` is false off Windows).
+    // packed RGB. Linux has no SDR-10 chain (`resolved_backend_ingests_rgb_444` is false off
+    // Windows).
     let sdr10_chain_ok =
-        codec == crate::encode::Codec::H265 && crate::encode::resolved_backend_ingests_rgb_444();
+        codec_carries_sdr10(codec) && crate::encode::resolved_backend_ingests_rgb_444();
     let depth_reachable = (client_wants_hdr && capture_supports_hdr) || sdr10_chain_ok;
     // Probe may open a tiny encoder; spawn_blocking, short-circuited behind the cheap gates.
     let gpu_can_10bit =
@@ -934,6 +948,15 @@ fn linux_chroma_under_hdr(
     crate::encode::ChromaFormat::Yuv420
 }
 
+/// Codecs that carry 10-bit SDR off the packed-RGB capture. PyroWave is out: that capture path
+/// hands it NV12 under SDR, so a 10-bit label would outrun the stream.
+fn codec_carries_sdr10(codec: crate::encode::Codec) -> bool {
+    matches!(
+        codec,
+        crate::encode::Codec::H265 | crate::encode::Codec::Av1
+    )
+}
+
 /// Whether Hello carried a format at all. Decode maps an absent one to 48 kHz/16-bit, so
 /// that pair (or a bare zero) is "nothing asked" — the rule `Hello::encode` applies.
 fn audio_format_asked(rate_hz: u32, bits: u8) -> bool {
@@ -1001,6 +1024,16 @@ mod tests {
         assert_eq!(linux_chroma_under_hdr(Yuv444, true), Yuv420);
         assert_eq!(linux_chroma_under_hdr(Yuv444, false), Yuv444);
         assert_eq!(linux_chroma_under_hdr(Yuv420, true), Yuv420);
+    }
+
+    /// AV1 carries 10-bit SDR like HEVC; PyroWave captures NV12 under SDR, so it must not.
+    #[test]
+    fn av1_carries_sdr10_and_pyrowave_does_not() {
+        use crate::encode::Codec;
+        assert!(codec_carries_sdr10(Codec::Av1));
+        assert!(codec_carries_sdr10(Codec::H265));
+        assert!(!codec_carries_sdr10(Codec::PyroWave));
+        assert!(!codec_carries_sdr10(Codec::H264));
     }
 
     /// 1472-byte discovery ceiling minus QUIC header + AEAD. Same number `pcm`'s ladder test uses.

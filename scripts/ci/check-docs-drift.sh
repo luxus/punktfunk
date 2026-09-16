@@ -243,6 +243,46 @@ if [ "$wi_secs" -lt 2 ] || [ "$wi_secs" -ge 30 ]; then
     echo "::error::web-init.sh returned after ${wi_secs}s — expected it to wait for the files (>=2s) and stop as soon as they landed (<30s)"
     fail=1
 fi
+# ------------------------------------- the bind line, which decides whether the console disappears
+#
+# The console binds loopback unless host.env's PUNKTFUNK_UI_BIND says otherwise, and before 0.38 it
+# bound every interface with no way to say so. web-init.sh is where an upgrade writes that down, so
+# a box someone reaches from another device keeps working. Getting this branch backwards either
+# takes a live console off the LAN or puts a fresh one on it — both silent, hence a gate.
+bind_of() { sed -n 's/^PUNKTFUNK_UI_BIND=//p' "$1/punktfunk/host.env" 2>/dev/null | tail -n1; }
+bind_case() {
+    _got=$(bind_of "$2")
+    [ "$_got" = "$3" ] && return
+    echo "::error::web-init.sh ($1): PUNKTFUNK_UI_BIND is '$_got', expected '$3'"
+    fail=1
+}
+
+# A first start — no console has run here, so nothing is taken away by binding loopback.
+mkdir -p "$wi/bind-fresh/punktfunk"
+seed_token "$wi/bind-fresh"
+seed_pair "$wi/bind-fresh" native-
+run_web_init 1 "$wi/bind-fresh"
+bind_case "fresh install" "$wi/bind-fresh" 127.0.0.1
+
+# An upgrade: web-password is already there, so a console served this box under the old default.
+mkdir -p "$wi/bind-upgrade/punktfunk"
+seed_token "$wi/bind-upgrade"
+seed_pair "$wi/bind-upgrade" native-
+printf 'PUNKTFUNK_UI_PASSWORD=hunter2\n' > "$wi/bind-upgrade/punktfunk/web-password"
+run_web_init 1 "$wi/bind-upgrade"
+bind_case "upgrade keeps the reach it had" "$wi/bind-upgrade" 0.0.0.0
+
+# An operator's answer is never rewritten, and a second run never appends a second line.
+mkdir -p "$wi/bind-set/punktfunk"
+seed_token "$wi/bind-set"
+seed_pair "$wi/bind-set" native-
+printf 'PUNKTFUNK_UI_BIND=100.64.0.3\n' > "$wi/bind-set/punktfunk/host.env"
+run_web_init 1 "$wi/bind-set"
+run_web_init 1 "$wi/bind-set"
+bind_case "an existing line wins" "$wi/bind-set" 100.64.0.3
+_n=$(grep -c '^PUNKTFUNK_UI_BIND=' "$wi/bind-set/punktfunk/host.env")
+[ "$_n" = 1 ] || { echo "::error::web-init.sh wrote PUNKTFUNK_UI_BIND $_n times"; fail=1; }
+
 rm -rf "$wi"
 
 exit "$fail"

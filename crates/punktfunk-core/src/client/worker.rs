@@ -101,6 +101,9 @@ pub(crate) struct WorkerArgs {
     pub(crate) decode_lat: Arc<Mutex<DecodeLatAcc>>,
     /// Encoder-target mirror. Seeded from Welcome; updated on every `BitrateChanged` ack.
     pub(crate) live_bitrate: Arc<AtomicU32>,
+    /// Mute mask the control task ORs [`crate::client::AUDIO_MUTE_HOST`] into on every
+    /// `AudioState`. The embedder's own bit rides the same cell.
+    pub(crate) audio_mute: Arc<AtomicU8>,
     /// Live grants. Seeded from the Welcome advert; every `AccessUpdate` overwrites
     /// (latest wins).
     pub(crate) access_grants: Arc<AtomicU32>,

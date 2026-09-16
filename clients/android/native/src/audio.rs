@@ -1113,7 +1113,7 @@ fn decode_loop(
             return DecodeExit::Disconnected;
         }
         let step = match client.next_audio(tick) {
-            Ok(pkt) => plane.on_packet(client, &pkt),
+            Ok(pkt) => plane.on_packet(&pkt),
             Err(PunktfunkError::NoFrame) => plane.on_quiet(),
             Err(_) => return DecodeExit::SessionClosed,
         };
@@ -1127,6 +1127,9 @@ fn decode_loop(
 /// One decoding audio plane: the decoder and its scratch, the gap + drought concealment, the
 /// A/V placement, and the ring it pushes into.
 struct Plane<'a> {
+    /// Read per push for the mute mask — a local mute zeroes what is queued, never what is
+    /// decoded, so the decoder keeps its state and unmute lands in step.
+    client: &'a NativeClient,
     live: &'a LiveStream,
     counters: &'a Counters,
     fmt: SessionAudio,
@@ -1153,7 +1156,7 @@ struct Plane<'a> {
 
 impl<'a> Plane<'a> {
     fn new(
-        client: &NativeClient,
+        client: &'a NativeClient,
         live: &'a LiveStream,
         counters: &'a Counters,
         fmt: SessionAudio,
@@ -1202,6 +1205,7 @@ impl<'a> Plane<'a> {
             );
         }
         Ok(Plane {
+            client,
             live,
             counters,
             fmt,
@@ -1225,7 +1229,9 @@ impl<'a> Plane<'a> {
     }
 
     /// Hand `pcm[..n]` to the ring in a recycled buffer (allocating only when the free-list is
-    /// momentarily empty: startup / after a backpressure drop). Full = drop-newest.
+    /// momentarily empty: startup / after a backpressure drop). Full = drop-newest. A muted
+    /// stream queues the same length in silence, so the ring keeps its cadence and the device
+    /// is never closed and reopened on a toggle.
     fn push(&mut self, n: usize) -> Result<(), DecodeExit> {
         let mut buf = self
             .live
@@ -1233,7 +1239,11 @@ impl<'a> Plane<'a> {
             .try_recv()
             .unwrap_or_else(|_| Vec::with_capacity(self.pcm.len()));
         buf.clear();
-        buf.extend_from_slice(&self.pcm[..n]);
+        if self.client.audio_muted() {
+            buf.resize(n, 0.0);
+        } else {
+            buf.extend_from_slice(&self.pcm[..n]);
+        }
         match self.live.tx.try_send(buf) {
             Ok(()) | Err(TrySendError::Full(_)) => Ok(()),
             Err(TrySendError::Disconnected(_)) => Err(DecodeExit::Shutdown),
@@ -1259,7 +1269,7 @@ impl<'a> Plane<'a> {
 
     /// Place the packet against the picture, conceal any seq gap in front of it, decode it into
     /// the ring, and keep the 1 Hz line.
-    fn on_packet(&mut self, client: &NativeClient, pkt: &AudioPacket) -> Result<(), DecodeExit> {
+    fn on_packet(&mut self, pkt: &AudioPacket) -> Result<(), DecodeExit> {
         // BEFORE it is queued: `buffered_ahead` is everything that must still play first, so
         // the depth read here is exactly what delays it. Published unconditionally — the ring's
         // depth is what makes a "the audio delay is way too high" report triageable at all.
@@ -1273,7 +1283,7 @@ impl<'a> Plane<'a> {
             self.av.observe(punktfunk_core::audio::AvSyncObservation {
                 pts_ns: pkt.pts_ns,
                 now_local_ns: punktfunk_core::client::now_realtime_ns(),
-                clock_offset_ns: client.clock_offset_now_ns(),
+                clock_offset_ns: self.client.clock_offset_now_ns(),
                 buffered_ahead: depth,
                 // 0 = nothing confirmed on the glass yet (no render callback below API 33, or
                 // the stream has not presented a frame); no reference, no correction.

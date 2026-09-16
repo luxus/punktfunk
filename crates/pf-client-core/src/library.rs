@@ -391,8 +391,10 @@ pub fn invalidate_running(fp_hex: &str) {
 }
 
 /// 16 MiB. Steam heroes are a few MB; larger is not an image for the decoder.
+/// [`crate::art_cache`] holds the same ceiling, so disk never serves what the
+/// network would have refused.
 #[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
-const ART_MAX_BYTES: u64 = 16 * 1024 * 1024;
+pub(crate) const ART_MAX_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Host-origin URLs (`base` prefix) use the pinned mTLS agent; the art proxy
 /// requires the paired cert. Any other origin (custom-entry CDN) uses ureq's
@@ -424,9 +426,10 @@ pub fn fetch_art(pinned: &ureq::Agent, base: &str, url: &str) -> Result<Vec<u8>,
 #[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
 const ART_WORKERS: usize = 3;
 
-/// Walk each job's candidate URLs until one loads; results arrive on the
-/// returned channel. Drop the receiver to stop the workers (page popped).
-/// Consumer decodes textures on the main loop.
+/// Walk each job's candidate URLs until one loads — [`crate::art_cache`] first,
+/// then the network, which writes what it fetched back. Results arrive on the
+/// returned channel; drop the receiver to stop the workers (page popped).
+/// Consumer decodes textures on the main loop, cached bytes included.
 #[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
 pub fn spawn_art_fetch(
     base: String,
@@ -457,12 +460,22 @@ pub fn spawn_art_fetch(
                     }
                     let job = queue.lock().unwrap().pop_front();
                     let Some((id, candidates)) = job else { break };
+                    // Every candidate is asked of disk before any of them is asked of the
+                    // network: last launch's winner is often the second URL, and walking in
+                    // order would spend a round trip on the first one's known miss.
+                    if let Some(bytes) = candidates.iter().find_map(|u| crate::art_cache::load(u)) {
+                        if tx.send_blocking((id, bytes)).is_err() {
+                            return;
+                        }
+                        continue;
+                    }
                     for url in &candidates {
                         if tx.is_closed() {
                             return;
                         }
                         match fetch_art(&agent, &base, url) {
                             Ok(bytes) => {
+                                crate::art_cache::store(url, &bytes);
                                 // Receiver dropped (page popped) — stop fetching.
                                 if tx.send_blocking((id, bytes)).is_err() {
                                     return;

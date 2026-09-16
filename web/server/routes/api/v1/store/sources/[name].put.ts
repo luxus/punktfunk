@@ -16,7 +16,7 @@ interface SourceBody {
 
 export default defineEventHandler(async (event) => {
 	const body = await readBody<SourceBody>(event);
-	confirmPassword(event, body?.password);
+	await confirmPassword(event, body?.password);
 	const name = getRouterParam(event, "name") ?? "";
 	// Rebuild the body from known fields so the password cannot leak upstream.
 	const upstream: { url: string; public_key?: string } = {

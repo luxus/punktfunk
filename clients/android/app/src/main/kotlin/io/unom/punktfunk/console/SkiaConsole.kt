@@ -42,9 +42,11 @@ import io.unom.punktfunk.kit.security.KnownHost
 import io.unom.punktfunk.kit.security.KnownHostStore
 import io.unom.punktfunk.kit.security.obtainIdentity
 import io.unom.punktfunk.models.ActiveSession
+import java.io.File
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
+import okhttp3.Cache
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONArray
@@ -93,7 +95,11 @@ object SkiaConsole {
     private val main = Handler(Looper.getMainLooper())
     private val ioPool = Executors.newCachedThreadPool { r -> Thread(r, "pf-console-io").apply { isDaemon = true } }
     private val artPool = Executors.newFixedThreadPool(3) { r -> Thread(r, "pf-console-art").apply { isDaemon = true } }
-    private val artHttp by lazy { OkHttpClient() }
+    /** One disk cache behind both art clients: the host proxy sends `Cache-Control` + `ETag`, a
+     *  CDN its own, and OkHttp honours either, so a shelf revisit is a 304 at most. Null before
+     *  `init`: no context, no cache, fetches still work. */
+    private val artCache: Cache? by lazy { appContext?.let { Cache(File(it.cacheDir, "art-http"), 64L shl 20) } }
+    private val artHttp by lazy { OkHttpClient.Builder().cache(artCache).build() }
     private var eventThread: Thread? = null
     private val running = AtomicBoolean(false)
 
@@ -699,7 +705,11 @@ object SkiaConsole {
         ioPool.execute {
             val timeout = if (requestAccess) REQUEST_ACCESS_TIMEOUT_MS else CONNECT_TIMEOUT_MS
             val h = kotlinx.coroutines.runBlocking {
-                connectToHost(app, effective, id, addr, port, fp, launchId, timeout)
+                connectToHost(
+                    app, effective, id, addr, port, fp, launchId,
+                    dialer = if (launchId != null) "console/library" else "console/desktop",
+                    timeoutMs = timeout,
+                )
             }
             main.post {
                 if (d.cancelled.get()) {
@@ -740,10 +750,14 @@ object SkiaConsole {
                     // swap the console for the stream view mid-wait, which is the seam this
                     // whole screen exists to remove. `ShowStream` releases it.
                     NativeBridge.nativeConsoleSessionPhase(handle, 1, "")
-                    if (holdsLaunch) {
-                        pendingSession = session
-                    } else {
-                        onConnected?.invoke(session)
+                    val take = onConnected
+                    when {
+                        holdsLaunch -> pendingSession = session
+                        take != null -> take(session)
+                        // Nothing on screen to hand it to (the console is parked behind a
+                        // stream): close it rather than leave the host feeding a session
+                        // nobody will ever see.
+                        else -> ioPool.execute { NativeBridge.nativeClose(h) }
                     }
                 } else {
                     val token = NativeBridge.nativeTakeLastError()
@@ -1096,7 +1110,7 @@ object SkiaConsole {
     private fun fetchArt(candidates: List<String>, id: ClientIdentity, addr: String, fp: String): ByteArray? {
         for (url in candidates) {
             val client = if (url.contains(addr)) {
-                runCatching { io.unom.punktfunk.kit.library.mtlsHttpClient(id.certPem, id.privateKeyPem, addr, fp) }.getOrNull() ?: continue
+                runCatching { io.unom.punktfunk.kit.library.mtlsHttpClient(id.certPem, id.privateKeyPem, addr, fp, artCache) }.getOrNull() ?: continue
             } else artHttp
             val bytes = runCatching {
                 client.newCall(Request.Builder().url(url).build()).execute().use { resp ->

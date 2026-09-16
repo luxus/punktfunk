@@ -18,7 +18,7 @@ export default defineEventHandler(async (event) => {
 		peer_ip?: string;
 		password?: string;
 	}>(event);
-	confirmPassword(event, body?.password);
+	await confirmPassword(event, body?.password);
 	// Rebuild from exactly the fields the host takes, so the password cannot leak upstream.
 	// uniqueid/fingerprint address the PIN to one parked ceremony — the one the operator SAW in
 	// the pairing status — instead of whichever handshake is parked at delivery time

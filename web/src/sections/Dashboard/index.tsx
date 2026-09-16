@@ -7,6 +7,10 @@ import type { ActiveGame } from "@/api/gen/model/activeGame";
 import {
 	useEndGame,
 	useRequestIdr,
+	useRequestSessionIdr,
+	useSetSessionAccess,
+	useSetSessionAudio,
+	useStopOneSession,
 	useStopSession,
 } from "@/api/gen/session/session";
 import { useDialogs } from "@/components/dialogs";
@@ -40,6 +44,12 @@ export const SectionDashboard: FC = () => {
 	const stop = useStopSession();
 	const idr = useRequestIdr();
 	const endGame = useEndGame();
+	// The per-session verbs. Same actions, one id — the host-wide ones above still mean
+	// "every session", which is what every existing caller expects of them.
+	const stopOne = useStopOneSession();
+	const idrOne = useRequestSessionIdr();
+	const mute = useSetSessionAudio();
+	const access = useSetSessionAccess();
 
 	const invalidate = () =>
 		qc.invalidateQueries({ queryKey: getGetStatusQueryKey() });
@@ -55,12 +65,11 @@ export const SectionDashboard: FC = () => {
 	 * follows the operator's policy — stopping a session is not licence to close a game), while a
 	 * game already waiting out its reconnect window has no session left to stop and is ended directly.
 	 *
-	 * Both paths are wider than the row they are attached to, and neither used to say so:
+	 * A live native row stops its OWN session by id, so ending one person's game no longer kicks
+	 * everyone else off. Two paths are still wider than the row, and both say so before acting:
 	 *
-	 * - `DELETE /session` is the host's ONLY stop and it tears down every live session
-	 *   (mgmt/session.rs calls `quit_session` AND `session_status::stop_all_quit`). With two people
-	 *   streaming, "End now" on one row kicked both. There is no per-session stop to call instead,
-	 *   so the honest fix is to name the blast radius before doing it.
+	 * - a compat-plane row has no session id, and the host's only stop for it is `DELETE /session`,
+	 *   which tears down every live session on both planes.
 	 * - `POST /game/end` with `app_id: null` means "end EVERY waiting game" to the host, and a grace
 	 *   row for an operator-typed command carries no `app_id` — so that row ended all of them.
 	 */
@@ -80,6 +89,13 @@ export const SectionDashboard: FC = () => {
 			endGame.mutate(
 				{ data: { app_id: game.app_id ?? null } },
 				{ onSuccess: invalidate, onError: failed(m.games_end_failed()) },
+			);
+			return;
+		}
+		if (game.session_id != null) {
+			stopOne.mutate(
+				{ id: game.session_id },
+				{ onSuccess: invalidate, onError: failed(m.action_stop_failed()) },
 			);
 			return;
 		}
@@ -119,9 +135,43 @@ export const SectionDashboard: FC = () => {
 				idr.mutate(undefined, { onError: failed(m.action_idr_failed()) })
 			}
 			onEndGame={onEndGame}
+			onStopOne={(row) =>
+				row.id != null &&
+				stopOne.mutate(
+					{ id: row.id },
+					{ onSuccess: invalidate, onError: failed(m.action_stop_failed()) },
+				)
+			}
+			onIdrOne={(row) =>
+				row.id != null &&
+				idrOne.mutate(
+					{ id: row.id },
+					{ onError: failed(m.action_idr_failed()) },
+				)
+			}
+			onMuteOne={(row, muted) =>
+				row.id != null &&
+				mute.mutate(
+					{ id: row.id, data: { muted } },
+					{ onSuccess: invalidate, onError: failed(m.action_mute_failed()) },
+				)
+			}
+			onAccessOne={(row, level) =>
+				row.id != null &&
+				access.mutate(
+					{ id: row.id, data: { level } },
+					{ onSuccess: invalidate, onError: failed(m.access_edit_failed()) },
+				)
+			}
 			isStopping={stop.isPending}
 			isRequestingIdr={idr.isPending}
 			isEndingGame={endGame.isPending || stop.isPending}
+			isChangingSession={
+				stopOne.isPending ||
+				idrOne.isPending ||
+				mute.isPending ||
+				access.isPending
+			}
 		/>
 	);
 };

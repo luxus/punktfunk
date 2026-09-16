@@ -254,6 +254,7 @@ fn run(
                 compositor: Some(compositor),
                 route: gamescope_route.clone(),
                 isolation: None,
+                audio_sink: Default::default(),
             },
         );
         tracing::info!(
@@ -306,6 +307,10 @@ fn run(
         }
         // Keep the child: it is the liveness signal and the termination-ladder handle.
         // Gamescope bare-spawn already nested the command; launching again would start it twice.
+        // Workspace this launch owns on the streamed head; handed to the lease, which
+        // releases it when the game is done.
+        #[cfg(target_os = "linux")]
+        let mut launch_workspace: Option<crate::vdisplay::WorkspaceClaim> = None;
         #[cfg(target_os = "linux")]
         let spawned_launch = match target.as_ref().and_then(|t| t.command.as_deref()) {
             Some(cmd) if adopt_launch => {
@@ -314,22 +319,32 @@ fn run(
                     "gamestream: this client's copy of this title is already running — not starting \
                      a second one"
                 );
+                // The claim belongs to the launch, not to us: go back to the game's
+                // workspace rather than opening an empty one beside it.
+                launch_workspace = launch_claim
+                    .as_ref()
+                    .and_then(|c| c.workspace())
+                    .and_then(|ws| crate::library::adopt_launch_workspace(compositor, ws));
                 None
             }
             Some(_) if crate::vdisplay::launch_is_nested(compositor, gamescope_route.as_ref()) => {
                 spawned_now = true;
                 None
             }
-            Some(cmd) => match crate::library::launch_session_command(compositor, cmd, None) {
-                Ok(spawned) => {
-                    spawned_now = true;
-                    Some(spawned)
+            Some(cmd) => {
+                let own = target.as_ref().is_some_and(|t| t.own_workspace);
+                match crate::library::launch_session_command(compositor, cmd, None, own) {
+                    Ok(mut spawned) => {
+                        spawned_now = true;
+                        launch_workspace = spawned.workspace.take();
+                        Some(spawned)
+                    }
+                    Err(e) => {
+                        tracing::warn!(command = %cmd, error = %e, "gamestream: app not launched");
+                        None
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!(command = %cmd, error = %e, "gamestream: app not launched");
-                    None
-                }
-            },
+            }
             None => None,
         };
         if let Some(c) = launch_claim.as_ref() {
@@ -340,6 +355,11 @@ fn run(
                 }
             } else if c.must_spawn() {
                 c.abandon();
+            }
+            // On the record, not on the session: the next reconnect focuses it.
+            #[cfg(target_os = "linux")]
+            if let Some(ws) = launch_workspace.as_ref() {
+                c.placed(ws.id());
             }
         }
 
@@ -378,6 +398,10 @@ fn run(
                     client: client_label.clone(),
                     plane: crate::events::Plane::Gamestream,
                     spec: t.detect.clone(),
+                    // Native plane only: this one has no per-session head to
+                    // watch, so a Moonlight launch keeps the `running` stage.
+                    #[cfg(target_os = "linux")]
+                    window_stage: None,
                     nested,
                     launcher: t.launcher,
                     child,
@@ -385,6 +409,11 @@ fn run(
                     launch_stamp,
                     // Adopted launch keeps the original slot across the handover.
                     procs: launch_claim.as_ref().and_then(|c| c.procs()),
+                    #[cfg(target_os = "linux")]
+                    workspace: launch_workspace,
+                    // Moonlight has no control channel of ours to say it on; the
+                    // finding stays in the log, as it did before.
+                    outcome: None,
                 },
                 on_exit,
             );
@@ -568,6 +597,8 @@ struct GsApp {
     detect: crate::library::DetectSpec,
     /// `Some` on Linux (host runs it). `None` for a Windows library title (launch by id).
     command: Option<String>,
+    /// Own workspace on the streamed head ([`crate::library::LaunchTarget`]).
+    own_workspace: bool,
 }
 
 /// Resolve a `/launch` catalog entry against the host's own library. The client sends only
@@ -582,6 +613,7 @@ fn resolve_gs_app(app: Option<&super::apps::AppEntry>) -> Option<GsApp> {
                     launcher: t.launcher,
                     detect: t.detect,
                     command: t.command,
+                    own_workspace: t.own_workspace,
                 })
             }
             None => tracing::warn!(
@@ -608,6 +640,8 @@ fn resolve_gs_app(app: Option<&super::apps::AppEntry>) -> Option<GsApp> {
         },
         detect: crate::library::spec_from_command(cmd),
         command: Some(cmd.to_string()),
+        // A bare `apps.json` command names no entry, so the host default decides.
+        own_workspace: crate::library::OnWindow::default().own_workspace(),
     })
 }
 

@@ -137,6 +137,9 @@ pf-update-check = { path = "../pf-update-check", optional = true }
 # aws-lc-rs backend + PQ hybrid key exchange, matching punktfunk-core (see its Cargo.toml for
 # why every crate that names a rustls backend has to name the same one).
 rustls = { version = "0.23", default-features = false, optional = true, features = ["aws_lc_rs", "prefer-post-quantum", "logging", "std", "tls12"] }
+# Art-cache keys (`art_cache`): the SHA-256 of a poster URL. Already in the tree —
+# punktfunk-core's `tls` hashes certificates with the same version.
+sha2 = "0.11"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"

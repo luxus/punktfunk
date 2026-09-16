@@ -263,6 +263,8 @@ mod pool {
         /// Compositor output name ([`VirtualOutput::output_name`]). Kept across
         /// reuse so the reused head answers with the same name as a fresh create.
         pub(super) output_name: Option<String>,
+        /// [`VirtualOutput::input_output`], kept across reuse like `output_name`.
+        pub(super) input_output: Option<String>,
         /// What a `mode_conflict: join` session casts to share this display
         /// (`VirtualDisplay::join_cast`). Unset until the backend knows it.
         pub(super) join_name: Option<crate::backend::JoinName>,
@@ -618,6 +620,7 @@ mod pool {
                 node_id: 0,
                 preferred_mode: None,
                 output_name: None,
+                input_output: None,
                 join_name: None,
                 mode: Mode {
                     width: 1920,
@@ -1184,7 +1187,7 @@ mod linux {
     fn output_for(
         node_id: u32,
         preferred_mode: Option<(u32, u32, u32)>,
-        output_name: Option<String>,
+        (output_name, input_output): (Option<String>, Option<String>),
         seat: Option<String>,
         generation: u64,
         quit: Arc<AtomicBool>,
@@ -1197,6 +1200,7 @@ mod linux {
         );
         // Same head as at create, so it answers with the same name.
         out.output_name = output_name;
+        out.input_output = input_output;
         // Same compositor as at create, so its launches and watches stay on this seat.
         out.seat = seat;
         // First-frame failure on reuse can `mark_failed` instead of re-wedging.
@@ -1293,7 +1297,7 @@ mod linux {
                             let generation = r.generation.fetch_add(1, Ordering::Relaxed);
                             es[idx].generation = generation;
                             let preferred_mode = es[idx].preferred_mode;
-                            let output_name = es[idx].output_name.clone();
+                            let names = (es[idx].output_name.clone(), es[idx].input_output.clone());
                             let seat = es[idx].seat.clone();
                             tracing::info!(
                                 backend,
@@ -1304,7 +1308,7 @@ mod linux {
                             ReuseOutcome::Reused(output_for(
                                 node_id,
                                 preferred_mode,
-                                output_name,
+                                names,
                                 seat,
                                 generation,
                                 quit.clone(),
@@ -1430,6 +1434,7 @@ mod linux {
             node_id,
             preferred_mode,
             output_name: output_name.clone(),
+            input_output: real.input_output.clone(),
             join_name,
             mode,
             backend,
@@ -1485,7 +1490,7 @@ mod linux {
         let mut out = output_for(
             node_id,
             preferred_mode,
-            output_name,
+            (output_name, real.input_output.clone()),
             real.seat.clone(),
             generation,
             quit,
@@ -1528,7 +1533,7 @@ mod linux {
             let out = output_for(
                 e.node_id,
                 e.preferred_mode,
-                e.output_name.clone(),
+                (e.output_name.clone(), e.input_output.clone()),
                 e.seat.clone(),
                 e.generation,
                 quit.clone(),

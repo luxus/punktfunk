@@ -166,6 +166,24 @@ pub enum GameSession {
     Dedicated,
 }
 
+/// Where a library launch's windows open on the streamed head.
+///
+/// Default `own`: the player gets the game on an empty workspace instead of
+/// the operator's desk. Honoured only by the backends that can place a launch
+/// (`claim_workspace`); everywhere else a launch is always `current`.
+///
+/// [`DisplayPolicy`] field, not part of [`EffectivePolicy`]: a preset never
+/// clobbers it. A library entry's own `on_window.workspace` outranks it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspacePlacement {
+    /// An empty workspace on the streamed head, released with the launch.
+    #[default]
+    Own,
+    /// Whatever the head already shows.
+    Current,
+}
+
 /// Named bundle of the fields below. `Custom` uses the explicit fields;
 /// any other preset ignores them and expands ([`DisplayPolicy::effective`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -214,6 +232,11 @@ pub struct DisplayPolicy {
     /// `Auto` so older `display-settings.json` files stay untouched.
     #[serde(default)]
     pub game_session: GameSession,
+    /// Default for a launch whose library entry names no `on_window.workspace`.
+    /// Orthogonal to `preset`; `#[serde(default)]` is `own`, so an older
+    /// `display-settings.json` opts in with the rest.
+    #[serde(default)]
+    pub launch_workspace: WorkspacePlacement,
     /// Windows: DDC/CI panel off (VCP 0xD6) before Exclusive isolate, on at
     /// restore. Cuts standby auto-input-scan / DP link churn on a dark
     /// physical. Best-effort; no DDC/CI → skip. Orthogonal to `preset`; default off.
@@ -375,6 +398,7 @@ impl Default for DisplayPolicy {
             layout: Layout::default(),
             max_displays: 4,
             game_session: GameSession::default(),
+            launch_workspace: WorkspacePlacement::default(),
             ddc_power_off: false,
             pnp_disable_monitors: true,
             edid_lock: false,
@@ -837,6 +861,11 @@ impl DisplayPolicyStore {
 
     pub fn edid_lock(&self) -> bool {
         self.get().edid_lock
+    }
+
+    /// Host default for a launch's workspace ([`DisplayPolicy::launch_workspace`]).
+    pub fn launch_workspace(&self) -> WorkspacePlacement {
+        self.get().launch_workspace
     }
 
     /// Neutralise connected-but-inactive external sinks for the stream.
@@ -1484,7 +1513,7 @@ mod tests {
         let keys: Vec<&String> = v.as_object().unwrap().keys().collect();
         assert_eq!(
             keys.len(),
-            13,
+            14,
             "a display-policy axis was added or removed: {keys:?} — wire it into the mgmt PUT's \
              per-axis merge (and into `EffectivePolicy` if it is a behavior axis) before bumping this"
         );

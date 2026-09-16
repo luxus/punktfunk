@@ -6,8 +6,8 @@
 //!
 //! The host publishes [`set_stream_output`] at capture bring-up (`wl_output.name`,
 //! protocol v4, "the same for all clients": Hyprland `PF-<pid>-<n>`, sway
-//! `HEADLESS-N`, or a mirrored connector). The wlr backend re-creates the pointer
-//! bound to that name.
+//! `HEADLESS-N`, KWin `Virtual-<name>`, or a mirrored connector). The wlr backend
+//! re-creates the pointer bound to that name; KWin fake_input maps into that head.
 //!
 //! **One slot per process.** Last capture bring-up wins for every concurrent
 //! session; per-session routing needs source-tagged events (see
@@ -24,6 +24,7 @@ static STREAM_OUTPUT: RwLock<Option<String>> = RwLock::new(None);
 /// sessions. A later bring-up may pass `None` so a stale name cannot outlive its
 /// compositor. Parallel sessions: last writer wins (module doc).
 pub fn set_stream_output(name: Option<String>) {
+    crate::bump_aim_gen();
     let mut cur = STREAM_OUTPUT.write().unwrap_or_else(|e| e.into_inner());
     if *cur != name {
         tracing::info!(output = ?name, "absolute-input stream output set");

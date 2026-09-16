@@ -37,13 +37,16 @@ export function carriesCommandExecution(
 
 /**
  * Re-verify the console password iff `entries` contains a command-execution field. Throws the same
- * 401/429/503 `confirmPassword` does; returns normally when the gate does not apply.
+ * 401/429/503 `confirmPassword` does; resolves when the gate does not apply.
+ *
+ * Async because the verify is: the caller must `await` this, or a gated write runs unchecked.
  */
-export function confirmIfCommandExecution(
+export async function confirmIfCommandExecution(
 	event: H3Event,
 	entries: EntryLike | EntryLike[] | null | undefined,
 	password: unknown,
-): void {
+): Promise<void> {
 	const list = Array.isArray(entries) ? entries : [entries];
-	if (list.some(carriesCommandExecution)) confirmPassword(event, password);
+	if (list.some(carriesCommandExecution))
+		await confirmPassword(event, password);
 }

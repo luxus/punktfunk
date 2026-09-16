@@ -100,9 +100,10 @@ pinned. The layers, from the outside in:
   `~/.config/punktfunk/web-password`; the SteamOS installer writes it to
   `~/.config/punktfunk/web.env` and points you at that file when it finishes; on Windows the wizard
   lets you choose it (a strong random default is pre-filled) while a silent install generates one,
-  and either way it is stored readable only by Administrators and SYSTEM.
-  Pick a strong one and keep it out of shared documents; repeated wrong guesses are rate-limited per
-  IP. To read it back or change it, see [Forgot your Password?](/docs/forgot-password).
+  and either way it is stored readable only by Administrators and SYSTEM. On the first sign-in the
+  console replaces the clear line with a salted argon2id hash, so the file stops being a copy of
+  your password. Pick a strong one and keep it out of shared documents; repeated wrong guesses are
+  rate-limited per IP. To reset it, see [Forgot your Password?](/docs/forgot-password).
 - **The [shared clipboard](/docs/clipboard) is opt-in at both ends.** The host never advertises it
   until an operator adds a line to `host.env`, and on your side it is a switch per *saved host*
   rather than a global one — because letting a machine read and write what you copy is a decision
@@ -190,8 +191,8 @@ We mitigate this deliberately:
 - **Sealed internal channels.** The desktop-frame ring and the gamepad input/output channels are
   passed between the host and its drivers as duplicated handles to unnamed objects, so another local
   service can't open them by name to read your screen or forge controller input.
-- **Secrets are locked down.** The management token, the host identity key, and the console password
-  are stored with Administrators/SYSTEM-only permissions.
+- **Secrets are locked down.** The management token, the host identity key, and the console
+  password hash are stored with Administrators/SYSTEM-only permissions.
 
 **The honest floor still applies.** None of this defends against an attacker who is *already* an
 administrator or SYSTEM on the box — at that level they own the machine regardless of Punktfunk. And a
@@ -240,7 +241,13 @@ machine. Punktfunk narrows it as far as it can:
   capability-limited `plugin-token`, not the full-admin `mgmt-token` — so a plugin can't register
   hooks or admit new devices. On Windows the runner's scheduled task runs as
   `NT AUTHORITY\LocalService`, **not** SYSTEM, and is granted read on exactly two files (that token
-  and the TLS pin). On Linux it runs as your desktop user, like the host.
+  and the TLS pin). On Linux it runs as your desktop user, so the systemd unit draws the same line
+  a different way: the runner starts with an empty home, and the only things mounted back into it
+  are that same token, that same pin, and the directories plugins actually work in — their own
+  packages, their own saved state, your scripts, and the game libraries a scanner reads. The
+  host's `mgmt-token` and its identity key are not among them. A plugin that needs to reach
+  somewhere else needs you to grant it, with
+  `systemctl --user edit punktfunk-scripting`.
 
 Install plugins only from sources you trust, and prefer Verified catalog entries. See
 [Plugins](/docs/plugins) for the install flow and the CLI.

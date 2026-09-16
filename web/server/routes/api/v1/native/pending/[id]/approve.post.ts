@@ -25,7 +25,7 @@ export default defineEventHandler(async (event) => {
 		throw createError({ statusCode: 404, statusMessage: "no such pending id" });
 	}
 	const body = await readBody<ApproveBody>(event);
-	confirmPassword(event, body?.password);
+	await confirmPassword(event, body?.password);
 	// Rebuild from known fields so the password cannot leak upstream. Absent stays absent: the
 	// dialog omits `grants`/`expires_in_secs` to keep a re-knocking device's stored access.
 	const { name, grants, expires_in_secs, until_disconnect } = body ?? {};

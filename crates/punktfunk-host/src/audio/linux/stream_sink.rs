@@ -8,9 +8,10 @@
 //! that drops HDMI cannot flip the default under capture.
 //!
 //! Refcounted, latest-wins: concurrent sessions each hold a claim; the newest
-//! routes to *its* sink, and only the last release restores. The ledger lock
-//! is held across the metadata round-trip so a stale restore cannot overwrite
-//! a fresh claim.
+//! routes to *its* sink, and only the last release restores. A `join` session
+//! claims the sink it taps, so the owner leaving first restores nothing under
+//! it. The ledger lock is held across the metadata round-trip so a stale
+//! restore cannot overwrite a fresh claim.
 //!
 //! Crash self-healing: a leftover `punktfunk-speaker-*` name is never saved as
 //! a restore target (that would wedge routing on a ghost). Restore then deletes

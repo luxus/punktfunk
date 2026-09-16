@@ -16,6 +16,19 @@ data class Settings(
     val width: Int = 0,
     val height: Int = 0,
     val hz: Int = 0,
+    /**
+     * Fold the rounded corners into the [SAFE_AREA_MODE] inset. Off: a corner of radius `r` clips a
+     * quarter-circle out of each end of the top and bottom rows, and clearing it costs `r` on every
+     * row. On is for a HUD that lives in a corner.
+     */
+    val safeAreaClearCorners: Boolean = false,
+    /**
+     * Replace the probed left/right inset of [SAFE_AREA_MODE] with this many pixels;
+     * [SafeArea.AUTO_INSET] (the default) keeps what the display reports. The escape hatch for a
+     * phone whose [DisplayCutout] does not describe what the glass actually covers.
+     */
+    val safeAreaLeftPx: Int = SafeArea.AUTO_INSET,
+    val safeAreaRightPx: Int = SafeArea.AUTO_INSET,
     val bitrateKbps: Int = 0,
     /**
      * Render-resolution multiplier: the client asks the host to render/encode at `chosen mode ×
@@ -425,9 +438,9 @@ fun nativeDisplayMode(context: Context): Triple<Int, Int, Int> {
 
 /**
  * Sentinel [Settings.width]/[Settings.height] meaning "the native mode, narrowed so the picture
- * clears the display cutout and the rounded corners" — resolved at connect by [safeDisplayMode],
- * exactly as `0` is resolved by [nativeDisplayMode]. Negative, so it can never collide with a real
- * size; distinct from the UI's `-1` "Custom…" sentinel.
+ * clears the display cutout" — resolved at connect by [safeDisplayMode], exactly as `0` is resolved
+ * by [nativeDisplayMode]. Negative, so it can never collide with a real size; distinct from the
+ * UI's `-1` "Custom…" sentinel.
  */
 const val SAFE_AREA_MODE = -2
 
@@ -435,82 +448,122 @@ const val SAFE_AREA_MODE = -2
  * Safe-area stream geometry — the pure part, so it is unit-testable without a Display.
  *
  * The phone clips the picture in HARDWARE: the cutout (notch / punch-hole) and the four rounded
- * corners eat whatever the stream draws under them. [StreamScreen] deliberately draws edge-to-edge
- * (`LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS`) and centres the video at its own aspect ratio
- * (`Modifier.aspectRatio`), so which pixels survive is decided purely by the mode's aspect:
+ * corners eat whatever the stream draws under them, and the stream screen draws edge-to-edge
+ * (`LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS`). Which pixels survive is decided by the mode's aspect:
  *
- *  * A 16:9 mode on a 20:9 phone pillarboxes, and those black bars land exactly on the unsafe
- *    regions — which is why the presets have always "just worked".
- *  * The NATIVE mode has the panel's own aspect, so it fills every pixel, cutout and corners
- *    included. That is the mode that loses its corners.
+ *  * A 16:9 mode on a 20:9 phone pillarboxes, and those bars land on the unsafe regions — which is
+ *    why the fixed presets have always "just worked", at 20 % of the width.
+ *  * The NATIVE mode has the panel's own aspect, so it fills every pixel, housing included.
  *
- * So asking the host for a mode narrower by the unsafe inset is the entire fix: the existing
- * aspect-fit centres it inside the safe region, and pointer mapping follows for free (MouseInput
- * derives the picture rect from the live video size, not from the window).
+ * Asking the host for a mode narrower by the unsafe insets is the fix, and the picture then sits at
+ * [offsetX] rather than centred: a hole on one side must not be paid for on both. Pointer mapping
+ * follows for free — the input lanes derive the picture rect from the live placement.
  */
 object SafeArea {
     /** The host rejects odd dimensions and anything under 320 px wide (`validate_dimensions`). */
     const val MIN_WIDTH = 320
 
+    /** A stored per-side override meaning "whatever the display reports" — the default. */
+    const val AUTO_INSET = -1
+
     /**
-     * [nativeWidth] reduced by [perSideInsetPx] on each side, even-floored and clamped to the
-     * host's floor. Height is deliberately untouched: under aspect-fit only one axis can bind, and
-     * on a landscape phone that axis is always the horizontal one — insetting height as well would
-     * shrink the picture without uncovering anything.
+     * [nativeWidth] less [left] and [right], even-floored and clamped to the host's floor. A hole
+     * on one side costs the picture that side only: charging both spends 127 px of a OnePlus 9 Pro
+     * on an edge nothing covers. Height is untouched — under aspect-fit only the horizontal axis
+     * binds on a landscape phone, so insetting it would shrink the picture uncovering nothing.
      */
-    fun insetWidth(nativeWidth: Int, perSideInsetPx: Int): Int {
-        val inset = perSideInsetPx.coerceAtLeast(0)
-        return (nativeWidth - inset * 2).coerceAtLeast(MIN_WIDTH) / 2 * 2
+    fun insetWidth(nativeWidth: Int, left: Int, right: Int): Int =
+        (nativeWidth - left.coerceAtLeast(0) - right.coerceAtLeast(0))
+            .coerceAtLeast(MIN_WIDTH) / 2 * 2
+
+    /**
+     * Where that picture starts, so it sits under neither edge: the left inset, pulled back when
+     * the floor above made the picture wider than the room between the two.
+     */
+    fun offsetX(nativeWidth: Int, left: Int, right: Int): Int =
+        left.coerceAtLeast(0)
+            .coerceAtMost((nativeWidth - insetWidth(nativeWidth, left, right)).coerceAtLeast(0))
+
+    /**
+     * The two sides to clear, from what the display reported and what [s] says about it: the
+     * corner radius joins only on the opt-in, and a typed override replaces its own side outright.
+     */
+    fun resolve(cutLeft: Int, cutRight: Int, corner: Int, s: Settings): SafeInsets {
+        var left = cutLeft
+        var right = cutRight
+        if (s.safeAreaClearCorners) {
+            left = maxOf(left, corner)
+            right = maxOf(right, corner)
+        }
+        if (s.safeAreaLeftPx >= 0) left = s.safeAreaLeftPx
+        if (s.safeAreaRightPx >= 0) right = s.safeAreaRightPx
+        return SafeInsets(left, right, corner)
     }
 }
 
 /**
- * The per-side inset, in pixels, that the **landscape** stream must clear on this display.
+ * What a landscape stream must clear on this display, in the window's own pixels.
  *
- * Two contributions, and the larger wins:
- *  * **The cutout.** [DisplayCutout] is rotation-aware, so in landscape the housing shows up on
- *    `left`/`right`. The settings screen may be portrait though, where the very same housing is
- *    reported on `top`/`bottom` and the horizontal insets read zero — which would compute "no inset
- *    needed" for exactly the devices that need one. The stream is always landscape, so a vertical
- *    inset now becomes a horizontal one then: fall back to it.
- *  * **The rounded corners.** These are NOT part of the cutout insets. For a FULL-HEIGHT picture the
- *    horizontal clearance a corner of radius `r` needs is exactly `r`: at the topmost row the
- *    display boundary sits at `x = r`, so anything left of that is clipped. Not conservative — it is
- *    the precise requirement for a picture that spans the full height.
- *
- * `0` when the display has neither, which makes the safe mode identical to the native one.
+ * [left]/[right] are the cutout's two sides, read separately whenever the rotation in hand is a
+ * landscape one and as one symmetric value otherwise — a portrait probe knows how big the housing
+ * is but not which side it will land on. [corner] is the largest rounded-corner radius, reported
+ * whether or not it is folded in: it is what "Clear rounded corners" would add to each side.
  */
-private fun displaySideInsetPx(context: Context): Int {
-    val display = probeDisplay(context) ?: return 0
-    var inset = 0
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+data class SafeInsets(val left: Int, val right: Int, val corner: Int)
+
+/**
+ * What this display's housing costs a landscape stream, per side, under [s].
+ *
+ * [DisplayCutout] is rotation-aware: in a landscape rotation the housing sits on `left`/`right` and
+ * the two are read as they are. A portrait probe reports the same housing on `top`/`bottom` with
+ * both horizontal insets zero — that says how big it is, not which side it will land on, so the
+ * reading goes on both sides as it always did.
+ *
+ * Rounded corners are reported but NOT folded in unless [Settings.safeAreaClearCorners] asks. A
+ * full-height picture needs exactly `r` of clearance at a corner of radius `r`, and paying that on
+ * every row for two small arcs is a trade only some HUDs want.
+ * [Settings.safeAreaLeftPx]/[Settings.safeAreaRightPx] replace a side outright, for a phone this
+ * probe reads wrong.
+ */
+fun displaySafeInsets(context: Context, s: Settings): SafeInsets {
+    val display = probeDisplay(context)
+    var left = 0
+    var right = 0
+    var corner = 0
+    if (display != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
         display.cutout?.let { cut ->
-            val horizontal = maxOf(cut.safeInsetLeft, cut.safeInsetRight)
-            val vertical = maxOf(cut.safeInsetTop, cut.safeInsetBottom)
-            inset = maxOf(inset, if (horizontal > 0) horizontal else vertical)
+            if (maxOf(cut.safeInsetLeft, cut.safeInsetRight) > 0) {
+                left = cut.safeInsetLeft
+                right = cut.safeInsetRight
+            } else {
+                val vertical = maxOf(cut.safeInsetTop, cut.safeInsetBottom)
+                left = vertical
+                right = vertical
+            }
         }
     }
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+    if (display != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
         for (position in intArrayOf(
             android.view.RoundedCorner.POSITION_TOP_LEFT,
             android.view.RoundedCorner.POSITION_TOP_RIGHT,
             android.view.RoundedCorner.POSITION_BOTTOM_LEFT,
             android.view.RoundedCorner.POSITION_BOTTOM_RIGHT,
         )) {
-            display.getRoundedCorner(position)?.let { inset = maxOf(inset, it.radius) }
+            display.getRoundedCorner(position)?.let { corner = maxOf(corner, it.radius) }
         }
     }
-    return inset
+    return SafeArea.resolve(left, right, corner, s)
 }
 
 /**
- * The native mode narrowed to clear the cutout and the rounded corners — the [SAFE_AREA_MODE]
- * resolution, as a landscape `(width, height, hz)`. Same height and refresh as [nativeDisplayMode];
- * only the width moves.
+ * The native mode narrowed to clear this display's housing — the [SAFE_AREA_MODE] resolution, as a
+ * landscape `(width, height, hz)`. Same height and refresh as [nativeDisplayMode]; only the width
+ * moves, and the stream screen places the narrower picture at the left inset rather than centred.
  */
-fun safeDisplayMode(context: Context): Triple<Int, Int, Int> {
+fun safeDisplayMode(context: Context, s: Settings): Triple<Int, Int, Int> {
     val (w, h, hz) = nativeDisplayMode(context)
-    return Triple(SafeArea.insetWidth(w, displaySideInsetPx(context)), h, hz)
+    val i = displaySafeInsets(context, s)
+    return Triple(SafeArea.insetWidth(w, i.left, i.right), h, hz)
 }
 
 /**
@@ -555,7 +608,7 @@ fun displaySupportsHdr(context: Context): Boolean {
  */
 fun Settings.effectiveMode(context: Context): Triple<Int, Int, Int> {
     val base = if (width == SAFE_AREA_MODE && height == SAFE_AREA_MODE) {
-        safeDisplayMode(context)
+        safeDisplayMode(context, this)
     } else {
         nativeDisplayMode(context)
     }

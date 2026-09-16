@@ -46,6 +46,9 @@ pub(super) struct ControlTask {
     /// Access updates → [`NativeClient::next_access_update`]. try_send: a
     /// lagging embedder drops the oldest; the two live slots already hold truth.
     pub(super) access_tx: std::sync::mpsc::SyncSender<crate::quic::AccessUpdate>,
+    /// Live mute mask ([`NativeClient::audio_mute`]). This task owns
+    /// [`crate::client::AUDIO_MUTE_HOST`]; the embedder's own bit shares the cell.
+    pub(super) audio_mute: Arc<AtomicU8>,
 }
 
 impl ControlTask {
@@ -69,6 +72,7 @@ impl ControlTask {
             access_grants,
             access_deadline_unix,
             access_tx,
+            audio_mute,
         } = self;
         // Mid-stream clock re-sync ([`ClockResync`]): a batch every
         // CLOCK_RESYNC_INTERVAL and when the pump asks (CtrlRequest::ClockResync
@@ -301,6 +305,16 @@ impl ControlTask {
                             Ordering::Relaxed,
                         );
                         let _ = access_tx.try_send(upd);
+                    } else if let Ok(st) = crate::quic::AudioState::decode(&msg) {
+                        // The operator muted this session from the console: the host stopped
+                        // encoding, so the silence is not a broken link. Own bit — the
+                        // player's local mute is theirs, and neither clears the other.
+                        tracing::info!(muted = st.muted, "host set this session's audio mute");
+                        crate::client::set_mute_bit(
+                            &audio_mute,
+                            crate::client::AUDIO_MUTE_HOST,
+                            st.muted,
+                        );
                     } else if let Ok(shape) = crate::quic::CursorShape::decode(&msg) {
                         // Pointer bitmap changed. try_send: overflow drops newest;
                         // the next shape change resends.

@@ -81,6 +81,9 @@ pub mod collate;
 // Per-host catalog cache, so a library screen has titles to show while a sleeping host boots.
 #[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
 pub mod library_cache;
+// Poster bytes on disk behind the shells' texture maps, so the cached catalog above has covers.
+#[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
+pub mod art_cache;
 // Host power actions (`design/host-actions.md`). Android gets the row type and labels; ureq stays desktop-gated (Android uses OkHttp).
 #[cfg(any(
     target_os = "linux",

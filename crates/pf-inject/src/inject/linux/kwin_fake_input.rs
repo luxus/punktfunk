@@ -8,7 +8,9 @@
 //! Absolute pointer/touch use *logical* compositor pixels (post scale). At scale ≠ 1 the
 //! logical edge is `physical / scale`; a streamed pixel coordinate then lands `scale×`
 //! too far toward the bottom-right. Track each output's logical rectangle via
-//! `xdg-output` and map the normalized client position into it.
+//! `xdg-output` and map the normalized client position into it. The target is the head
+//! named by [`crate::stream_output`]; the event's `w×h` is the client's own size and only
+//! picks a head when no name is published.
 //!
 //! Pin: install the host `.desktop` and re-login (KWin caches the grant per-exe).
 //! Same path as `krdpserver`. See `docs-site/content/docs/kde.md`.
@@ -76,19 +78,53 @@ fn axis_value(x: i32, precise: bool) -> f64 {
     }
 }
 
-/// Physical mode (match streamed WxH) plus logical rectangle (abs coords).
-/// `logical_w == 0` until xdg-output reports size.
 struct OutputTrack {
     /// Registry id; also dispatch user-data so events find this entry.
     name: u32,
     wl_output: WlOutput,
     xdg_output: Option<ZxdgOutputV1>,
+    geo: Geo,
+}
+
+/// `wl_output.name`, physical mode, and logical rectangle (abs coords).
+/// `logical_w == 0` until xdg-output reports size.
+#[derive(Default)]
+struct Geo {
+    output_name: Option<String>,
     mode_w: i32,
     mode_h: i32,
     logical_x: i32,
     logical_y: i32,
     logical_w: i32,
     logical_h: i32,
+}
+
+/// Head a normalized absolute position lands on: the one named `want` (the newest, when a
+/// supersede briefly leaves two), else a mode equal to `w×h`, else the sole head.
+fn pick<'a>(
+    heads: impl Iterator<Item = &'a Geo> + Clone,
+    want: Option<&str>,
+    w: i32,
+    h: i32,
+) -> Option<&'a Geo> {
+    let usable = heads.filter(|g| g.logical_w > 0 && g.logical_h > 0);
+    if let Some(n) = want {
+        if let Some(named) = usable
+            .clone()
+            .filter(|g| g.output_name.as_deref() == Some(n))
+            .last()
+        {
+            return Some(named);
+        }
+    }
+    if let Some(sized) = usable.clone().find(|g| g.mode_w == w && g.mode_h == h) {
+        return Some(sized);
+    }
+    let mut it = usable;
+    match (it.next(), it.next()) {
+        (Some(only), None) => Some(only),
+        _ => None,
+    }
 }
 
 #[derive(Default)]
@@ -125,18 +161,13 @@ impl Dispatch<WlRegistry, ()> for State {
                     state.fake = Some(registry.bind(name, version.min(MAX_VERSION), qh, ()));
                 }
                 "wl_output" => {
-                    // `mode` is v1; bind ≤ the proxy max (4).
+                    // `mode` is v1, `name` v4; bind ≤ the proxy max (4).
                     let wl_output: WlOutput = registry.bind(name, version.min(4), qh, name);
                     let mut o = OutputTrack {
                         name,
                         wl_output,
                         xdg_output: None,
-                        mode_w: 0,
-                        mode_h: 0,
-                        logical_x: 0,
-                        logical_y: 0,
-                        logical_w: 0,
-                        logical_h: 0,
+                        geo: Geo::default(),
                     };
                     if let Some(mgr) = state.xdg_mgr.clone() {
                         State::ensure_xdg_output(&mut o, &mgr, qh);
@@ -191,20 +222,22 @@ impl Dispatch<WlOutput, u32> for State {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        // A monitor also advertises non-current modes; only Current is the live size.
-        if let wl_output::Event::Mode {
-            flags: WEnum::Value(flags),
-            width,
-            height,
-            ..
-        } = event
-        {
-            if flags.contains(wl_output::Mode::Current) {
-                if let Some(o) = state.outputs.iter_mut().find(|o| o.name == *name) {
-                    o.mode_w = width;
-                    o.mode_h = height;
-                }
+        let Some(o) = state.outputs.iter_mut().find(|o| o.name == *name) else {
+            return;
+        };
+        match event {
+            // A monitor also advertises non-current modes; only Current is the live size.
+            wl_output::Event::Mode {
+                flags: WEnum::Value(flags),
+                width,
+                height,
+                ..
+            } if flags.contains(wl_output::Mode::Current) => {
+                o.geo.mode_w = width;
+                o.geo.mode_h = height;
             }
+            wl_output::Event::Name { name } => o.geo.output_name = Some(name),
+            _ => {}
         }
     }
 }
@@ -221,12 +254,12 @@ impl Dispatch<ZxdgOutputV1, u32> for State {
         if let Some(o) = state.outputs.iter_mut().find(|o| o.name == *name) {
             match event {
                 zxdg_output_v1::Event::LogicalPosition { x, y } => {
-                    o.logical_x = x;
-                    o.logical_y = y;
+                    o.geo.logical_x = x;
+                    o.geo.logical_y = y;
                 }
                 zxdg_output_v1::Event::LogicalSize { width, height } => {
-                    o.logical_w = width;
-                    o.logical_h = height;
+                    o.geo.logical_w = width;
+                    o.geo.logical_h = height;
                 }
                 _ => {}
             }
@@ -314,33 +347,20 @@ impl KwinFakeInjector {
             if self.queue.roundtrip(&mut self.state).is_err() {
                 return;
             }
-            let pending =
-                self.state.xdg_mgr.is_some() && self.state.outputs.iter().any(|o| o.logical_w == 0);
+            let pending = self.state.xdg_mgr.is_some()
+                && self.state.outputs.iter().any(|o| o.geo.logical_w == 0);
             if !pending {
                 break;
             }
         }
     }
 
-    /// Logical rectangle for a normalized client position: matching physical mode, else
-    /// the sole output, else streamed pixels at the origin (correct at scale 1).
+    /// Logical rectangle for a normalized client position: the [`pick`]ed head, else
+    /// `w×h` pixels at the origin (correct at scale 1).
     fn logical_target(&self, phys_w: i32, phys_h: i32) -> (f64, f64, f64, f64) {
-        let usable = || {
-            self.state
-                .outputs
-                .iter()
-                .filter(|o| o.logical_w > 0 && o.logical_h > 0)
-        };
-        let chosen = usable()
-            .find(|o| o.mode_w == phys_w && o.mode_h == phys_h)
-            .or_else(|| {
-                let mut it = usable();
-                match (it.next(), it.next()) {
-                    (Some(only), None) => Some(only),
-                    _ => None,
-                }
-            });
-        match chosen {
+        let want = crate::stream_output();
+        let heads = self.state.outputs.iter().map(|o| &o.geo);
+        match pick(heads, want.as_deref(), phys_w, phys_h) {
             Some(o) => (
                 o.logical_x as f64,
                 o.logical_y as f64,
@@ -443,6 +463,46 @@ impl InputInjector for KwinFakeInjector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn head(name: &str, x: i32, w: i32, h: i32) -> Geo {
+        Geo {
+            output_name: Some(name.into()),
+            mode_w: w,
+            mode_h: h,
+            logical_x: x,
+            logical_w: w,
+            logical_h: h,
+            ..Geo::default()
+        }
+    }
+
+    /// A 1080p TV beside two 1080p monitors drives the streamed head, not the first
+    /// monitor whose mode equals the TV panel.
+    #[test]
+    fn the_named_head_beats_a_size_match() {
+        let heads = [
+            head("DP-2", 0, 1920, 1080),
+            head("DP-1", 1920, 1920, 1080),
+            head("Virtual-punktfunk-1", 3840, 2560, 1440),
+        ];
+        let at = |want| pick(heads.iter(), want, 1920, 1080).map(|g| g.logical_x);
+        assert_eq!(at(Some("Virtual-punktfunk-1")), Some(3840));
+        assert_eq!(at(Some("DP-1")), Some(1920));
+        // Unpublished or vanished: the size ladder.
+        assert_eq!(at(None), Some(0));
+        assert_eq!(at(Some("gone")), Some(0));
+    }
+
+    /// A supersede leaves the old head alive under the same name; the newer one is live.
+    #[test]
+    fn a_shared_name_takes_the_newest_head() {
+        let heads = [
+            head("Virtual-punktfunk-1", 0, 1920, 1080),
+            head("Virtual-punktfunk-1", 1920, 3840, 2160),
+        ];
+        let got = pick(heads.iter(), Some("Virtual-punktfunk-1"), 1920, 1080);
+        assert_eq!(got.map(|g| g.logical_x), Some(1920));
+    }
 
     /// The app multiplies this axis back by 12 to reach 120-space, so a detent has to leave
     /// as 10 units — 15 spent one and a half clicks per notch.

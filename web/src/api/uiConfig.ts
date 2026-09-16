@@ -26,6 +26,8 @@ export interface UiConfig {
 	pluginPort: number | null;
 	/** `null` on every box that is not a themed Omarchy one — the console keeps its own palette. */
 	theme: OmarchyTheme | null;
+	/** The console answers on more than this machine. Settings shows a notice when it does. */
+	reachableFromNetwork: boolean;
 }
 
 /**

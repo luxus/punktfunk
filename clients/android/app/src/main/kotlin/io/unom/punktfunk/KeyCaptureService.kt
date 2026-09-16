@@ -30,6 +30,8 @@ class KeyCaptureService : AccessibilityService() {
         return super.onUnbind(intent)
     }
 
+    /** A key consumed here never reaches the dispatcher, so it never repeats there either;
+     *  the stream's handler re-creates the repeat (`MainActivity.armKeyRepeat`). */
     override fun onKeyEvent(event: KeyEvent): Boolean = stream?.invoke(event) == true
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {}

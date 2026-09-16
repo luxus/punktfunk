@@ -395,15 +395,22 @@ impl Shell {
         self.draw_takeover_field(canvas, w, h, t);
         canvas.restore();
 
-        // Cover and column as one centred pair: a 2:3 card carrying the left, and a text
-        // column beside it wide enough for a long title to break twice, not fifteen times.
-        let ch = (h * 0.62).min(460.0 * k);
-        let cw = ch * 2.0 / 3.0;
-        let gap = (w * 0.04).min(56.0 * k);
-        let dw = (w * 0.34).clamp(260.0 * k, 460.0 * k);
-        let x0 = (w - (cw + gap + dw)) / 2.0;
-        let top = (h - ch) / 2.0;
-        let settled = Rect::from_xywh(x0 as f32, top as f32, cw as f32, ch as f32);
+        let a = l.appear as f32;
+        let rows: Vec<(&String, f64, f32)> = [
+            (&l.facts, 15.0, 0.62),
+            (&l.developer, 14.0, 0.45),
+            (&l.genres, 14.0, 0.45),
+        ]
+        .into_iter()
+        .filter(|(text, _, _)| !text.is_empty())
+        .collect();
+        // Under the title: the rows, then the spinner line, which sits 38 k below the last row.
+        let rest = (11.0 + rows.iter().map(|(_, size, _)| size + 7.0).sum::<f64>() + 38.0) * k;
+        let lay = launch_layout(w, h, k, rest, |dw| {
+            fonts.title_height(&l.title, W::SemiBold, 34.0 * k, fg(a), dw)
+        });
+        let (cw, ch) = (lay.cw, lay.ch);
+        let settled = Rect::from_xywh(lay.cover_x as f32, lay.cover_y as f32, cw as f32, ch as f32);
         // Where it flies from: its shelf tile, or — with no tile to leave — the settled rect
         // a little small, so the arrival still reads as one.
         let start = if l.from.is_empty() {
@@ -471,28 +478,21 @@ impl Shell {
         );
         canvas.restore();
 
-        // The column: left-aligned beside the cover, centred on its height. Most titles carry
-        // one fact line, and a block hung from the top of a card this tall reads as fallen off
-        // it. The height is estimated from the rows present; measuring the paragraphs to place
-        // them would be a second layout pass for accuracy nobody can see.
-        let rows = [&l.facts, &l.developer, &l.genres]
-            .iter()
-            .filter(|s| !s.is_empty())
-            .count() as f64;
-        let block = (44.0 + rows * 21.0 + 52.0) * k;
-        let a = l.appear as f32;
-        let dx = x0 + cw + gap;
-        let ty = top + (ch - block).max(0.0) / 2.0;
-        fonts.leading(canvas, &l.title, W::SemiBold, 34.0 * k, fg(a), dx, ty, dw);
-        let mut y = ty + 52.0 * k;
-        for (text, size, alpha) in [
-            (&l.facts, 15.0, 0.62),
-            (&l.developer, 14.0, 0.45),
-            (&l.genres, 14.0, 0.45),
-        ] {
-            if text.is_empty() {
-                continue;
-            }
+        // The column, placed from the title's measured height: a wrapped title would
+        // otherwise be painted over by the rows placed for one line.
+        let (dx, dw) = (lay.col_x, lay.dw);
+        fonts.title(
+            canvas,
+            &l.title,
+            W::SemiBold,
+            34.0 * k,
+            fg(a),
+            dx,
+            lay.col_y,
+            dw,
+        );
+        let mut y = lay.col_y + lay.title_h + 11.0 * k;
+        for (text, size, alpha) in rows {
             fonts.leading(canvas, text, W::Regular, size * k, fg(alpha * a), dx, y, dw);
             y += (size + 7.0) * k;
         }
@@ -519,5 +519,138 @@ impl Shell {
             Hint::new(HintKey::Back, "Cancel")
         };
         self.draw_takeover_hints(canvas, w, h, k, fonts, &[hint]);
+    }
+}
+
+/// Where the launch hold puts its cover and text column, in layout pixels.
+struct LaunchLayout {
+    cover_x: f64,
+    cover_y: f64,
+    cw: f64,
+    ch: f64,
+    col_x: f64,
+    col_y: f64,
+    dw: f64,
+    title_h: f64,
+}
+
+/// Landscape: a 2:3 cover and a text column beside it, one centred pair. Portrait, or a
+/// window too narrow for the pair: the cover on top, the column under it, the cover shrunk
+/// before anything leaves the screen. `title_h(dw)` measures the title at a column width;
+/// `rest` is the height of everything under the title.
+fn launch_layout(w: f64, h: f64, k: f64, rest: f64, title_h: impl Fn(f64) -> f64) -> LaunchLayout {
+    let margin = (w * 0.06).max(24.0 * k);
+    let gap = (w * 0.04).min(56.0 * k);
+    let ch = (h * 0.62).min(460.0 * k);
+    let cw = ch * 2.0 / 3.0;
+    let dw = (w * 0.34).clamp(260.0 * k, 460.0 * k);
+    if w >= h && cw + gap + dw <= w - 2.0 * margin {
+        let cover_x = (w - (cw + gap + dw)) / 2.0;
+        let cover_y = (h - ch) / 2.0;
+        let title_h = title_h(dw);
+        // Centred on the cover's height: a block hung from the top of a card this
+        // tall reads as fallen off it.
+        let col_y = cover_y + (ch - title_h - rest).max(0.0) / 2.0;
+        return LaunchLayout {
+            cover_x,
+            cover_y,
+            cw,
+            ch,
+            col_x: cover_x + cw + gap,
+            col_y,
+            dw,
+            title_h,
+        };
+    }
+    let dw = w - 2.0 * margin;
+    let title_h = title_h(dw);
+    let text = title_h + rest;
+    // The hint row owns the bottom band; the stack is centred in what is left.
+    let avail = h - margin - BOTTOM_BAND * k;
+    let ch = (h * 0.4)
+        .min(460.0 * k)
+        .min(avail - gap - text)
+        .min(dw * 1.5)
+        .max(0.0);
+    let cw = ch * 2.0 / 3.0;
+    let cover_y = margin + (avail - margin - (ch + gap + text)).max(0.0) / 2.0;
+    LaunchLayout {
+        cover_x: (w - cw) / 2.0,
+        cover_y,
+        cw,
+        ch,
+        col_x: margin,
+        col_y: cover_y + ch + gap,
+        dw,
+        title_h,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two title lines at 34 k, the paragraph's line height.
+    fn two_lines(k: f64) -> impl Fn(f64) -> f64 {
+        move |_| 2.0 * 41.0 * k
+    }
+
+    fn inside(l: &LaunchLayout, w: f64, h: f64, rest: f64) {
+        assert!(l.cover_x >= 0.0, "cover left {}", l.cover_x);
+        assert!(l.cover_x + l.cw <= w, "cover right {}", l.cover_x + l.cw);
+        assert!(
+            l.col_x >= 0.0 && l.col_x + l.dw <= w,
+            "column {}..{}",
+            l.col_x,
+            l.dw
+        );
+        assert!(
+            l.col_y + l.title_h + rest <= h,
+            "text bottom {}",
+            l.col_y + l.title_h + rest
+        );
+        assert!(
+            l.cover_y >= 0.0 && l.cover_y + l.ch <= h,
+            "cover {}..{}",
+            l.cover_y,
+            l.ch
+        );
+    }
+
+    /// A portrait phone: the pair does not fit side by side, so the cover sits on top of
+    /// the column instead of past the left edge.
+    #[test]
+    fn portrait_stacks_the_cover_over_the_column() {
+        let (w, h, k) = (1440.0, 3216.0, 3.0);
+        let rest = 120.0 * k;
+        let l = launch_layout(w, h, k, rest, two_lines(k));
+        inside(&l, w, h, rest);
+        assert!(l.cover_y + l.ch <= l.col_y, "column starts under the cover");
+        assert!(l.dw > w * 0.8, "the column takes the width: {}", l.dw);
+        assert!(l.ch > 0.3 * h, "the cover keeps its size: {}", l.ch);
+    }
+
+    /// A landscape screen keeps the pair, centred, with the column past the cover.
+    #[test]
+    fn landscape_keeps_the_pair() {
+        let (w, h, k) = (1920.0, 1080.0, 1.35);
+        let rest = 120.0 * k;
+        let l = launch_layout(w, h, k, rest, two_lines(k));
+        inside(&l, w, h, rest);
+        assert!(l.col_x >= l.cover_x + l.cw, "column beside the cover");
+        assert!(
+            (l.cover_x - (w - (l.col_x + l.dw))).abs() < 1.0,
+            "pair is centred"
+        );
+    }
+
+    /// A narrow landscape window that cannot hold the pair stacks too, on screen.
+    #[test]
+    fn a_narrow_window_never_puts_the_cover_off_screen() {
+        let (w, h, k) = (400.0, 380.0, 0.75);
+        let rest = 120.0 * k;
+        let l = launch_layout(w, h, k, rest, two_lines(k));
+        inside(&l, w, h, rest);
+        assert!(l.cover_y + l.ch <= l.col_y);
     }
 }

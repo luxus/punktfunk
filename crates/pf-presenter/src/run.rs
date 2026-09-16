@@ -1738,6 +1738,12 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         toggle_pad_mouse(c, ring_opener);
                     }
                 }
+                RingCommand::ToggleStreamMute => {
+                    if let Some(c) = stream.as_ref().and_then(|st| st.connector.as_ref()) {
+                        let on = c.audio_mute() & punktfunk_core::client::AUDIO_MUTE_LOCAL != 0;
+                        c.set_audio_muted(!on);
+                    }
+                }
                 // The pad worker owns the wire index and the owed release, so this one is
                 // the service's, not `ring_command`'s.
                 RingCommand::TapButton(bit) => gamepad.tap_button(bit),
@@ -1804,6 +1810,10 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
             // the pump knows whether an uplink exists, and a mirrored copy would go stale
             // at session end.
             let mic_muted = stream.as_ref().is_some_and(|st| st.handle.mic.muted());
+            let audio_mute = stream
+                .as_ref()
+                .and_then(|st| st.connector.as_ref())
+                .and_then(|c| punktfunk_core::client::audio_mute_label(c.audio_mute()));
             let ring_facts = stream
                 .as_ref()
                 .filter(|st| st.connector.is_some())
@@ -1819,6 +1829,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                 access: access_chip.as_deref(),
                 notice: session_notice,
                 mic_muted,
+                audio_mute,
                 resizing,
                 pad: pad.as_ref().map(|p| p.name.as_str()),
                 pad_pref: pad.as_ref().map(|p| p.pref),
@@ -2926,6 +2937,7 @@ fn ring_facts(
         mic_muted,
         pad_mouse_target: target,
         pad_mouse_on: target != 0 && c.pad_mouse() & target == target,
+        audio_mute: c.audio_mute(),
         pointer_granted: c.access_grants() & punktfunk_core::quic::GRANT_POINTER != 0,
         mode: (m.width, m.height, m.refresh_hz),
         native_mode: st.native_mode,
@@ -3026,7 +3038,8 @@ fn ring_command(
         RingCommand::CycleStats
         | RingCommand::Keyboard
         | RingCommand::TapButton(_)
-        | RingCommand::TogglePadMouse => {}
+        | RingCommand::TogglePadMouse
+        | RingCommand::ToggleStreamMute => {}
     }
 }
 

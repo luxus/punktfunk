@@ -52,6 +52,13 @@ discovery, it now needs a rule of its own. `service install` re-applies the rule
 so a normal update is enough.
 </Callout>
 
+## Who can reach the console
+
+The web console (47992) and the plugin-UI origin beside it (47993) listen on **this machine only**
+unless you say otherwise: `PUNKTFUNK_UI_BIND` in `host.env`, `0.0.0.0` for your whole network or one
+address for a single interface. The guided installer asks. Opening the firewall is not enough on its
+own — the console has to be listening there too.
+
 ## Moving a port
 
 Two are configurable, and both are how you share a machine with another streaming host — see

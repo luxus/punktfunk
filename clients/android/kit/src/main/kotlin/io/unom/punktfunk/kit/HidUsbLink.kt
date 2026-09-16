@@ -46,6 +46,8 @@ class HidUsbLink(
      * Puck's controller slots, or the DualSense's single HID interface among its audio siblings.
      * [keepAliveFeatures] are full feature reports (id byte first) re-sent to the streaming
      * interface every [keepAliveMs] AND once at claim time; empty = no keep-alive.
+     * [releaseFeatures] are written once as the claim goes back, undoing what the keep-alive held
+     * (the SC2's lizard mode) so the OS gets the device in the state it expects.
      */
     class Config(
         val tag: String,
@@ -54,6 +56,7 @@ class HidUsbLink(
         val ifaceFilter: (UsbDevice, UsbInterface) -> Boolean = { _, _ -> true },
         val keepAliveFeatures: List<ByteArray> = emptyList(),
         val keepAliveMs: Long = 0,
+        val releaseFeatures: List<ByteArray> = emptyList(),
     )
 
     private val usb = context.getSystemService(Context.USB_SERVICE) as UsbManager
@@ -495,8 +498,8 @@ class HidUsbLink(
     }
 
     /**
-     * Stop the read loop and the keep-alive, then release the interfaces. Idempotent; does not
-     * fire [onClosed].
+     * Stop the read loop and the keep-alive, write [Config.releaseFeatures], then release the
+     * interfaces. Idempotent; does not fire [onClosed].
      *
      * Safe to call from the `onClosed` handler itself — that is how an unplug gets cleaned up,
      * and it arrives on the reader thread, which must not try to join itself. Both threads are
@@ -516,6 +519,10 @@ class HidUsbLink(
             // would let a later stop() skip the join and free the connection under it.
             reader = null
         }
+        // Hand the device back before the claim goes: both threads are joined, so EP0 is ours
+        // alone and no keep-alive can follow. Best effort — a detached device answers an error,
+        // which is exactly as much as this needs to do about it.
+        for (f in config.releaseFeatures) setReport(REPORT_TYPE_FEATURE, f)
         outQueue.clear()
         activeClaim = null
         for (c in claims) runCatching { connection?.releaseInterface(c.iface) }

@@ -15,6 +15,23 @@ use super::args::{InnoArgs, TaskFlag};
 use super::plan::Artifact;
 use super::{NetCategory, WinFacts};
 
+/// The console's default listen address: this PC only.
+pub const LOOPBACK_BIND: &str = "127.0.0.1";
+
+/// What "this local network" means to the console's listener.
+pub const LAN_BIND: &str = "0.0.0.0";
+
+/// `/WEBBIND` and its env twin, in the Linux installer's spelling.
+fn parse_bind(raw: &str) -> Option<String> {
+    match raw.trim() {
+        "" => None,
+        "localhost" | "loopback" => Some(LOOPBACK_BIND.to_string()),
+        "lan" | "any" => Some(LAN_BIND.to_string()),
+        v if v.parse::<std::net::IpAddr>().is_ok() => Some(v.to_string()),
+        _ => None,
+    }
+}
+
 /// D12. `Skip` is the silent default: a profile change needs a consent surface.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NetworkAnswer {
@@ -81,6 +98,9 @@ pub struct WinChoices {
     pub desktop_icon: bool,
     /// Fresh only. `None` = executor generates 24 hex chars. Never render into a transcript or argv.
     pub web_password: Option<String>,
+    /// Where the web console listens (`PUNKTFUNK_UI_BIND`). `None` = pass nothing: `service
+    /// install` then keeps host.env's answer, which on an upgrade is the reach the box already had.
+    pub web_bind: Option<String>,
     /// Upgrades pre-fill the ARP location and ignore `/DIR` (Inno `UsePreviousAppDir`).
     pub dir: Option<PathBuf>,
     pub network: NetworkAnswer,
@@ -109,6 +129,12 @@ impl WinChoices {
             tray_autostart: if upgrade { facts.tray_autostart } else { true },
             desktop_icon: false,
             web_password: None,
+            // Fresh boxes are asked and answer loopback by default; an upgrade keeps host.env's.
+            web_bind: if upgrade {
+                None
+            } else {
+                Some(LOOPBACK_BIND.to_string())
+            },
             dir: installed
                 .and_then(|i| i.location.clone())
                 .map(PathBuf::from),
@@ -150,6 +176,23 @@ impl WinChoices {
             self.apply_flags(tasks, &mut warnings);
         }
         self.apply_flags(&args.merge_tasks, &mut warnings);
+        // Address, not a task flag, so it takes the same spelling as the Linux `--web-bind`:
+        // an address, or `localhost` / `lan`. A value we cannot read warns and changes nothing —
+        // an unattended install must not fail on it, and must not guess either (D5).
+        for raw in [
+            env.get("PUNKTFUNK_INSTALL_WEB_BIND"),
+            args.web_bind.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            match parse_bind(raw) {
+                Some(addr) => self.web_bind = Some(addr),
+                None => warnings.push(format!(
+                    "web console bind '{raw}' is not an address — ignored"
+                )),
+            }
+        }
         if let Some(dir) = &args.dir {
             match &self.dir {
                 Some(existing) => warnings.push(format!(

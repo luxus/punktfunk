@@ -44,6 +44,9 @@ pub struct InnoArgs {
     pub tasks: Option<Vec<TaskFlag>>,
     /// Fresh installs only; upgrades follow the ARP location.
     pub dir: Option<PathBuf>,
+    /// `/WEBBIND=ADDR` — where the web console listens. Unvalidated here; `WinChoices::apply`
+    /// warns on a value it cannot read rather than failing an unattended install.
+    pub web_bind: Option<String>,
     /// Unknown `/`-flags: one warning line, never an error.
     pub unknown: Vec<String>,
     pub rest: Vec<String>,
@@ -58,6 +61,7 @@ impl InnoArgs {
             merge_tasks: Vec::new(),
             tasks: None,
             dir: None,
+            web_bind: None,
             unknown: Vec::new(),
             rest: Vec::new(),
         };
@@ -83,6 +87,7 @@ impl InnoArgs {
                     .extend(task_list(&value().unwrap_or_default())),
                 "/TASKS" => out.tasks = Some(task_list(&value().unwrap_or_default())),
                 "/DIR" => out.dir = value().map(PathBuf::from),
+                "/WEBBIND" => out.web_bind = value(),
                 // No-ops we still accept: this installer never restarts, and we show no `/SP-` prompt.
                 "/NORESTART" | "/SP-" => {}
                 _ => out.unknown.push(arg.clone()),

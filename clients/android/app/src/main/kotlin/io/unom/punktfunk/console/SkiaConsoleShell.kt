@@ -43,6 +43,7 @@ import io.unom.punktfunk.kit.NativeBridge
 import io.unom.punktfunk.models.ActiveSession
 import io.unom.punktfunk.models.LibraryReturn
 import io.unom.punktfunk.kit.Sc2BleLink
+import io.unom.punktfunk.kit.Sc2Capture
 import io.unom.punktfunk.kit.Sc2Device
 import io.unom.punktfunk.rememberConsoleHaptics
 import io.unom.punktfunk.testRumble
@@ -461,9 +462,15 @@ private fun padAction(activity: MainActivity?, action: String, padKey: String) {
     val usb = activity.getSystemService(Context.USB_SERVICE) as UsbManager
     when (action) {
         "rumble" -> {
-            val pulsed = Gamepad.pads()
-                .firstOrNull { "${it.vendorId}:${it.productId}:${it.name}" == padKey }
-                ?.let(::testRumble) == true
+            // A captured SC2 left the input stack, so it has no vibrator to pulse: its buzz rides
+            // the capture's own HID output instead. Every other pad keeps the vibrator path.
+            val pulsed = if (padKey.startsWith(SC2_PAD_KEY)) {
+                activity.testSc2Rumble()
+            } else {
+                Gamepad.pads()
+                    .firstOrNull { "${it.vendorId}:${it.productId}:${it.name}" == padKey }
+                    ?.let(::testRumble) == true
+            }
             if (!pulsed) SkiaConsole.notice("No motor answered.")
         }
         "sc2_bluetooth" -> when {
@@ -537,27 +544,36 @@ private fun padAction(activity: MainActivity?, action: String, padKey: String) {
     }
 }
 
+/** Prefix of an [sc2Extras] row's key — what tells a pad action it is aimed at the capture. */
+private const val SC2_PAD_KEY = "sc2:"
+
 /**
  * The Steam Controller 2 as a pad row, when it has no [android.view.InputDevice] of its own:
  * capture detaches the kernel node, and a USB one awaiting its grant never had one. Without the
- * row the console's chip reads "TV remote" while the pad is driving it.
+ * row the console's chip reads "TV remote" while the pad is driving it. Probed through
+ * [Sc2Capture] — USB first, then a bonded BLE controller — so the console and the touch
+ * Controllers screen cannot disagree about which pads exist.
  */
 private fun sc2Extras(activity: MainActivity?): List<ConsoleJson.ExtraPad> {
     if (activity == null) return emptyList()
-    val usb = activity.getSystemService(Context.USB_SERVICE) as UsbManager
-    val dev = usb.deviceList.values.firstOrNull {
-        it.vendorId == Sc2Device.VID_VALVE && it.productId in Sc2Device.USB_PIDS
-    }
+    val probe = Sc2Capture(activity)
+    val dev = probe.findUsbDevice()
+    // Answers null without the Bluetooth grant, so a paired pad stays invisible until it is asked
+    // for — the grant row below the list is what offers that.
+    val onBle = dev == null && probe.pairedBleAddress() != null
     val captured = activity.sc2MenuActive
-    if (dev == null && !captured) return emptyList()
+    if (dev == null && !onBle && !captured) return emptyList()
     val puck = dev != null && dev.productId != Sc2Device.PID_WIRED
     return listOf(
         ConsoleJson.ExtraPad(
             name = if (puck) "Steam Controller 2 Puck" else "Steam Controller 2",
-            key = "sc2:${dev?.vendorId ?: 0}:${dev?.productId ?: 0}",
+            key = "$SC2_PAD_KEY${dev?.vendorId ?: 0}:${dev?.productId ?: 0}",
             pref = if (puck) Gamepad.PREF_STEAMCONTROLLER2_PUCK else Gamepad.PREF_STEAMCONTROLLER2,
-            detail = dev?.let { "%04X:%04X · usb".format(it.vendorId, it.productId) } ?: "captured",
+            detail = dev?.let { "%04X:%04X · usb".format(it.vendorId, it.productId) }
+                ?: if (onBle) "bluetooth" else "captured",
             forwarded = captured,
+            // Only a live capture owns the HID output the buzz rides; an ungranted pad has no link.
+            rumble = captured,
         ),
     )
 }

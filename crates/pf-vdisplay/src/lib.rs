@@ -63,6 +63,16 @@ pub use session::{
 #[cfg(target_os = "linux")]
 pub use session::{session_epoch, session_x11_env};
 
+/// The streamed head's window list and the verbs that act on one.
+/// Types on every platform; the backend arms are Linux.
+#[path = "vdisplay/toplevels.rs"]
+pub(crate) mod toplevels;
+#[cfg(target_os = "linux")]
+pub use toplevels::{
+    list_all_toplevels, list_toplevels, move_toplevel_to_output, toplevels_token, window_action,
+};
+pub use toplevels::{Toplevel, WindowVerb};
+
 #[path = "vdisplay/routing.rs"]
 pub(crate) mod routing;
 pub use routing::{
@@ -74,9 +84,9 @@ pub use routing::{
 };
 #[cfg(target_os = "linux")]
 pub use routing::{
-    dedicated_game_exited, focus_streamed_output, gamescope_xwayland_cursor_targets,
-    launch_into_gamescope_session, launch_is_nested, steam_appid_from_launch,
-    watch_steam_game_exit,
+    claim_workspace, dedicated_game_exited, focus_streamed_output,
+    gamescope_xwayland_cursor_targets, launch_into_gamescope_session, launch_is_nested,
+    steam_appid_from_launch, watch_steam_game_exit, WorkspaceClaim,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

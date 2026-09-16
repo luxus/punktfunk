@@ -787,6 +787,10 @@ fn consume_frame(
                 with_hdr = r.with_hdr,
                 samples = r.samples,
                 period_us = r.period_us,
+                // `frames + skipped` ≈ the window's expected count when the
+                // producer skipped ticks; a producer running slow moves
+                // `period_us` instead and leaves this at 0.
+                skipped = r.skipped,
                 // Tighter hdr_mad than delivery_mad ⇒ compositor stamp is worth shipping;
                 // equally ragged ⇒ the producer composes irregularly and no stamp fixes it.
                 hdr_mad_us = r.hdr_mad_us,

@@ -117,7 +117,8 @@ host advertises over mDNS as `_punktfunk._udp`, so clients discover it automatic
 - **Installed before 0.25.0?** `web.env` was written at the ambient umask, i.e. world-readable, so
   the console password and session secret leaked to every local account. `install.sh`/`update.sh`
   now tighten `~/.config/punktfunk` to `0700` and `web.env` to `0600` on every run and say so —
-  but rotate `PUNKTFUNK_UI_PASSWORD` afterwards, because a chmod does not un-leak a read secret.
+  but reset the password afterwards, because a chmod does not un-leak a read secret: put a
+  `PUNKTFUNK_UI_PASSWORD=<new>` line in `web.env` and `systemctl --user restart punktfunk-web`.
 - **Game Mode auto-suspend** drops the host off the network on idle — disable it (Settings → Power)
   for a headless host.
 - **WiFi tx ceiling** ≈ 250 Mbps goodput (a Deck hardware/driver packet-rate limit, band-independent);

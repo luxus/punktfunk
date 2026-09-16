@@ -274,9 +274,43 @@ let
       ok =
         has appliance "punktfunk-scripting" "NoNewPrivileges=true"
         && has appliance "punktfunk-scripting" "ProtectSystem=strict"
-        && has appliance "punktfunk-scripting" "ReadWritePaths=%h"
         && has appliance "punktfunk-scripting" "ReadWritePaths=/tmp"
-        && has appliance "punktfunk-scripting" "RestrictAddressFamilies=AF_UNIX";
+        && has appliance "punktfunk-scripting" "RestrictAddressFamilies=AF_UNIX"
+        && has appliance "punktfunk-scripting" "ProtectKernelTunables=true"
+        && has appliance "punktfunk-scripting" "ProtectControlGroups=true"
+        && has appliance "punktfunk-scripting" "RestrictNamespaces=true"
+        && has appliance "punktfunk-scripting" "SystemCallArchitectures=native"
+        && has appliance "punktfunk-scripting" "CapabilityBoundingSet=";
+    }
+    {
+      # `ReadWritePaths=%h` re-opened the whole home, so the runner read `mgmt-token` and `key.pem`
+      # beside the scoped token it is supposed to be limited to — the privilege split the docs
+      # promise did not hold on Linux. The home is a tmpfs now and the binds are the allow-list.
+      name = "the plugin runner cannot read the host's admin token or identity key";
+      ok =
+        has appliance "punktfunk-scripting" "ProtectHome=tmpfs"
+        && !(has appliance "punktfunk-scripting" "ReadWritePaths=%h")
+        && has appliance "punktfunk-scripting" "InaccessiblePaths=-%h/.config/punktfunk/mgmt-token"
+        && has appliance "punktfunk-scripting" "InaccessiblePaths=-%h/.config/punktfunk/key.pem";
+    }
+    {
+      # Everything ProtectHome=tmpfs takes away that the runner genuinely needs. Drop one of these
+      # and the runner comes up unable to authenticate, unable to persist, or with an EMPTY
+      # LIBRARY — on Linux a game library lives in the home the tmpfs just hid.
+      name = "the plugin runner keeps the paths it needs through the empty home";
+      ok =
+        has appliance "punktfunk-scripting" "BindPaths=-%h/.config/punktfunk/plugins"
+        && has appliance "punktfunk-scripting" "BindPaths=-%h/.config/punktfunk/plugin-state"
+        # $XDG_RUNTIME_DIR: the host's live-stream marker, the session bus, compositor sockets.
+        && has appliance "punktfunk-scripting" "BindPaths=%t"
+        && has appliance "punktfunk-scripting" "BindReadOnlyPaths=-%h/.config/punktfunk/plugin-token"
+        # The TLS pin is native-cert.pem after the identity split, cert.pem before it.
+        && has appliance "punktfunk-scripting" "BindReadOnlyPaths=-%h/.config/punktfunk/native-cert.pem"
+        && has appliance "punktfunk-scripting" "BindReadOnlyPaths=-%h/.config/punktfunk/cert.pem"
+        # Without this a moved listener leaves every plugin dialling 47990 forever.
+        && has appliance "punktfunk-scripting" "BindReadOnlyPaths=-%h/.config/punktfunk/mgmt-endpoint"
+        && has appliance "punktfunk-scripting" "BindReadOnlyPaths=-%h/.config/punktfunk/scripts"
+        && has appliance "punktfunk-scripting" "BindReadOnlyPaths=-%h/.local/share/Steam";
     }
     {
       # PrivateTmp is OFF on purpose (the VirtualHere field report: a private /tmp hides
