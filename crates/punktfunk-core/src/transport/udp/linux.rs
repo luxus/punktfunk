@@ -36,20 +36,18 @@ use android_mmsg::{mmsghdr, recvmmsg, sendmmsg};
 #[cfg(target_os = "linux")]
 use libc::{mmsghdr, recvmmsg, sendmmsg};
 
-/// Each returned header holds a raw pointer into `iovs`. The caller must keep
-/// `iovs` alive and unmoved while those headers are passed to the syscall.
+/// Point `hdrs` at `iovs` without allocating around each socket syscall.
+/// Both slices stay fixed in their caller's stack frame until the syscall returns.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn mmsghdrs(iovs: &mut [libc::iovec]) -> Vec<mmsghdr> {
-    iovs.iter_mut()
-        .map(|iov| {
-            // SAFETY: `mmsghdr` is a `repr(C)` POD of scalars and pointers, so all-zeroes is a
-            // valid bit pattern; every field the kernel reads is assigned right below.
-            let mut h: mmsghdr = unsafe { std::mem::zeroed() };
-            h.msg_hdr.msg_iov = iov;
-            h.msg_hdr.msg_iovlen = 1;
-            h
-        })
-        .collect()
+fn set_mmsghdrs(iovs: &mut [libc::iovec], hdrs: &mut [mmsghdr]) {
+    debug_assert_eq!(iovs.len(), hdrs.len());
+    for (iov, hdr) in iovs.iter_mut().zip(hdrs) {
+        // SAFETY: `mmsghdr` is a `repr(C)` POD of scalars and pointers. Zero is valid for every
+        // field, and the two fields read for this one-iovec message are assigned immediately.
+        *hdr = unsafe { std::mem::zeroed() };
+        hdr.msg_hdr.msg_iov = iov;
+        hdr.msg_hdr.msg_iovlen = 1;
+    }
 }
 
 /// Process-wide UDP GSO latch. Opt-in (`PUNKTFUNK_GSO=1`).
@@ -153,20 +151,23 @@ pub(super) fn send_batch(t: &UdpTransport, packets: &[&[u8]]) -> std::io::Result
     const CHUNK: usize = 64;
     let fd = t.socket.as_raw_fd();
     let mut total_sent = 0usize;
+    let mut iovs = [libc::iovec {
+        iov_base: std::ptr::null_mut(),
+        iov_len: 0,
+    }; CHUNK];
+    // SAFETY: `mmsghdr` is a `repr(C)` POD of scalars and pointers; an all-zero header is valid.
+    let mut hdrs: [mmsghdr; CHUNK] = std::array::from_fn(|_| unsafe { std::mem::zeroed() });
     for chunk in packets.chunks(CHUNK) {
-        // `hdrs` hold raw pointers into `iovs`; both must outlive `sendmmsg`.
-        let mut iovs: Vec<libc::iovec> = chunk
-            .iter()
-            .map(|p| libc::iovec {
+        for (iov, p) in iovs.iter_mut().zip(chunk) {
+            *iov = libc::iovec {
                 iov_base: p.as_ptr() as *mut libc::c_void,
                 iov_len: p.len(),
-            })
-            .collect();
-        let mut hdrs = mmsghdrs(&mut iovs);
-        // SAFETY: `fd` is the live socket, and `hdrs` is a local slice of `mmsghdr` whose length
-        // is passed alongside it; each header points at an `iov` in `iovs`, which outlives the
-        // call. The kernel only reads the buffers and writes each header's `msg_len`.
-        let n = unsafe { sendmmsg(fd, hdrs.as_mut_ptr(), hdrs.len() as libc::c_uint, 0) };
+            };
+        }
+        set_mmsghdrs(&mut iovs[..chunk.len()], &mut hdrs[..chunk.len()]);
+        // SAFETY: `fd` is live. Active headers point into fixed `iovs` entries, and the packet
+        // slices outlive this call. The kernel only reads packet bytes and writes `msg_len`.
+        let n = unsafe { sendmmsg(fd, hdrs.as_mut_ptr(), chunk.len() as libc::c_uint, 0) };
         if n < 0 {
             let err = std::io::Error::last_os_error();
             // Send buffer full or stale ICMP on a connected socket: drop this chunk
@@ -234,43 +235,56 @@ pub(super) fn recv_batch(
     lens: &mut [usize],
 ) -> std::io::Result<usize> {
     use std::os::fd::AsRawFd;
+    const CHUNK: usize = 128;
     let fd = t.socket.as_raw_fd();
     let n_bufs = out.len().min(lens.len());
     if n_bufs == 0 {
         return Ok(0);
     }
-    // `hdrs` hold raw pointers into `iovs`; both must outlive `recvmmsg`.
-    let mut iovs: Vec<libc::iovec> = out[..n_bufs]
-        .iter_mut()
-        .map(|b| libc::iovec {
-            iov_base: b.as_mut_ptr() as *mut libc::c_void,
-            iov_len: b.len(),
-        })
-        .collect();
-    let mut hdrs = mmsghdrs(&mut iovs);
-    // SAFETY: `fd` is the live socket, and `hdrs` is a local slice of `mmsghdr` whose length is
-    // passed alongside it; each header points at an `iov` backed by a buffer in `out`, which
-    // outlives the call, so the kernel writes only inside those buffers.
-    let n = unsafe {
-        recvmmsg(
-            fd,
-            hdrs.as_mut_ptr(),
-            n_bufs as libc::c_uint,
-            libc::MSG_DONTWAIT,
-            std::ptr::null_mut(),
-        )
-    };
-    if n < 0 {
-        let err = std::io::Error::last_os_error();
-        if is_transient_io(&err) {
-            return Ok(0);
+    let mut iovs = [libc::iovec {
+        iov_base: std::ptr::null_mut(),
+        iov_len: 0,
+    }; CHUNK];
+    // SAFETY: `mmsghdr` is a `repr(C)` POD of scalars and pointers; an all-zero header is valid.
+    let mut hdrs: [mmsghdr; CHUNK] = std::array::from_fn(|_| unsafe { std::mem::zeroed() });
+    let mut received = 0usize;
+    while received < n_bufs {
+        let count = (n_bufs - received).min(CHUNK);
+        for (iov, buf) in iovs.iter_mut().zip(&mut out[received..received + count]) {
+            *iov = libc::iovec {
+                iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+                iov_len: buf.len(),
+            };
         }
-        return Err(err);
+        set_mmsghdrs(&mut iovs[..count], &mut hdrs[..count]);
+        // SAFETY: `fd` is live. Active headers point into fixed `iovs` entries backed by `out`;
+        // each iovec length bounds the kernel write, and both arrays outlive this call.
+        let n = unsafe {
+            recvmmsg(
+                fd,
+                hdrs.as_mut_ptr(),
+                count as libc::c_uint,
+                libc::MSG_DONTWAIT,
+                std::ptr::null_mut(),
+            )
+        };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if is_transient_io(&err) {
+                break;
+            }
+            return Err(err);
+        }
+        let n = n as usize;
+        for (i, h) in hdrs[..n].iter().enumerate() {
+            lens[received + i] = h.msg_len as usize;
+        }
+        received += n;
+        if n < count {
+            break;
+        }
     }
-    for (i, h) in hdrs[..n as usize].iter().enumerate() {
-        lens[i] = h.msg_len as usize;
-    }
-    Ok(n as usize)
+    Ok(received)
 }
 
 #[cfg(test)]
