@@ -27,6 +27,8 @@ pub(crate) use self::windows::listener_is_runner;
 mod posix;
 #[cfg(not(target_os = "windows"))]
 use self::posix as plat;
+#[cfg(target_os = "linux")]
+pub(crate) use self::posix::listener_is_runner;
 
 pub fn main(args: &[String]) -> Result<()> {
     match args.first().map(String::as_str) {

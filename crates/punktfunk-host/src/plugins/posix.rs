@@ -218,6 +218,66 @@ pub(super) fn restart_runtime() -> Result<()> {
     bail!("the plugin runner is only available on Linux and Windows hosts")
 }
 
+/// Whether the IPv4 listener on `127.0.0.1:port` (or `0.0.0.0:port`) is this user.
+///
+/// A registration outlives its plugin by up to the lease TTL, and another local
+/// user who binds the freed port would otherwise receive the UI secret and
+/// answer the launch. Fail closed if `/proc/net/tcp` cannot be read.
+#[cfg(target_os = "linux")]
+pub(crate) fn listener_is_runner(port: u16) -> bool {
+    let Ok(table) = std::fs::read_to_string("/proc/net/tcp") else {
+        return false;
+    };
+    uids_are_ours(&loopback_listen_uids(&table, port), euid())
+}
+
+#[cfg(target_os = "linux")]
+fn uids_are_ours(uids: &[u32], me: u32) -> bool {
+    !uids.is_empty() && uids.iter().all(|&u| u == me)
+}
+
+#[cfg(target_os = "linux")]
+fn euid() -> u32 {
+    // SAFETY: geteuid reads this thread's credentials and touches no memory.
+    unsafe { libc::geteuid() }
+}
+
+/// UIDs of TCP_LISTEN sockets on `port` bound to 127.0.0.1 or 0.0.0.0.
+#[cfg(target_os = "linux")]
+fn loopback_listen_uids(table: &str, port: u16) -> Vec<u32> {
+    let want = format!("{port:04X}");
+    let mut uids = Vec::new();
+    for line in table.lines() {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() < 8 {
+            continue;
+        }
+        let Some((addr, p)) = cols[1].split_once(':') else {
+            continue;
+        };
+        if !p.eq_ignore_ascii_case(&want) || !cols[3].eq_ignore_ascii_case("0A") {
+            continue;
+        }
+        if !proc_ipv4_is_loopback_or_any(addr) {
+            continue;
+        }
+        if let Ok(uid) = cols[7].parse::<u32>() {
+            uids.push(uid);
+        }
+    }
+    uids
+}
+
+/// `/proc/net/tcp` prints IPv4 addresses as native-endian hex of the in_addr.
+#[cfg(target_os = "linux")]
+fn proc_ipv4_is_loopback_or_any(hex: &str) -> bool {
+    let Ok(n) = u32::from_str_radix(hex, 16) else {
+        return false;
+    };
+    let ip = std::net::Ipv4Addr::from(n.to_le_bytes());
+    ip.is_loopback() || ip.is_unspecified()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -353,5 +413,47 @@ mod tests {
         ] {
             assert!(RUNNER_MISSING.contains(hint), "missing hint: {hint}");
         }
+    }
+
+    /// `/proc/net/tcp` listen rows: loopback/any count, established and foreign
+    /// addresses do not, and a mixed-uid port is not ours.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn loopback_listen_uids_read_the_listen_rows() {
+        let table = "\
+  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 1
+   1: 0100007F:1F90 0100007F:C001 01 00000000:00000000 00:00000000 00000000  1000        0 2
+   2: 00000000:0050 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 3
+   3: 0200A8C0:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 4
+   4: 00000000:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 5
+";
+        let uids = loopback_listen_uids(table, 0x1F90);
+        assert_eq!(uids, vec![1000, 0]);
+        assert!(
+            !uids_are_ours(&uids, 1000),
+            "a foreign uid on the same port must fail the runner check"
+        );
+        assert!(uids_are_ours(&[1000], 1000));
+        assert!(!uids_are_ours(&[], 1000));
+        assert!(proc_ipv4_is_loopback_or_any("0100007F"));
+        assert!(proc_ipv4_is_loopback_or_any("00000000"));
+        assert!(!proc_ipv4_is_loopback_or_any("0200A8C0"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_loopback_listen_we_own_is_the_runner() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        assert!(
+            listener_is_runner(port),
+            "this process's loopback listener must count as the runner"
+        );
+        drop(listener);
+        assert!(
+            !listener_is_runner(port),
+            "a port with no listener must not count as the runner"
+        );
     }
 }

@@ -6,7 +6,9 @@
 //! `None` if the plugin is down, disowns the key, or answers something unusable.
 //!
 //! The per-boot UI secret authenticates the registered listener, not plugin
-//! ownership — see `mgmt::plugins`. Pin: [`ask_plugin_launch`], tests below.
+//! ownership — see `mgmt::plugins`. The listener is identified too: Windows
+//! requires LocalService, Linux this uid, so a squat on a leased port cannot
+//! collect the secret or name the command. Pin: [`ask_plugin_launch`].
 
 use super::*;
 use std::time::Duration;
@@ -41,11 +43,11 @@ pub fn valid_plugin_entry_key(v: &str) -> bool {
 }
 
 /// Loopback `POST /__launch` for `plugin`'s entry `key`. `None` if unregistered,
-/// disowned, or unusable; every arm logs so the operator can tell which.
+/// disowned, unusable, or the listener is not the runner.
 ///
 /// Blocking (`ureq`). Callers sit on a blocking thread: `resolve_launch` hops
 /// through `spawn_blocking`. Handshake probes use [`super::launch_is_resolvable`],
-/// which never asks.
+/// which never asks. Every refusal logs so the operator can tell which arm fired.
 pub fn ask_plugin_launch(plugin: &str, key: &str) -> Option<PluginLaunch> {
     if !valid_plugin_entry_key(key) {
         tracing::warn!(
@@ -63,10 +65,9 @@ pub fn ask_plugin_launch(plugin: &str, key: &str) -> Option<PluginLaunch> {
         );
         return None;
     };
-    // The registration outlives a dead plugin by up to its lease, and the dial carries the UI
-    // secret: whoever listens on the port now must still be the LocalService runner. Tests
-    // stub the plugin in-process, as whoever runs them.
-    #[cfg(all(windows, not(test)))]
+    // Lease TTL can outlive the plugin. The secret rides the dial, so the
+    // listener must still be the runner (Windows: LocalService; Linux: this uid).
+    #[cfg(any(all(windows, not(test)), target_os = "linux"))]
     if !crate::plugins::listener_is_runner(cred.port) {
         tracing::warn!(
             plugin,
