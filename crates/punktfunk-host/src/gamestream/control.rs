@@ -446,6 +446,9 @@ fn spawn(state: Arc<AppState>) -> Result<Running> {
                     tracing::info!(port = CONTROL_PORT, "control: stopped (no paired clients)");
                     return;
                 }
+                // Admission steal raises `quit` without `/cancel`. End here so audio,
+                // launch, and the farewell take the host-side path this tick.
+                let _ = state.end_session_if_stolen();
                 // Each 2 ms tick: resolve on a new owner, fold a console edit (watch poll),
                 // cut the session the tick the deadline passes. Events below read this mask.
                 let owner_fp = state.launch.lock().unwrap().and_then(|s| s.owner_fp);

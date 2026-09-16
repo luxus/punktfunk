@@ -286,9 +286,9 @@ pub struct AppState {
     pub streaming: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Deliberate end (compat-plane stand-in for native `QUIT_CODE`; RTSP has none).
     ///
-    /// Set by `/cancel`, management stop, and the launched game exiting. An ENet vanish
+    /// Set by `/cancel`, management stop, game exit, and steal. An ENet vanish
     /// leaves it clear. Virtual-display linger and end-game policy both read it. Cleared
-    /// by `/launch`.
+    /// by `/launch` and `/resume`.
     pub quit: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Audio thread running, and its keep-running flag.
     pub audio_streaming: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -359,6 +359,16 @@ impl AppState {
     pub(crate) fn quit_session(&self, reason: &str) -> bool {
         self.quit.store(true, std::sync::atomic::Ordering::SeqCst);
         self.end_session(reason)
+    }
+
+    /// Admission steal raises `quit` (this plane registers it as the stop flag)
+    /// without `/cancel`. Finish teardown so audio, launch, and control share the
+    /// host-side path. No-op when `quit` is clear.
+    pub(crate) fn end_session_if_stolen(&self) -> bool {
+        if !self.quit.load(std::sync::atomic::Ordering::SeqCst) {
+            return false;
+        }
+        self.end_session("mode-conflict steal")
     }
 
     /// Mint a fresh A/V ping for `/launch` or `/resume`. Must run before the client's RTSP SETUP.
@@ -1092,6 +1102,55 @@ mod session_tests {
         assert!(state.quit_session("client /cancel"), "video was live");
         assert!(state.quit.load(Ordering::SeqCst));
         assert!(!state.streaming.load(Ordering::SeqCst));
+    }
+
+    /// Admission steal raises `quit` and leaves launch/media up. Control's tick
+    /// must finish the same teardown as `/cancel`.
+    #[test]
+    fn admission_steal_ends_audio_app_and_control() {
+        use std::sync::atomic::Ordering;
+        let state = test_state();
+        state.streaming.store(true, Ordering::SeqCst);
+        state.audio_streaming.store(true, Ordering::SeqCst);
+        *state.launch.lock().unwrap() = Some(LaunchSession {
+            gcm_key: [0; 16],
+            rikeyid: 0,
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            appid: 1,
+            peer_ip: None,
+            owner_fp: None,
+        });
+        #[cfg(feature = "gamestream")]
+        {
+            *state.stream.lock().unwrap() = Some(stream::StreamConfig {
+                width: 1920,
+                height: 1080,
+                fps: 60,
+                packet_size: 1024,
+                bitrate_kbps: 20_000,
+                codec: crate::encode::Codec::H265,
+                min_fec: 0,
+                hdr: false,
+                slices: 1,
+                encrypt_video: false,
+            });
+        }
+
+        assert!(
+            !state.end_session_if_stolen(),
+            "quit is still clear — not a steal"
+        );
+        state.quit.store(true, Ordering::SeqCst);
+        assert!(state.end_session_if_stolen(), "video was live");
+        assert!(state.quit.load(Ordering::SeqCst), "steal stays deliberate");
+        assert!(!state.streaming.load(Ordering::SeqCst));
+        assert!(!state.audio_streaming.load(Ordering::SeqCst));
+        assert!(state.launch.lock().unwrap().is_none());
+        #[cfg(feature = "gamestream")]
+        assert!(state.stream.lock().unwrap().is_none());
+        assert!(!state.end_session_if_stolen());
     }
 }
 

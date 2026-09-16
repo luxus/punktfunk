@@ -239,6 +239,7 @@ async fn h_launch(
 
     // Snapshot owner + mode (Copy) so the launch lock is not held over admission.
     let mut forced_mode: Option<(u32, u32, u32)> = None;
+    let mut steal = false;
     {
         let live = st
             .launch
@@ -253,6 +254,7 @@ async fn h_launch(
         let conflict = crate::vdisplay::admission::effective_conflict(None);
         match gamestream_admission(live, req_fp, conflict) {
             GsDecision::Serve => {}
+            GsDecision::Steal => steal = true,
             GsDecision::Join((w, h, f)) => {
                 forced_mode = Some((w, h, f));
                 tracing::info!(
@@ -270,6 +272,18 @@ async fn h_launch(
 
     match launch(&st, &q) {
         Ok(mut session) => {
+            if steal {
+                // `quit_session` stops audio, launch, and control — not the video loop alone.
+                let before = st.media_exited.load(std::sync::atomic::Ordering::SeqCst);
+                let expected = u64::from(st.streaming.load(std::sync::atomic::Ordering::SeqCst))
+                    + u64::from(st.audio_streaming.load(std::sync::atomic::Ordering::SeqCst));
+                tracing::info!(
+                    threads = expected,
+                    "GameStream launch STEAL — ending the live session"
+                );
+                st.quit_session("mode-conflict steal");
+                wait_media_exit(&st, before, expected).await;
+            }
             // Bind unauthenticated RTSP/UDP to this paired client's source IP.
             session.peer_ip = addr.map(|Extension(PeerAddr(a))| a.ip());
             session.owner_fp = req_fp;
@@ -326,6 +340,8 @@ async fn h_resume(
     // PLAY skips if `streaming` is still true. Clear flags and wait for exit so teardown
     // cannot stomp the new session's capturer/flags. 2 s bound: do not hang; timeout is
     // the old media-less outcome. 20 ms poll is well under thread-exit time.
+    // Clear `quit` before the wait so a control tick does not steal-end the launch.
+    st.quit.store(false, std::sync::atomic::Ordering::SeqCst);
     let before = st.media_exited.load(std::sync::atomic::Ordering::SeqCst);
     let expected = u64::from(
         st.streaming
@@ -339,15 +355,8 @@ async fn h_resume(
             threads = expected,
             "resume — stopping the previous connection's media threads"
         );
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while st.media_exited.load(std::sync::atomic::Ordering::SeqCst) < before + expected {
-            if std::time::Instant::now() >= deadline {
-                tracing::warn!("resume — old media threads still exiting after 2 s; proceeding");
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
     }
+    wait_media_exit(&st, before, expected).await;
     // Resume mints new rikey; control-GCM and audio-CBC derive from it. Present → replace;
     // malformed → refuse (streaming on keys the client does not hold is worse); absent → keep.
     // Teardown during the wait can clear `launch`. ANNOUNCE re-negotiates audio — ignore
@@ -404,6 +413,21 @@ async fn h_cancel(
     xml("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<root status_code=\"200\"><cancel>1</cancel></root>\n".to_string())
 }
 
+/// Bound wait for video/audio threads to bump `media_exited` after their flags clear.
+async fn wait_media_exit(st: &AppState, before: u64, expected: u64) {
+    if expected == 0 {
+        return;
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while st.media_exited.load(std::sync::atomic::Ordering::SeqCst) < before + expected {
+        if std::time::Instant::now() >= deadline {
+            tracing::warn!("old media threads still exiting after 2 s; proceeding");
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
 /// `rikey` (16-byte AES hex) and signed `rikeyid` (negative values wrap to a BE u32 IV).
 fn parse_rikey(q: &HashMap<String, String>) -> Result<([u8; 16], i32)> {
     let rikey = q.get("rikey").ok_or_else(|| anyhow!("missing rikey"))?;
@@ -449,8 +473,10 @@ fn parse_mode(mode: &str) -> Option<(u32, u32, u32)> {
 type LiveGs = (Option<[u8; 32]>, (u32, u32, u32));
 
 enum GsDecision {
-    /// No session, same client, or `steal`/`separate` taking the one session.
+    /// No session, or the same client reconnecting.
     Serve,
+    /// Take the live session: end it, then serve.
+    Steal,
     /// Admit at the live mode (`join`).
     Join((u32, u32, u32)),
     /// 503 (`reject`).
@@ -458,8 +484,8 @@ enum GsDecision {
 }
 
 /// Single-session mode-conflict. No session or same client → Serve. A different client
-/// applies `policy`; GameStream has no `separate`, so `steal`/`separate` both Serve
-/// (take the one session).
+/// applies `policy`; GameStream has no `separate`, so `steal`/`separate` both Steal
+/// (end the one session, then serve).
 fn gamestream_admission(
     live: Option<LiveGs>,
     req_fp: Option<[u8; 32]>,
@@ -479,7 +505,7 @@ fn gamestream_admission(
     match policy {
         ModeConflict::Reject => GsDecision::Reject,
         ModeConflict::Join => GsDecision::Join(mode),
-        ModeConflict::Steal | ModeConflict::Separate => GsDecision::Serve,
+        ModeConflict::Steal | ModeConflict::Separate => GsDecision::Steal,
     }
 }
 
@@ -755,11 +781,11 @@ mod tests {
         ));
         assert!(matches!(
             gamestream_admission(live, Some(b), ModeConflict::Steal),
-            GsDecision::Serve
+            GsDecision::Steal
         ));
         assert!(matches!(
             gamestream_admission(live, Some(b), ModeConflict::Separate),
-            GsDecision::Serve
+            GsDecision::Steal
         ));
         // No cert: treat as a different client.
         assert!(matches!(
@@ -1027,5 +1053,109 @@ mod tests {
         .await;
         assert!(ok.contains("<resume>1</resume>"), "keyless resume: {ok}");
         assert_eq!(st.launch.lock().unwrap().as_ref().unwrap().rikeyid, -5);
+    }
+
+    /// Steal leaves `quit` set. Resume must clear it the same way `/launch` does.
+    #[tokio::test]
+    async fn resume_clears_quit_after_steal() {
+        async fn body_of(resp: Response) -> String {
+            let b = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            String::from_utf8(b.to_vec()).unwrap()
+        }
+
+        let st = test_state();
+        let der = b"resume-after-steal".to_vec();
+        let fp_hex = fp_of(&der);
+        let owner_fp = punktfunk_core::quic::endpoint::cert_fingerprint(&der);
+        st.paired.lock().unwrap().push(der);
+        let peer = Some(Extension(PeerCertFingerprint(Some(fp_hex))));
+        *st.launch.lock().unwrap() = Some(LaunchSession {
+            gcm_key: [0x11; 16],
+            rikeyid: 1,
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            appid: 1,
+            peer_ip: None,
+            owner_fp: Some(owner_fp),
+        });
+        st.quit.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let ok = body_of(
+            h_resume(State(st.clone()), peer, None, Query(HashMap::new()))
+                .await
+                .into_response(),
+        )
+        .await;
+        assert!(ok.contains("<resume>1</resume>"), "resume after steal: {ok}");
+        assert!(
+            !st.quit.load(std::sync::atomic::Ordering::SeqCst),
+            "resume must clear quit or PLAY dies at once"
+        );
+    }
+
+    /// `/launch` steal ends audio, launch, and the negotiated stream, then serves.
+    /// Windows `effective_conflict` remaps `separate` to `reject`, so this path is Linux.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn launch_steal_ends_the_live_session() {
+        async fn body_of(resp: Response) -> String {
+            let b = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            String::from_utf8(b.to_vec()).unwrap()
+        }
+
+        let st = test_state();
+        let owner = b"gs-steal-owner".to_vec();
+        let thief = b"gs-steal-thief".to_vec();
+        let owner_fp = punktfunk_core::quic::endpoint::cert_fingerprint(&owner);
+        let thief_fp = punktfunk_core::quic::endpoint::cert_fingerprint(&thief);
+        st.paired.lock().unwrap().push(thief.clone());
+        let peer = Some(Extension(PeerCertFingerprint(Some(fp_of(&thief)))));
+        *st.launch.lock().unwrap() = Some(LaunchSession {
+            gcm_key: [0x11; 16],
+            rikeyid: 1,
+            width: 2560,
+            height: 1440,
+            fps: 120,
+            appid: 7,
+            peer_ip: None,
+            owner_fp: Some(owner_fp),
+        });
+        *st.stream.lock().unwrap() = Some(crate::gamestream::stream::StreamConfig {
+            width: 2560,
+            height: 1440,
+            fps: 120,
+            packet_size: 1024,
+            bitrate_kbps: 20_000,
+            codec: crate::encode::Codec::H265,
+            min_fec: 0,
+            hdr: false,
+            slices: 1,
+            encrypt_video: false,
+        });
+
+        let mut q = HashMap::new();
+        q.insert("rikey".to_string(), "22".repeat(16));
+        q.insert("rikeyid".to_string(), "9".to_string());
+        q.insert("mode".to_string(), "1920x1080x60".to_string());
+        q.insert("appid".to_string(), "1".to_string());
+        let ok = body_of(h_launch(State(st.clone()), peer, None, Query(q)).await).await;
+        assert!(ok.contains("<gamesession>1</gamesession>"), "steal launch: {ok}");
+        assert!(
+            !st.quit.load(std::sync::atomic::Ordering::SeqCst),
+            "the successor launch clears quit"
+        );
+        assert!(!st.streaming.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!st.audio_streaming.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(st.stream.lock().unwrap().is_none());
+        let launch = st.launch.lock().unwrap();
+        let s = launch.as_ref().expect("successor session");
+        assert_eq!(s.owner_fp, Some(thief_fp));
+        assert_eq!(s.rikeyid, 9);
+        assert_eq!((s.width, s.height, s.fps), (1920, 1080, 60));
     }
 }
