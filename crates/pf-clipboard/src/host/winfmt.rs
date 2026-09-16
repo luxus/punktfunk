@@ -8,17 +8,16 @@
 //! * `"Rich Text Format"` (raw RTF) ↔ `text/rtf`
 //! * `"PNG"` (raw PNG) ↔ `image/png` — identity, handled by the backend.
 
-/// `CF_UNICODETEXT` HGLOBAL → UTF-8. `raw` is the `GlobalSize` buffer:
-/// little-endian UTF-16 with one trailing `0x0000`.
+/// `CF_UNICODETEXT` HGLOBAL → UTF-8. `raw` is the `GlobalSize` buffer.
+/// UTF-16LE; the first `U+0000` ends the string. Bytes after it are heap padding.
 pub fn text_from_utf16(raw: &[u8]) -> Vec<u8> {
     // Odd trailing byte (invalid CF_UNICODETEXT) is dropped by `chunks_exact`.
     let mut units: Vec<u16> = raw
         .chunks_exact(2)
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .collect();
-    // One trailing NUL only — a real U+0000 code unit must survive.
-    if units.last() == Some(&0) {
-        units.pop();
+    if let Some(n) = units.iter().position(|&u| u == 0) {
+        units.truncate(n);
     }
     String::from_utf16_lossy(&units).into_bytes()
 }
@@ -250,6 +249,19 @@ mod tests {
 
         assert_eq!(text_to_utf16(b""), vec![0, 0]);
         assert_eq!(text_from_utf16(&[0, 0]), b"");
+    }
+
+    /// `GlobalSize` is the heap block, often rounded up and zero-filled past the
+    /// CF_UNICODETEXT terminator. Extra NULs must not ride on the wire.
+    #[test]
+    fn text_from_utf16_stops_at_the_first_nul() {
+        let mut raw: Vec<u8> = "hi"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        raw.extend_from_slice(&[0u8; 10]);
+        assert_eq!(text_from_utf16(&raw), b"hi");
     }
 
     #[test]
