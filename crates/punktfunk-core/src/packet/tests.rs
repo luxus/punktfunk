@@ -586,16 +586,15 @@ fn rejects_wrong_shard_bytes_and_oversized_frame() {
     assert_eq!(stats.snapshot().packets_dropped, 1);
 }
 
-/// Receiver `max_total_shards` is frozen at session start. `Packetizer::recovery_for` clamps
-/// parity to that ceiling so a mid-session `fec_percent` ramp cannot emit undeliverable blocks.
+/// A live FEC increase emits the requested parity while staying inside the receiver's
+/// pre-reserved 90% ceiling.
 #[test]
-fn adaptive_fec_ramp_keeps_maximal_blocks_within_the_peers_ceiling() {
+fn adaptive_fec_ramp_emits_requested_parity() {
     let cfg = e2e_config(FecScheme::Gf16, 10);
     let coder = coder_for(FecScheme::Gf16);
     let lim = ReassemblerLimits::from_config(&cfg);
     let mut pk = Packetizer::new(&cfg);
 
-    // Mid-session ramp past the negotiated 10%, as `apply_fec_target` does under loss.
     pk.set_fec_percent(90);
 
     let frame_len = cfg.shard_payload * cfg.fec.max_data_per_block as usize * 2;
@@ -603,7 +602,10 @@ fn adaptive_fec_ramp_keeps_maximal_blocks_within_the_peers_ceiling() {
     let pkts = pk.packetize(&src, 1, 0, coder.as_ref()).unwrap();
 
     let k = cfg.fec.max_data_per_block as usize;
-    let mut clamped = false;
+    let mut live_fec = cfg.fec;
+    live_fec.fec_percent = 90;
+    let expected_recovery = live_fec.recovery_for(k);
+    let mut full_blocks = 0;
     for p in &pkts {
         let hdr = PacketHeader::read_from_bytes(&p[..HEADER_LEN]).unwrap();
         let total = hdr.data_shards as usize + hdr.recovery_shards as usize;
@@ -613,16 +615,15 @@ fn adaptive_fec_ramp_keeps_maximal_blocks_within_the_peers_ceiling() {
              would be dropped",
             lim.max_total_shards
         );
-        // Unclamped 90% would put 4 parity on a full block; the 10% ceiling leaves 2.
         if hdr.data_shards as usize == k {
-            assert!(
-                (hdr.recovery_shards as usize) < cfg.fec.recovery_for(k).max(1) + 1,
-                "parity must be clamped to the peer's ceiling"
+            assert_eq!(
+                hdr.recovery_shards as usize, expected_recovery,
+                "the startup FEC percentage must not cap a live increase"
             );
-            clamped = true;
+            full_blocks += 1;
         }
     }
-    assert!(clamped, "test must exercise a maximal block");
+    assert!(full_blocks > 0, "test must exercise a maximal block");
 
     let mut r = Reassembler::new(lim);
     let stats = StatsCounters::default();
