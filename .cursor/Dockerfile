@@ -9,7 +9,7 @@ FROM ubuntu:26.04
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      build-essential clang libclang-dev pkg-config cmake git curl ca-certificates unzip sudo \
+      build-essential clang libclang-dev pkg-config cmake git curl ca-certificates nodejs unzip sudo \
       mold \
       libpipewire-0.3-dev libopus-dev libwayland-dev libxkbcommon-dev \
       libgl-dev libegl-dev libgbm-dev \
@@ -23,9 +23,9 @@ RUN id ubuntu >/dev/null 2>&1 || useradd -m -u 1000 -s /bin/bash ubuntu \
     && echo 'ubuntu ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/90-ubuntu \
     && chmod 0440 /etc/sudoers.d/90-ubuntu
 
-# Rust toolchain shared under /usr/local so the ubuntu user can use and extend it. The exact
-# channel is pinned by rust-toolchain.toml; install it here so the first cargo run needs no
-# network. mold links the x86_64 targets (see ci/cargo-config-mold.toml).
+# Rust toolchain shared under /usr/local. --default-toolchain stays in lockstep with
+# rust-toolchain.toml; the image context is .cursor/, so the pin file is not COPY'd. mold
+# links the x86_64 targets (see ci/cargo-config-mold.toml).
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
     PATH=/usr/local/cargo/bin:$PATH
