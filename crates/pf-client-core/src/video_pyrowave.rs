@@ -1074,4 +1074,30 @@ mod tests {
         garbage[1] = 0xFF;
         assert_eq!(au_dims(&garbage, true, WIN), None);
     }
+
+    /// One command buffer: wait the previous submit before `begin_command_buffer`,
+    /// then return the frame at `queue_submit`. A wait after submit is the old
+    /// stall — present CSC cannot overlap that dispatch.
+    #[test]
+    fn decode_inner_ships_before_the_gpu_fence() {
+        let src = include_str!("video_pyrowave.rs");
+        let start = src.find("unsafe fn decode_inner").expect("decode_inner");
+        let end = src.find("impl Drop for PyroWaveDecoder").expect("Drop");
+        let body = &src[start..end];
+        let wait = body.find("wait_for_fences").expect("fence wait");
+        let begin = body.find("begin_command_buffer").expect("rerecord");
+        let submit = body.find("queue_submit").expect("submit");
+        let ship = body
+            .find("self.submitted = true")
+            .expect("ship without wait");
+        assert!(
+            wait < begin,
+            "wait the previous submit before rerecording the command buffer"
+        );
+        assert!(submit < ship, "mark in-flight only after submit");
+        assert!(
+            !body[submit..].contains("wait_for_fences"),
+            "returning the frame must not wait this submit"
+        );
+    }
 }
