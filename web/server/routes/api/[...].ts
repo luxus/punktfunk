@@ -1,8 +1,6 @@
-// /api/** → the management API. By the time we get here the gate (middleware/auth.ts) has
-// confirmed an authenticated session. We inject the management bearer token server-side
-// (the browser never sees it) and drop the browser's own cookies/auth from the upstream
-// request, then proxy. The management API itself binds loopback only — this proxy is the
-// ONLY path to it from the LAN, and it's authenticated.
+// /api/** → the management API after session auth. Sensitive leaves with dedicated handlers
+// are refused here, including normalized aliases, so this fallback cannot skip their stronger
+// checks. Everything else receives the server-side bearer with browser credentials removed.
 import {
 	createError,
 	defineEventHandler,
@@ -16,6 +14,7 @@ import {
 	mgmtUrl,
 	normalizePath,
 } from "../../util/auth";
+import { requiresPasswordConfirmation } from "../../util/proxyPolicy";
 
 export default defineEventHandler((event) => {
 	const { pathname, search } = getRequestURL(event);
@@ -32,6 +31,14 @@ export default defineEventHandler((event) => {
 		setResponseStatus(event, 403);
 		return {
 			error: "plugin UI credentials are not accessible from the browser",
+		};
+	}
+	// Canonical spellings are handled by dedicated routes that verify and strip the password.
+	// Refuse aliases here: forwarding one would attach the admin bearer without that check.
+	if (requiresPasswordConfirmation(event.method, pathname)) {
+		setResponseStatus(event, 403);
+		return {
+			error: "Use the canonical management path to confirm this change.",
 		};
 	}
 	const base = mgmtUrl();
