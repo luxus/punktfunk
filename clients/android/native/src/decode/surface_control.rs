@@ -363,20 +363,20 @@ impl Layer {
             .unwrap_or((self.fallback_w, self.fallback_h))
     }
 
-    /// Present one decoded buffer at `desired_present_ns` (`CLOCK_MONOTONIC`; `0` = ASAP). Consumes
-    /// `acquire_fence` (ownership passes to SurfaceFlinger via `setBuffer`). Registers a one-shot
-    /// completion that reports the real latch + the previous buffer's release fence on `ev_tx`,
-    /// tagged with `seq`. `dataspace` is the `ADataSpace` value (`0` = leave the layer default —
-    /// only the `setBufferDataSpace`-less API-29 fallback ever presents untagged).
-    /// `frame_rate` votes the layer's rate once (`0.0` skips). Returns `false` if the transaction
-    /// could not be created (the caller then frees the buffer itself).
+    /// Present one decoded buffer at `desired_present_ns` (`CLOCK_MONOTONIC`; `0` = ASAP).
+    /// SurfaceFlinger takes `acquire_fence` only after transaction creation succeeds; otherwise
+    /// the caller keeps it to release the unused image safely. The completion reports the latch
+    /// and previous-buffer release fence on `ev_tx`, tagged with `seq`.
+    ///
+    /// `dataspace` is the `ADataSpace` value (`0` leaves the layer default). `frame_rate` votes
+    /// once (`0.0` skips). `false` means the caller still owns the buffer and fence.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn present(
         &mut self,
         buffer: &HardwareBuffer,
         src_w: i32,
         src_h: i32,
-        acquire_fence: Option<OwnedFd>,
+        acquire_fence: &mut Option<OwnedFd>,
         desired_present_ns: i64,
         dataspace: i32,
         frame_rate: f32,
@@ -388,12 +388,11 @@ impl Layer {
         unsafe {
             let txn = (self.api.txn_create)();
             if txn.is_null() {
-                // The acquire fence would leak if we returned without consuming it.
-                drop(acquire_fence);
                 return false;
             }
             let sc = self.sc.sc;
             let fence_fd = acquire_fence
+                .take()
                 .map(std::os::fd::IntoRawFd::into_raw_fd)
                 .unwrap_or(-1);
             (self.api.txn_set_buffer)(txn, sc, buffer.as_ptr(), fence_fd);
