@@ -97,9 +97,9 @@ fn command_for(spec: &LaunchSpec) -> Option<String> {
 
 /// `<runner>:<appName>` → Heroic command, nested in gamescope.
 ///
-/// Heroic is single-instance Electron. Fresh gamescope: boot, launch, stay
-/// hidden (`--no-gui`). An already-running GUI forwards the URI and exits,
-/// which would tear the session — validated only for the fresh-session case.
+/// Heroic is single-instance Electron. A fresh gamescope keeps its hidden
+/// process alive; an existing GUI forwards the URI and exits. Quote the URI
+/// because every launch route evaluates this value as a shell command.
 #[cfg(target_os = "linux")]
 pub(crate) fn heroic_command(value: &str) -> Option<String> {
     let (runner, app) = value.split_once(':')?;
@@ -115,9 +115,8 @@ pub(crate) fn heroic_command(value: &str) -> Option<String> {
         return None;
     }
     let prefix = heroic_launch_prefix()?;
-    // No quotes: gamescope splits on whitespace. URI has no spaces; `&` is exec'd, not a shell.
     Some(format!(
-        "{prefix} --no-gui heroic://launch?appName={app}&runner={runner}"
+        "{prefix} --no-gui 'heroic://launch?appName={app}&runner={runner}'"
     ))
 }
 
