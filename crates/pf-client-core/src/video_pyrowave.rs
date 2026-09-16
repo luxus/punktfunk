@@ -1,7 +1,9 @@
 //! PyroWave client decode on the presenter's VkDevice: decode + CSC + present on one
 //! device, no interop (design/pyrowave-codec-plan.md). One AU is one self-delimiting
 //! packet: `push_packet` → ready → `decode_gpu_buffer` into our command buffer,
-//! submitted under [`QueueLock`], fence-waited.
+//! submitted under [`QueueLock`]. The submit fence is waited only before that
+//! buffer is rerecorded, so present's later submit on the same graphics queue
+//! can overlap this decode instead of stalling the pump for GPU completion.
 //!
 //! Output is three STORAGE planes (Y full-res; Cb/Cr half-res, or full-res on 4:4:4;
 //! R8, or R16 UNORM at 10-bit). Encoder RG packing is invalid here (`pyrowave.h`).
@@ -206,8 +208,8 @@ unsafe extern "C" fn queue_unlock_cb(ud: *mut c_void) {
     unsafe { (*(ud as *const QueueLock)).unlock() }
 }
 
-/// Fence-waited decode output on the presenter's device, GENERAL layout. Views live
-/// as long as the decoder.
+/// Decode output on the presenter's device, GENERAL layout. Views live as long as
+/// the decoder. Sampling is ordered by a later submit on the same graphics queue.
 pub struct PyroWavePlanarFrame {
     /// Raw `VkImageView`s (Y, Cb, Cr) for planar CSC sampling.
     pub views: [u64; 3],
@@ -396,6 +398,8 @@ pub struct PyroWaveDecoder {
     cmd_pool: vk::CommandPool,
     cmd: vk::CommandBuffer,
     fence: vk::Fence,
+    /// `fence` names a submitted decode. Wait and clear before rerecording `cmd`.
+    submitted: bool,
     mem_props: vk::PhysicalDeviceMemoryProperties,
     width: u32,
     height: u32,
@@ -559,7 +563,11 @@ impl PyroWaveDecoder {
                 .level(vk::CommandBufferLevel::PRIMARY)
                 .command_buffer_count(1),
         )?[0];
-        let fence = device.create_fence(&vk::FenceCreateInfo::default(), None)?;
+        // SIGNALED: the first `reset_fences` (before the first submit) is valid.
+        let fence = device.create_fence(
+            &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
+            None,
+        )?;
 
         tracing::info!(
             width,
@@ -579,6 +587,7 @@ impl PyroWaveDecoder {
             cmd_pool,
             cmd,
             fence,
+            submitted: false,
             mem_props,
             width,
             height,
@@ -632,8 +641,8 @@ impl PyroWaveDecoder {
                 return Err(e).context("plane ring (mid-stream resize)");
             }
         };
-        // Decode is fence-synchronous here, so the old decoder can go now; only the
-        // plane images wait (retired).
+        // Previous decode was fence-waited at `decode_inner` entry, so this object
+        // is idle. Plane images wait in `retired` — present may still sample them.
         pw::pyrowave_decoder_destroy(self.pw_dec);
         self.pw_dec = new_dec;
         let old = std::mem::replace(&mut self.ring, new_ring);
@@ -687,7 +696,8 @@ impl PyroWaveDecoder {
         complete: bool,
     ) -> Result<Option<PyroWavePlanarFrame>> {
         // SAFETY: single decode thread; all handles owned/pinned by `self`; queue access
-        // serialized under QueueLock; the fence bounds GPU completion before handover.
+        // serialized under QueueLock; the fence is waited before this command buffer
+        // is rerecorded, not before the frame is handed to present.
         unsafe { self.decode_inner(au, aligned, complete) }
     }
 
@@ -757,6 +767,15 @@ impl PyroWaveDecoder {
         aligned: bool,
         complete: bool,
     ) -> Result<Option<PyroWavePlanarFrame>> {
+        // One command buffer: wait the previous submit before rerecord or resize.
+        // Do not wait after this submit — present's later submit on this queue
+        // orders CSC after the decode, and the pump can return the frame now.
+        if self.submitted {
+            self.device
+                .wait_for_fences(&[self.fence], true, 5_000_000_000)
+                .context("pyrowave decode fence")?;
+            self.submitted = false;
+        }
         // The AU's sequence header announces a host mode switch; rebuild first — a size
         // mismatch hard-errors upstream. A lost first shard sniffs `None` and decodes at
         // the current size; the next complete frame carries the header again.
@@ -911,8 +930,7 @@ impl PyroWaveDecoder {
                 self.fence,
             )?;
         }
-        dev.wait_for_fences(&[self.fence], true, 5_000_000_000)
-            .context("pyrowave decode fence")?;
+        self.submitted = true;
         self.ring[slot].initialized = true;
 
         for r in &mut self.retired {
@@ -936,10 +954,14 @@ impl PyroWaveDecoder {
 
 impl Drop for PyroWaveDecoder {
     fn drop(&mut self) {
-        // SAFETY: owned handles on the presenter's device. Decode is fence-synchronous so
-        // none of our work is in flight; the presenter may still sample the last slot —
-        // idle the shared queue under the lock before destroying plane images.
+        // SAFETY: owned handles on the presenter's device. Wait our decode fence, then
+        // idle the shared queue under the lock: present may still sample the last slot.
         unsafe {
+            if self.submitted {
+                let _ = self
+                    .device
+                    .wait_for_fences(&[self.fence], true, 5_000_000_000);
+            }
             {
                 let _guard = self.queue_lock.guard();
                 let _ = self.device.queue_wait_idle(self.queue);

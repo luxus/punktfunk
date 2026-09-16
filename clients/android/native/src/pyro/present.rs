@@ -15,9 +15,8 @@ use pf_client_core::video_color::{csc_rows, ColorDesc};
 use pf_client_core::video_vk::QueueLock;
 use std::sync::Arc;
 
-/// Frames the CPU may record ahead of the GPU. Two is the whole budget this lane wants:
-/// decode is synchronous (the shared decoder fence-waits before handing the planes over),
-/// so a deeper pipeline would only park finished pictures in front of the panel.
+/// Frames the CPU may record ahead of the GPU. Two covers present of N while
+/// decode of N+1 is already submitted on the same queue.
 const FRAMES: usize = 2;
 
 /// How long to wait for a free swapchain image before giving up on this picture.

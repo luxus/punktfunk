@@ -56,8 +56,9 @@ pub enum DecodedImage {
     /// (`VK_KHR_external_memory_win32`) on GPUs without Vulkan Video.
     #[cfg(windows)]
     D3d11(crate::video_d3d11::D3d11Frame),
-    /// Three R8 plane views on the presenter's device, fence-complete, GENERAL.
-    /// Planar CSC samples them as BT.709 limited (the codec's colour contract).
+    /// Three R8 plane views on the presenter's device, GENERAL. Sampling is
+    /// ordered by a later submit on the same graphics queue. Planar CSC uses
+    /// negotiated colour (the codec's colour contract; no VUI).
     #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
     PyroWave(crate::video_pyrowave::PyroWavePlanarFrame),
     /// pf-vkdecode image + plane views already on the presenter's device.

@@ -59,7 +59,9 @@ pub enum FrameInput<'a> {
     /// Shareable NT-handle texture; imported in `d3d11.rs`.
     #[cfg(windows)]
     D3d11(pf_client_core::video::D3d11Frame),
-    /// Three R8 plane views already on this device, decode fence-complete, GENERAL layout.
+    /// Three R8 plane views already on this device, GENERAL layout. Decode
+    /// submitted on this graphics queue; CSC after this present's submit is
+    /// ordered by queue FIFO, not a host fence wait at decode.
     #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
     PyroWave(pf_client_core::video_pyrowave::PyroWavePlanarFrame),
     /// NV12 image + plane views already on this device. Wait the frame's timeline on

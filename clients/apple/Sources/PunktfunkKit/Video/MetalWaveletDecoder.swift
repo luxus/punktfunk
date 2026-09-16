@@ -446,11 +446,9 @@ public final class MetalWaveletDecoder {
         }
         guard let layout, !slots.isEmpty else { return false }
 
-        // Bound in-flight decodes to the ring's depth. The slot buffers are `.storageModeShared`
-        // and re-filled by the CPU below, and Metal's hazard tracking orders GPU work against GPU
-        // work only — it does not stop this memcpy landing while an earlier dispatch is still
-        // reading the same slot. Upstream's Vulkan twin is fence-synchronous for this reason.
-        // Timed, so a wedged GPU drops a frame instead of parking the pump thread forever.
+        // Shared-mode slot buffers are CPU-refilled below. Metal hazards GPU vs GPU
+        // only, so wait this slot's semaphore before the memcpy, not after commit.
+        // 250 ms: a wedged GPU drops the frame instead of parking the pump.
         guard ringSlots.wait(timeout: .now() + .milliseconds(250)) == .success else { return false }
         var committed = false
         defer { if !committed { ringSlots.signal() } }

@@ -1981,8 +1981,9 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     image,
                 } = f;
                 let did_present = match image {
-                    // PyroWave: already on the presenter's device and fence-complete — a
-                    // present failure has no demote rung; only device loss ends the session.
+                    // PyroWave: already on the presenter's device. Decode submitted
+                    // on this queue; CSC is ordered by that later submit. Present
+                    // failure has no demote rung; only device loss ends the session.
                     #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
                     DecodedImage::PyroWave(f) => {
                         // Wavelet stream carries negotiated ColorInfo (no VUI): a PQ
