@@ -83,21 +83,96 @@ def _controller_template_src() -> Path:
     return Path(decky.DECKY_PLUGIN_DIR) / "controller_config" / CONTROLLER_TEMPLATE
 
 
+def _no_symlink_under(root: Path, path: Path) -> bool:
+    """True when every existing component under `root` is a real inode, not a symlink.
+
+    This backend is root and the Steam / settings trees are the user's. A planted
+    link would otherwise redirect mkdir, write, or chown onto another file.
+    """
+    try:
+        real_root = root.resolve()
+        rel = path.relative_to(root)
+    except (OSError, ValueError):
+        return False
+    acc = root
+    for part in rel.parts:
+        acc = acc / part
+        if acc.is_symlink():
+            return False
+        if not acc.exists():
+            return True
+        try:
+            acc.resolve().relative_to(real_root)
+        except (OSError, ValueError):
+            return False
+    return True
+
+
+def _mkdir_plain_under(root: Path, path: Path) -> None:
+    """`mkdir -p` that refuses a symlink at every component under `root`."""
+    if root.is_symlink():
+        raise OSError(f"{root} is a symlink")
+    if not root.exists():
+        root.mkdir(parents=True, exist_ok=True)
+    if not _no_symlink_under(root, path):
+        raise OSError("path is a symlink or outside the allowed tree")
+    acc = root
+    for part in path.relative_to(root).parts:
+        acc = acc / part
+        if acc.is_symlink():
+            raise OSError(f"{acc} is a symlink")
+        if acc.exists():
+            if not acc.is_dir():
+                raise OSError(f"{acc} is not a directory")
+            continue
+        os.mkdir(acc, 0o755)
+
+
+def _write_bytes_nofollow(path: Path, data: bytes, mode: int = 0o644) -> None:
+    """Create or truncate `path` without following a leaf symlink."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
+    fd = os.open(path, flags, mode)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+
+
+def _copyfile_nofollow(src: Path, dst: Path) -> None:
+    _write_bytes_nofollow(dst, src.read_bytes())
+
+
 def _chown_like_parent(path: Path) -> None:
-    """The Decky backend runs as root, so files it CREATES in the deck-owned Steam tree land
-    root-owned — which would stop Steam (running as the user) from rewriting them. Match the
-    parent dir's owner so Steam retains write access. Best-effort."""
+    """Match the parent dir's owner so Steam (the user) can rewrite what this root
+    backend created. `follow_symlinks=False`: never chown the target of a planted link."""
     try:
         st = path.parent.stat()
-        os.chown(path, st.st_uid, st.st_gid)
+        os.chown(path, st.st_uid, st.st_gid, follow_symlinks=False)
     except OSError:
         pass
 
 
 def _configset_dirs() -> list[Path]:
-    """Every Steam account's controller-config dir holding configset_controller_neptune.vdf."""
-    base = _steam_root() / "steamapps" / "common" / "Steam Controller Configs"
-    return [p / "config" for p in sorted(base.glob("*")) if (p / "config").is_dir()]
+    """Every Steam account's controller-config dir holding configset_controller_neptune.vdf.
+
+    Skip a symlink account or `config` dir: this backend is root, and `is_dir()`
+    would otherwise walk a planted link out of the Steam tree.
+    """
+    steam = _steam_root()
+    base = steam / "steamapps" / "common" / "Steam Controller Configs"
+    out: list[Path] = []
+    if steam.is_symlink() or not _no_symlink_under(steam, base):
+        return out
+    try:
+        entries = sorted(base.iterdir())
+    except OSError:
+        return out
+    for p in entries:
+        if p.is_symlink() or not p.is_dir():
+            continue
+        cfg = p / "config"
+        if cfg.is_symlink() or not cfg.is_dir():
+            continue
+        out.append(cfg)
+    return out
 
 
 def _upsert_configset_entry(text: str, key: str, source_type: str, source_val: str) -> str:
@@ -995,9 +1070,9 @@ class Plugin:
         return art
 
     async def save_icon(self, appid: int, png_base64: str) -> dict:
-        """Write a per-game shortcut's icon as PNG (Steam's shortcut icons are PNG or ICO; the
-        frontend converts the game's JPG on a canvas) and hand back the path SetShortcutIcon
-        wants. User-readable, since Steam reads it as the user."""
+        """Write a per-game shortcut's icon as PNG and hand back the path SetShortcutIcon
+        wants. `O_NOFOLLOW`: this backend is root, so a planted link in the settings dir
+        must not redirect the write. Steam reads the file as the user."""
         try:
             appid = int(appid)
             data = base64.b64decode(str(png_base64), validate=True)
@@ -1006,34 +1081,35 @@ class Plugin:
         if appid <= 0 or not data.startswith(b"\x89PNG"):
             return {"ok": False, "error": "bad-input"}
         dest = _icon_dir() / f"{appid}.png"
+        settings = Path(decky.DECKY_PLUGIN_SETTINGS_DIR)
         try:
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.parent.chmod(0o755)
-            dest.write_bytes(data)
-            dest.chmod(0o644)  # this backend is root; Steam is not
+            _mkdir_plain_under(settings, dest.parent)
+            dest.parent.chmod(0o755, follow_symlinks=False)
+            _write_bytes_nofollow(dest, data, 0o644)
         except OSError as e:
             return {"ok": False, "error": "write-failed", "detail": str(e)}
         return {"ok": True, "path": str(dest)}
 
     async def apply_controller_config(self, name: str = "Punktfunk") -> dict:
         """Install our Steam Input layout (native touchscreen `ts_n` + gamepad passthrough) and
-        point the shortcut(s) at it, so the Deck touchscreen reaches the client as native touch
-        with zero manual controller setup. Best-effort + idempotent — a controller tweak must
-        never block a launch, so failures are reported, not raised. Both shortcuts share the same
-        name → the same lowercase configset key, so one entry per account covers both."""
+        point the shortcut(s) at it. Writes stay on real files under the Steam tree — a planted
+        symlink is refused, because this backend is root. Best-effort + idempotent."""
         src = _controller_template_src()
         if not src.exists():
             return {"ok": False, "error": "template-missing", "detail": str(src)}
         key = name.strip().lower()
         applied: list[str] = []
         errors: list[str] = []
+        steam = _steam_root()
         # 1) Ship it as a selectable template (also the safe fallback if Steam clobbers the
         #    configset write on exit): controller_base/templates/punktfunk.vdf.
         try:
-            tdir = _steam_root() / "controller_base" / "templates"
-            tdir.mkdir(parents=True, exist_ok=True)
+            tdir = steam / "controller_base" / "templates"
             dst = tdir / CONTROLLER_TEMPLATE
-            shutil.copyfile(src, dst)
+            _mkdir_plain_under(steam, tdir)
+            if not _no_symlink_under(steam, dst):
+                raise OSError("symlink or path outside the Steam tree")
+            _copyfile_nofollow(src, dst)
             _chown_like_parent(dst)
             applied.append("template")
         except OSError as e:
@@ -1043,17 +1119,19 @@ class Plugin:
         for d in dirs:
             f = d / "configset_controller_neptune.vdf"
             try:
+                if f.is_symlink() or not _no_symlink_under(steam, f):
+                    raise OSError("symlink or path outside the Steam tree")
                 text = f.read_text(encoding="utf-8") if f.exists() else ""
                 new = _upsert_configset_entry(text, key, "template", CONTROLLER_TEMPLATE)
                 if new != text:
-                    if f.exists():  # keep one recoverable backup before our first edit
+                    if f.exists() and not f.is_symlink():
                         bak = f.with_name(f.name + ".pf-bak")
-                        if not bak.exists():
-                            shutil.copyfile(f, bak)
+                        if not bak.exists() and not bak.is_symlink():
+                            _copyfile_nofollow(f, bak)
                             _chown_like_parent(bak)
-                    existed = f.exists()
-                    f.write_text(new, encoding="utf-8")
-                    if not existed:  # a freshly-created file is root-owned — hand it to the user
+                    existed = f.exists() and not f.is_symlink()
+                    _write_bytes_nofollow(f, new.encode("utf-8"))
+                    if not existed:
                         _chown_like_parent(f)
                 applied.append(f"configset:{d.parent.name}")
             except OSError as e:

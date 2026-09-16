@@ -319,6 +319,101 @@ mixed = existing.replace('"halflife2"', '"Punktfunk"')
 replaced = main._upsert_configset_entry(mixed, "punktfunk", "template", "punktfunk.vdf")
 check("vdf: matches an existing key case-insensitively", replaced.count("unktfunk\"\n") == 1)
 
+# ---- root backend must not follow a planted symlink in the Steam / settings trees ----------
+#
+# Decky plugins with the root flag run as root. copyfile / write_text / chown follow a
+# leaf or parent symlink, so a local user who plants one in their Steam tree can overwrite
+# (and re-own) an arbitrary file. O_NOFOLLOW and skipping symlink account dirs close that.
+_plugin = Path("/tmp/pf-test-plugin")
+_home = Path("/tmp/pf-test-home")
+_steam = _home / ".local" / "share" / "Steam"
+_victim = Path("/tmp/pf-symlink-victim")
+shutil.rmtree(_plugin, ignore_errors=True)
+shutil.rmtree(_home, ignore_errors=True)
+_victim.write_bytes(b"keep-me")
+(_plugin / "controller_config").mkdir(parents=True)
+(_plugin / "controller_config" / "punktfunk.vdf").write_text("template-body\n")
+
+# Leaf symlink where the template would land: the victim must stay intact.
+tdir = _steam / "controller_base" / "templates"
+tdir.mkdir(parents=True)
+(dst := tdir / "punktfunk.vdf").symlink_to(_victim)
+got = asyncio.run(main.Plugin().apply_controller_config())
+check("symlink: template write is refused", "template" not in got.get("applied", []))
+check("symlink: template error names the problem", any("symlink" in e for e in got.get("errors", [])))
+check("symlink: template victim is untouched", _victim.read_bytes() == b"keep-me")
+check("symlink: dest is still a symlink, not a regular file", dst.is_symlink())
+
+# Parent-dir symlink: controller_base → /tmp/pf-symlink-outside. mkdir must not create
+# templates there, and the victim outside the Steam tree must stay empty of our file.
+shutil.rmtree(_steam / "controller_base", ignore_errors=True)
+outside = Path("/tmp/pf-symlink-outside")
+shutil.rmtree(outside, ignore_errors=True)
+outside.mkdir()
+(_steam / "controller_base").symlink_to(outside)
+got = asyncio.run(main.Plugin().apply_controller_config())
+check("symlink: parent-dir template write is refused", "template" not in got.get("applied", []))
+check("symlink: no file created on the other side of the parent link", not (outside / "templates" / "punktfunk.vdf").exists())
+
+# Account-dir symlink: glob would have treated it as a Steam account and written
+# configset_controller_neptune.vdf through it.
+cb = _steam / "controller_base"
+if cb.is_symlink():
+    cb.unlink()
+else:
+    shutil.rmtree(cb, ignore_errors=True)
+(_steam / "controller_base" / "templates").mkdir(parents=True)
+cfgs = _steam / "steamapps" / "common" / "Steam Controller Configs"
+shutil.rmtree(cfgs, ignore_errors=True)
+cfgs.mkdir(parents=True)
+(cfgs / "12345").symlink_to(outside)
+(outside / "config").mkdir(exist_ok=True)
+check("symlink: a linked account dir is not a configset dir", main._configset_dirs() == [])
+got = asyncio.run(main.Plugin().apply_controller_config("Punktfunk"))
+check("symlink: happy-path template still writes a real file", "template" in got.get("applied", []))
+check("symlink: template dest is a regular file", (_steam / "controller_base" / "templates" / "punktfunk.vdf").is_file() and not (_steam / "controller_base" / "templates" / "punktfunk.vdf").is_symlink())
+check("symlink: linked account was not written", not (outside / "config" / "configset_controller_neptune.vdf").exists())
+
+# Configset file itself is a symlink to the victim.
+shutil.rmtree(cfgs, ignore_errors=True)
+real_acct = cfgs / "acct1" / "config"
+real_acct.mkdir(parents=True)
+(real_acct / "configset_controller_neptune.vdf").symlink_to(_victim)
+got = asyncio.run(main.Plugin().apply_controller_config())
+check("symlink: configset file write is refused", not any(a.startswith("configset:") for a in got.get("applied", [])))
+check("symlink: configset victim is untouched", _victim.read_bytes() == b"keep-me")
+
+# A real account dir still gets a configset — the refuses above must not break the write.
+shutil.rmtree(cfgs, ignore_errors=True)
+real_acct = cfgs / "acct1" / "config"
+real_acct.mkdir(parents=True)
+got = asyncio.run(main.Plugin().apply_controller_config())
+check(
+    "symlink: a real account still gets a configset",
+    "configset:acct1" in got.get("applied", [])
+    and (real_acct / "configset_controller_neptune.vdf").is_file()
+    and not (real_acct / "configset_controller_neptune.vdf").is_symlink(),
+)
+
+# save_icon: planted symlink at <settings>/icons/<appid>.png
+_settings = Path("/tmp/pf-test-settings")
+shutil.rmtree(_settings, ignore_errors=True)
+decky.DECKY_PLUGIN_SETTINGS_DIR = str(_settings)
+(_settings / "icons").mkdir(parents=True)
+(_settings / "icons" / "570.png").symlink_to(_victim)
+got = asyncio.run(main.Plugin().save_icon(570, _b64.b64encode(b"\x89PNG\r\n\x1a\n....").decode()))
+check("symlink: save_icon is refused through a planted link", got["ok"] is False)
+check("symlink: save_icon victim is untouched", _victim.read_bytes() == b"keep-me")
+
+# Happy path still works after the refuses (settings dir with no planted link).
+shutil.rmtree(_settings, ignore_errors=True)
+got = asyncio.run(main.Plugin().save_icon(570, _b64.b64encode(b"\x89PNG\r\n\x1a\n....").decode()))
+check("icon: a png still lands as <appid>.png in the settings dir", got["ok"] and got["path"] == "/tmp/pf-test-settings/icons/570.png" and Path(got["path"]).is_file() and not Path(got["path"]).is_symlink())
+
+_victim.unlink(missing_ok=True)
+shutil.rmtree(outside, ignore_errors=True)
+
+
 print()
 if failures:
     print(f"{failures} check(s) FAILED")
