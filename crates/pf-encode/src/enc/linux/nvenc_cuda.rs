@@ -1293,7 +1293,7 @@ impl NvencCudaEncoder {
         }
     }
 
-    /// Lazy session + ring, keyed off the first frame's format.
+    /// Opens the lazy session and input ring after the first frame fixes their format.
     fn init_session(&mut self) -> Result<()> {
         // SAFETY: NVENC calls go through `api()` (gated in `open`). `try_open_session`/
         // `query_caps` return a live handle or `Err`; `destroy_encoder` only on a handle just
@@ -1414,6 +1414,7 @@ impl NvencCudaEncoder {
                             }
                         }
                     }
+                    let mut floor_dropped_split = false;
                     if best.is_null() {
                         let no_split =
                             nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_DISABLE_MODE as u32;
@@ -1424,6 +1425,7 @@ impl NvencCudaEncoder {
                                     "NVENC initialize_encoder rejected even at the floor bitrate",
                                 )?;
                                 used_split = no_split;
+                                floor_dropped_split = true;
                                 e
                             }
                         };
@@ -1434,7 +1436,9 @@ impl NvencCudaEncoder {
                         clamped_mbps = best_bps / 1_000_000,
                         "NVENC (Linux): requested bitrate above the GPU codec-level ceiling — clamped"
                     );
-                    store_ceiling(self.ceiling_key(used_split), best_bps);
+                    if let Some(ceiling) = proven_bitrate_ceiling(best_bps, floor_dropped_split) {
+                        store_ceiling(self.ceiling_key(used_split), ceiling);
+                    }
                     self.bitrate_bps = best_bps;
                     best
                 }
@@ -2742,6 +2746,11 @@ impl Encoder for NvencCudaEncoder {
     }
 }
 
+/// A floor that opens only after dropping split proves nothing about the no-split bitrate limit.
+fn proven_bitrate_ceiling(bps: u64, floor_dropped_split: bool) -> Option<u64> {
+    (!floor_dropped_split).then_some(bps)
+}
+
 impl Drop for NvencCudaEncoder {
     fn drop(&mut self) {
         // SAFETY: exclusive owner on the encode thread. `teardown` no-ops a null session;
@@ -2755,6 +2764,15 @@ mod tests {
     use super::*;
     use pf_frame::{CapturedFrame, FramePayload, PixelFormat};
     use pf_zerocopy::cuda::DeviceBuffer;
+
+    #[test]
+    fn split_fallback_does_not_poison_the_no_split_ceiling() {
+        assert_eq!(proven_bitrate_ceiling(10_000_000, true), None);
+        assert_eq!(
+            proven_bitrate_ceiling(620_000_000, false),
+            Some(620_000_000)
+        );
+    }
 
     /// Env helper for ignored hardware tests. Run `--test-threads=1` — they mutate process env.
     fn set_env(key: &str, val: impl AsRef<std::ffi::OsStr>) {
