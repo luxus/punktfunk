@@ -147,13 +147,16 @@ upgrade switches them to native-only until you set the knob.)
 The host doesn't hide it: whenever the compat planes come up, it logs a warning at startup naming
 exactly this risk.
 
-**To turn it off**, if you don't use Moonlight clients:
+**To turn it off**, if a box already has it on (you set the knob, or an install from before the
+opt-in change never dropped it):
 
-- **Linux** — override the unit's `ExecStart` with a drop-in, so a package upgrade doesn't undo it:
-  see [What the unit starts](/docs/running-as-a-service#what-the-unit-starts).
+- **Linux** — delete `PUNKTFUNK_GAMESTREAM=1` from `host.env` and drop any `ExecStart` drop-in that
+  still passes `--gamestream`, then `systemctl --user restart punktfunk-host`. See [What the unit
+  starts](/docs/running-as-a-service#what-the-unit-starts).
 - **Windows** — from an elevated prompt, `punktfunk-host service install --gamestream=off`, then
   `punktfunk-host service restart`.
-- **SteamOS** — re-run the Deck installer with `--no-gamestream`.
+- **SteamOS** — re-run the Deck installer without `--gamestream`, or with `--no-gamestream` to force
+  a box that had it on back off.
 - **NixOS** — set `services.punktfunk.host.gamestream = false;` (this also drops the GameStream
   firewall ports).
 

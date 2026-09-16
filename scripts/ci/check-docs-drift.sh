@@ -100,6 +100,16 @@ while IFS= read -r cmd; do
         fail=1
     fi
 done < "$tmp/cli-cmds"
+# GameStream is opt-in (`--gamestream` / PUNKTFUNK_GAMESTREAM=1). The packaged unit is `serve`.
+if grep -q 'ExecStart=.* --gamestream' scripts/punktfunk-host.service; then
+    echo "::error::punktfunk-host.service baked --gamestream into ExecStart — GameStream is host.env"
+    fail=1
+fi
+if grep -qE 'ship the unit as `serve --gamestream`|enables `--gamestream` by' \
+    docs-site/content/docs/support-matrix.md scripts/steamdeck/README.md; then
+    echo "::error::docs claim GameStream is the packaged default — ExecStart is serve, Deck GAMESTREAM=0"
+    fail=1
+fi
 
 # ---------------------------------------------------------------- gate 5: platforms.json parses
 # Explicit try/exit: `bun -e` (1.3.x) exits 0 on an uncaught JSON.parse throw, so relying on
