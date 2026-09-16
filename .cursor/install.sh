@@ -7,12 +7,16 @@ set -euo pipefail
 echo "==> cargo fetch (workspace dependencies)"
 cargo fetch --locked
 
-# JS dependencies for the surfaces that use bun. Each guarded so a missing lockfile or directory
-# never fails setup.
+# JS dependencies for the surfaces that use bun. Frozen when bun.lock is present (a mismatch
+# fails setup); unfrozen only when it is missing. Always --ignore-scripts.
 for dir in web docs-site sdk plugin-kit; do
   if [ -f "$dir/package.json" ]; then
     echo "==> bun install ($dir)"
-    (cd "$dir" && bun install --frozen-lockfile 2>/dev/null || bun install)
+    if [ -f "$dir/bun.lock" ]; then
+      (cd "$dir" && bun install --frozen-lockfile --ignore-scripts)
+    else
+      (cd "$dir" && bun install --ignore-scripts)
+    fi
   fi
 done
 
