@@ -170,8 +170,9 @@ pub(crate) fn schedule<T: AsRef<[u8]>>(
     }
 }
 
-/// Burst, then sleep each overflow chunk toward its slice of the budget
-/// (sub-`sleep_floor` waits skipped). A `send` error aborts the frame —
+/// Burst, then sleep between overflow chunks toward `budget × (j+1)/steps`
+/// (sub-`sleep_floor` waits skipped). The last overflow send does not sleep:
+/// those packets are already on the wire. A `send` error aborts the frame —
 /// native bails the session, GameStream stops the stream.
 pub(crate) fn pace_frame<T: AsRef<[u8]>, E>(
     packets: &[T],
@@ -216,6 +217,11 @@ pub(crate) fn pace_frame<T: AsRef<[u8]>, E>(
         };
         for (j, chunk) in packets[sched.burst_len..].chunks(sched.chunk).enumerate() {
             send(chunk)?;
+            // Last send: the tail is on the wire. Sleeping out the rest of the
+            // budget only parks this thread (next AU, next streamed flush).
+            if j + 1 == sched.steps {
+                break;
+            }
             let target = pace_start + budget.mul_f64((j + 1) as f64 / sched.steps as f64);
             if let Some(ahead) = target.checked_duration_since(Instant::now()) {
                 if ahead >= cfg.sleep_floor {
@@ -553,6 +559,60 @@ mod tests {
         );
         assert!(r.is_err());
         assert_eq!(calls, 2, "no sends after the failing chunk");
+    }
+
+    /// One overflow chunk is the last send. Sleeping the budget after it
+    /// only parks the send thread — `spread_us` must not include that wait.
+    #[test]
+    fn one_overflow_step_returns_once_the_packets_leave() {
+        // 10 burst + 16 overflow at a 10 KiB cap → one 16-packet overflow send.
+        let pkts = packets(26, 1024);
+        let t0 = Instant::now();
+        let stat = pace_frame(
+            &pkts,
+            PaceBudget::Fixed(Duration::from_millis(20)),
+            &native_cfg(10 * 1024),
+            |_chunk| Ok::<(), std::io::Error>(()),
+        )
+        .unwrap();
+        assert!(stat.paced);
+        assert!(
+            t0.elapsed() < Duration::from_millis(5),
+            "must not sleep the 20 ms budget after the only overflow send"
+        );
+        assert!(stat.spread_us < 5_000);
+    }
+
+    /// Two overflow steps still sleep between them. The last send does not
+    /// sleep out the remaining half of the budget.
+    #[test]
+    fn overflow_sleeps_between_chunks_not_after_the_last() {
+        // 10 burst + 32 overflow → two 16-packet steps. 40 ms budget → 20 ms
+        // between steps, not a further 20 ms after the tail is on the wire.
+        let pkts = packets(42, 1024);
+        let t0 = Instant::now();
+        let mut sends = 0usize;
+        let stat = pace_frame(
+            &pkts,
+            PaceBudget::Fixed(Duration::from_millis(40)),
+            &native_cfg(10 * 1024),
+            |_chunk| {
+                sends += 1;
+                Ok::<(), std::io::Error>(())
+            },
+        )
+        .unwrap();
+        assert_eq!(sends, 3, "burst chunk plus two overflow chunks");
+        assert!(stat.paced);
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(12),
+            "still paces between overflow chunks, got {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(32),
+            "must not sleep the last 20 ms, got {elapsed:?}"
+        );
     }
 
     /// Sleep target is `budget × (j+1) / steps`. GameStream's
