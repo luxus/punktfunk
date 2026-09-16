@@ -108,17 +108,11 @@ pub struct Punktfunk1Options {
     pub mdns: bool,
 }
 
-/// Bind the per-session data-plane UDP socket ([`Punktfunk1Options::data_port`]): the
-/// fixed port when set and free, else an ephemeral one. Held from handshake through
-/// streaming — no drop-then-rebind window that could steal a fixed port. It never decides
-/// how video is addressed: every session waits for the client's hole-punch on whatever
-/// port this bound, because a fixed port fixes only the host's side of the path — the
-/// client's NAT, or a port proxy such as Porthole, still remaps the source to answer.
+/// Bind the session data-plane UDP socket: `data_port` when free, else ephemeral.
 ///
-/// `local_ip` is the address the QUIC connection was received on. Bind it: the client's
-/// data socket is `connect`ed to the host IP it dialed, and its kernel drops any other
-/// source. A wildcard bind lets the routing table pick a different egress on a
-/// multi-homed host. `None` or a bind failure falls back to the wildcard.
+/// Pin `local_ip` (the QUIC receive address). The client's data socket is
+/// `connect`ed to the IP it dialed, so any other egress is dropped. A miss
+/// falls back to the wildcard; the session still waits for the hole-punch.
 fn bind_data_socket(
     data_port: Option<u16>,
     local_ip: Option<std::net::IpAddr>,
@@ -150,9 +144,9 @@ fn bind_data_socket(
             tracing::warn!(
                 local_ip = ?local_ip,
                 error = %e,
-                "could not bind the data plane to the address the control connection arrived on \
-                 — falling back to the wildcard. On a multi-homed host video may now egress from \
-                 a different interface than the client dialed, which it silently drops."
+                "data plane did not bind to the control-connection address — falling back to \
+                 the wildcard; on a multi-homed host video may egress from a different interface \
+                 than the client dialed"
             );
             Ok(std::net::UdpSocket::bind("0.0.0.0:0")?)
         }
@@ -2963,6 +2957,16 @@ mod tests {
 
         // No reported local address keeps the wildcard.
         let sock = bind_data_socket(None, None).expect("bind wildcard data socket");
+        assert!(sock.local_addr().unwrap().ip().is_unspecified());
+    }
+
+    /// A pinned address that this host cannot own still has to yield a socket. 192.0.2.1
+    /// is TEST-NET-1, so the bind miss is the live fallback, not a mock.
+    #[test]
+    fn data_socket_falls_back_to_wildcard_when_the_control_address_cannot_bind() {
+        let unroutable = std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1));
+        let sock = bind_data_socket(None, Some(unroutable))
+            .expect("wildcard fallback after a pinned bind miss");
         assert!(sock.local_addr().unwrap().ip().is_unspecified());
     }
 
