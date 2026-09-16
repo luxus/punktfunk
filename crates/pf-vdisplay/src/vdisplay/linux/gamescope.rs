@@ -4100,9 +4100,9 @@ fn resolved_spawn_app(cmd: Option<&str>) -> Option<String> {
         .filter(|s| !s.trim().is_empty())
 }
 
-/// `None` app is `sleep infinity`. Wrapper relays `LIBEI_SOCKET` and optionally backgrounds splash
-/// — gamescope pushes capture buffers only when it composites. The WSI layer is exported into
-/// the nested command, not this process: gamescope's Vulkan must not load it.
+/// `None` app is `sleep infinity`. The wrapper relays `LIBEI_SOCKET`, applies the
+/// nested environment, and runs the launch value as the shell command its source promises.
+/// The WSI layer stays out of gamescope's own Vulkan process.
 fn spawn(
     w: u32,
     h: u32,
@@ -4162,7 +4162,7 @@ fn spawn(
             cmd.env("PULSE_SOURCE", src);
         }
     }
-    cmd.args(app.split_whitespace())
+    cmd.arg(app)
         // Prefer the NVIDIA GL vendor for the nested session (harmless on a pure-NVIDIA box).
         .env("__GLX_VENDOR_LIBRARY_NAME", "nvidia")
         // The box's keyboard layout — see [`xkb_env`]. Empty on an unconfigured box.
@@ -4192,7 +4192,8 @@ fn spawn(
         .context("spawn gamescope (is it installed? `apt install gamescope`)")
 }
 
-/// Builds the nested command wrapper with quoted environment and relay values.
+/// Builds the nested wrapper. Its first remaining argument is one shell command,
+/// kept intact until the inner shell parses quoting and operators.
 fn nested_wrapper_script(
     relay: &std::path::Path,
     with_splash: bool,
@@ -4205,9 +4206,9 @@ fn nested_wrapper_script(
         .join(" ");
     let relay = shell_word(&relay.to_string_lossy());
     let run = if env_kv.is_empty() {
-        "exec \"$@\"".to_string()
+        "exec sh -c \"$1\"".to_string()
     } else {
-        format!("exec env {env_kv} \"$@\"")
+        format!("exec env {env_kv} sh -c \"$1\"")
     };
     if with_splash {
         let splash = if env_kv.is_empty() {
@@ -4499,23 +4500,35 @@ mod tests {
     #[test]
     fn nested_wrapper_script_shapes() {
         let relay = std::path::Path::new("/run/user/1000/pf-ei");
-        // Plain: relay + exec, no splash machinery.
+        // Plain: relay + shell command, no splash machinery.
         let plain = nested_wrapper_script(relay, false, &[]);
         assert!(plain.contains("/run/user/1000/pf-ei"));
-        assert!(plain.ends_with("exec \"$@\""));
+        assert!(plain.ends_with("exec sh -c \"$1\""));
         assert!(!plain.contains("gamescope-splash"));
-        // Splash: `"$1"` is the host exe (an argv, never shell-interpolated), backgrounded and
-        // shifted away so `exec "$@"` still runs the untouched app tokens.
+        // Splash shifts its executable, leaving the command in `$1`.
         let splash = nested_wrapper_script(relay, true, &[]);
         assert!(splash.contains("\"$1\" gamescope-splash &"));
-        assert!(splash.contains("shift; exec \"$@\""));
+        assert!(splash.contains("shift; exec sh -c \"$1\""));
         let wsi = nested_wrapper_script(
             relay,
             false,
             &[("PUNKTFUNK_GAMESCOPE_WSI", "1".to_string())],
         );
-        assert!(wsi.contains("exec env 'PUNKTFUNK_GAMESCOPE_WSI=1' \"$@\""));
+        assert!(wsi.contains("exec env 'PUNKTFUNK_GAMESCOPE_WSI=1' sh -c \"$1\""));
         assert_eq!(shell_word("a b'c;$HOME"), "'a b'\"'\"'c;$HOME'");
+
+        let out = std::process::Command::new("sh")
+            .args([
+                "-c",
+                &nested_wrapper_script(std::path::Path::new("/dev/null"), false, &[]),
+                "sh",
+            ])
+            .arg("printf '%s' 'quoted command stays whole'")
+            .env("LIBEI_SOCKET", "test")
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert_eq!(out.stdout, b"quoted command stays whole");
     }
 
     #[test]
