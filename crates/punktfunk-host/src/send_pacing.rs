@@ -583,35 +583,36 @@ mod tests {
         assert!(stat.spread_us < 5_000);
     }
 
-    /// Two overflow steps still sleep between them. The last send does not
-    /// sleep out the remaining half of the budget.
+    /// Two overflow steps still sleep between them. Return follows the last
+    /// send — not a further half-budget wait.
     #[test]
     fn overflow_sleeps_between_chunks_not_after_the_last() {
         // 10 burst + 32 overflow → two 16-packet steps. 40 ms budget → 20 ms
         // between steps, not a further 20 ms after the tail is on the wire.
         let pkts = packets(42, 1024);
-        let t0 = Instant::now();
-        let mut sends = 0usize;
+        let mut send_at: Vec<Instant> = Vec::new();
         let stat = pace_frame(
             &pkts,
             PaceBudget::Fixed(Duration::from_millis(40)),
             &native_cfg(10 * 1024),
             |_chunk| {
-                sends += 1;
+                send_at.push(Instant::now());
                 Ok::<(), std::io::Error>(())
             },
         )
         .unwrap();
-        assert_eq!(sends, 3, "burst chunk plus two overflow chunks");
+        let returned = Instant::now();
+        assert_eq!(send_at.len(), 3, "burst chunk plus two overflow chunks");
         assert!(stat.paced);
-        let elapsed = t0.elapsed();
+        let between = send_at[2].duration_since(send_at[1]);
         assert!(
-            elapsed >= Duration::from_millis(12),
-            "still paces between overflow chunks, got {elapsed:?}"
+            between >= Duration::from_millis(12),
+            "still paces between overflow chunks, got {between:?}"
         );
+        let after_last = returned.duration_since(send_at[2]);
         assert!(
-            elapsed < Duration::from_millis(32),
-            "must not sleep the last 20 ms, got {elapsed:?}"
+            after_last < Duration::from_millis(5),
+            "must not sleep after the last send, got {after_last:?}"
         );
     }
 
