@@ -62,13 +62,12 @@ public enum DefaultsKey {
     /// navigates the gamepad UI through `Sc2MenuPad` (`gamepadUIEnabled` gates that half).
     ///
     /// ⚠ The DEFAULT deliberately differs from Android's, which is ON: engaging this on Apple
-    /// can raise a CoreBluetooth permission prompt — on iOS at launch, now that the menu pad
-    /// acquires there — so a default-on toggle would ask every user for the radio whether or not
-    /// they own an SC2. Android's capture needs no prompt for an already-attached pad, so it can
-    /// default on and cost nothing when none is present. Do not
-    /// "align" the two without moving the prompt. (The macOS USB path prompts too — Input
-    /// Monitoring, because the controller interface carries the lizard keyboard collection — so
-    /// BOTH Apple transports cost a permission question the toggle must stay opt-in for.)
+    /// costs a permission question. iOS asks for CoreBluetooth at launch, now that the menu pad
+    /// acquires there. The Mac is no cheaper — `Sc2Capture` takes USB only when a pad is attached
+    /// right now, so a padless Mac falls back to the radio and is asked for Bluetooth, and the
+    /// USB path asks for Input Monitoring (the controller interface carries the lizard keyboard
+    /// collection). Android needs no prompt for an already-attached pad, so it can default on and
+    /// cost nothing when none is present. Do not align the platforms without moving the prompt.
     public static let sc2Capture = "punktfunk.sc2Capture"
     /// Where a controller's SYSTEM buttons (guide + the share/QAM misc) land while streaming:
     /// `"auto"` | `"forward"` | `"local"` — the cross-client `system_buttons` key. Auto

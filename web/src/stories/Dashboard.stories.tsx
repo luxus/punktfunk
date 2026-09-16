@@ -15,6 +15,7 @@ const meta = {
 		onIdrOne: () => {},
 		onMuteOne: () => {},
 		onAccessOne: () => {},
+		onPlayerOne: () => {},
 		isStopping: false,
 		isRequestingIdr: false,
 		isEndingGame: false,

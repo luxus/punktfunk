@@ -203,6 +203,7 @@ impl StreamState {
                 } else {
                     want_kf = true;
                     rfi_declined = true;
+                    self.counters.link.note_rfi_declined();
                 }
             }
         }
@@ -261,6 +262,7 @@ impl StreamState {
                     self.enc.distrust_references();
                 }
                 self.enc.request_keyframe();
+                self.counters.link.note_idr();
                 self.last_forced_idr = Some(now);
                 if unhealed == IDR_STORM {
                     tracing::warn!(

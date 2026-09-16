@@ -31,6 +31,7 @@ class SettingsRoundTripTest {
         height = 2160,
         hz = 120,
         bitrateKbps = 80_000,
+        abrMaxKbps = 25_000,
         renderScale = 0.75,
         hdrEnabled = false,
         tenBitSdr = true,
@@ -91,5 +92,37 @@ class SettingsRoundTripTest {
     fun everySettingSurvivesTheConsoleBridge() {
         val got = ConsoleJson.applySettings(Settings(), ConsoleJson.settings(every, null))
         assertEquals(every, got)
+    }
+
+    /**
+     * The bitrate pair spells three modes, and each one renders as itself. The bug this ends: an
+     * off-menu value — which the speed test writes — used to fall back to the first dropdown row
+     * and read as "Automatic" while the session ran fixed at a rate nobody picked.
+     */
+    @Test
+    fun theBitrateRowNamesTheModeInForce() {
+        val auto = Settings()
+        assertEquals(BitrateMode.AUTOMATIC, auto.bitrateMode())
+        assertEquals(0, auto.bitrateValueKbps())
+
+        val limited = auto.withBitrateMode(BitrateMode.LIMITED, 14_000)
+        assertEquals(BitrateMode.LIMITED, limited.bitrateMode())
+        assertEquals(0, limited.bitrateKbps)
+        assertEquals(14_000, limited.abrMaxKbps)
+
+        // Switching modes never leaves half the old one behind.
+        val fixed = limited.withBitrateMode(BitrateMode.FIXED, 50_000)
+        assertEquals(BitrateMode.FIXED, fixed.bitrateMode())
+        assertEquals(0, fixed.abrMaxKbps)
+        assertEquals(BitrateMode.AUTOMATIC, fixed.withBitrateMode(BitrateMode.AUTOMATIC, 0).bitrateMode())
+
+        // An off-ladder value reads as its own number, and the picker offers it as Custom.
+        assertEquals("14 Mbps", bitrateLabel(14_000))
+        assertEquals("12.5 Mbps", bitrateLabel(12_500))
+        assertEquals("1.5 Gbps", bitrateLabel(1_500_000))
+        assertEquals("Custom (14 Mbps)", bitrateValueOptions(14_000).last().second)
+        assertEquals("Custom\u2026", bitrateValueOptions(15_000).last().second)
+        // The gap an earlier fixed list left between 10 and 20 Mbps.
+        assertEquals(true, BITRATE_RUNGS.containsAll(listOf(12_000, 15_000, 25_000, 30_000)))
     }
 }

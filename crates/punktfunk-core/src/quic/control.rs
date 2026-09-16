@@ -127,8 +127,9 @@ pub struct PipelineGap {
 }
 
 /// `client → host` after [`Start`]: bandwidth probe. Host bursts
-/// [`crate::packet::FLAG_PROBE`] AUs at `target_kbps` for `duration_ms`,
-/// pausing video, then replies [`ProbeResult`]. Host clamps both fields.
+/// [`crate::packet::FLAG_PROBE`] AUs at `target_kbps` for `duration_ms`
+/// beside the video it is already sending, then replies [`ProbeResult`].
+/// So the reading is headroom, not an idle link. Host clamps both fields.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProbeRequest {
     pub target_kbps: u32,
@@ -1055,6 +1056,39 @@ impl AudioState {
     }
 }
 
+/// [`PadSlots`]. 0x5B: 0x5A is the launch outcome.
+pub const MSG_PAD_SLOTS: u8 = 0x5B;
+
+/// `host → client` ([`MSG_PAD_SLOTS`]): the OS pad slots this session holds, one
+/// bit per slot. Slot `n` is player `n + 1` to a local co-op game, so the client
+/// can say which player it is instead of leaving that to whoever moved a stick
+/// first. Latest-wins, best-effort; older clients just show nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PadSlots {
+    /// Bit `n` set = this session holds OS pad slot `n`. `0` = no pad.
+    pub slots: u16,
+}
+
+impl PadSlots {
+    pub fn encode(&self) -> Vec<u8> {
+        // magic[0..4] type[4] slots[5..7]
+        let mut b = Vec::with_capacity(7);
+        b.extend_from_slice(CTL_MAGIC);
+        b.push(MSG_PAD_SLOTS);
+        b.extend_from_slice(&self.slots.to_le_bytes());
+        b
+    }
+
+    pub fn decode(b: &[u8]) -> Result<PadSlots> {
+        if b.len() != 7 || &b[0..4] != CTL_MAGIC || b[4] != MSG_PAD_SLOTS {
+            return Err(PunktfunkError::InvalidArg("bad PadSlots"));
+        }
+        Ok(PadSlots {
+            slots: u16::from_le_bytes(b[5..7].try_into().unwrap()),
+        })
+    }
+}
+
 /// [`LaunchOutcome`]. 0x5A: next after [`MSG_AUDIO_STATE`].
 pub const MSG_LAUNCH_OUTCOME: u8 = 0x5A;
 
@@ -1719,6 +1753,18 @@ mod tests {
         assert!(CursorRenderMode::decode(&bytes).is_err());
         assert!(AudioState::decode(&CursorRenderMode { client_draws: true }.encode()).is_err());
         assert!(AudioState::decode(&bytes[..bytes.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn pad_slots_roundtrip() {
+        for slots in [0u16, 0b1, 0b1010, u16::MAX] {
+            let m = PadSlots { slots };
+            assert_eq!(PadSlots::decode(&m.encode()).unwrap(), m);
+        }
+        let bytes = PadSlots { slots: 0b10 }.encode();
+        assert_eq!(bytes[4], MSG_PAD_SLOTS);
+        assert!(PadSlots::decode(&AudioState { muted: true }.encode()).is_err());
+        assert!(PadSlots::decode(&bytes[..bytes.len() - 1]).is_err());
     }
 
     /// Every variant back off the wire, and the length byte honoured: the message is

@@ -790,6 +790,7 @@ impl StreamState {
             bringup: bringup.clone(),
             wire_sock,
             driver_dropped: driver_dropped.clone(),
+            counters: counters.clone(),
         };
         let send_thread = std::thread::Builder::new()
             .name("punktfunk-send".into())

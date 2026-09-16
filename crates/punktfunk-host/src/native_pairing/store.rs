@@ -39,6 +39,10 @@ pub struct PairedClient {
     /// exactly as they always do. Older stores read as `false`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub until_disconnect: bool,
+    /// Player slot this device's pads take, 0-based, or `None` for the lazy claim.
+    /// Not an authorization input: it places controllers, it never widens access.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferred_pad_slot: Option<u8>,
 }
 
 /// Operator access choice. `Option<Access>::None` means no choice: new records get
@@ -195,6 +199,7 @@ impl TrustStore {
                 expires_unix: access.and_then(|a| a.expires_unix),
                 granted_unix: access.map(|_| now_unix()),
                 until_disconnect: access.is_some_and(|a| a.until_disconnect),
+                preferred_pad_slot: None,
             }),
         }
         if let Err(e) = save(&p) {
@@ -221,6 +226,28 @@ impl TrustStore {
         existing.expires_unix = access.expires_unix;
         existing.until_disconnect = access.until_disconnect;
         existing.granted_unix = Some(now_unix());
+        if let Err(e) = save(&p) {
+            p.clients.clients = snapshot;
+            return Err(e);
+        }
+        Ok(true)
+    }
+
+    /// Place this device's pads on `slot`, or hand them back to the lazy claim with
+    /// `None`. Unknown fingerprint returns `false` and writes nothing — a player pick
+    /// is not a pairing path. Persist failure rolls back RAM.
+    pub(super) fn set_pad_slot(&self, fp_hex: &str, slot: Option<u8>) -> Result<bool> {
+        let mut p = self.paired.lock().unwrap();
+        let snapshot = p.clients.clients.clone();
+        let Some(existing) = p
+            .clients
+            .clients
+            .iter_mut()
+            .find(|c| c.fingerprint.eq_ignore_ascii_case(fp_hex))
+        else {
+            return Ok(false);
+        };
+        existing.preferred_pad_slot = slot;
         if let Err(e) = save(&p) {
             p.clients.clients = snapshot;
             return Err(e);

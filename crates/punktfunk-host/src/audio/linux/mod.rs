@@ -17,6 +17,7 @@
 //! and tears the sink so a surround session can replace a stereo capturer
 //! without leaking a consumer (a wedged link head-blocks the daemon).
 
+mod host_bridge;
 mod monitor_rate;
 mod pad_card_volume;
 pub(crate) mod pad_sink;
@@ -25,7 +26,7 @@ mod stream_sink;
 
 use super::{AudioCapturer, MicBackendStats, VirtualMic, SAMPLE_RATE};
 use anyhow::{anyhow, Context, Result};
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError};
 use std::sync::Arc;
@@ -66,10 +67,13 @@ pub(crate) fn sink_capture_active() -> bool {
 }
 
 fn capture_mode() -> CaptureMode {
-    if crate::audio::capture_policy::session_keeps_default() {
-        // `CLIENT_CAP_KEEP_HOST_AUDIO`: follow the operator's default sink, no
-        // default-sink claim. Wins over `PUNKTFUNK_STREAM_SINK` — "don't touch
-        // my devices" is the more restrictive promise.
+    if crate::audio::capture_policy::session_keeps_default()
+        || pf_host_config::config().audio_output_mode.keeps_default()
+    {
+        // `CLIENT_CAP_KEEP_HOST_AUDIO` or `audio.output_mode = follow_default`:
+        // follow the operator's default sink, no default-sink claim. Wins over
+        // `PUNKTFUNK_STREAM_SINK` — "don't touch my devices" is the more
+        // restrictive promise.
         return CaptureMode::Monitor;
     }
     capture_mode_from(std::env::var("PUNKTFUNK_STREAM_SINK").ok().as_deref())
@@ -143,6 +147,8 @@ pub struct PwAudioCapturer {
     chunks: Receiver<Vec<f32>>,
     channels: u32,
     quit: pipewire::channel::Sender<Terminate>,
+    /// After every claim: the operator's output for the thread's [`host_bridge`].
+    host: pipewire::channel::Sender<Option<String>>,
     sink_name: Option<String>,
     claimed: bool,
     /// Shared with the PipeWire thread so drop counting can tell "encode fell
@@ -212,6 +218,7 @@ impl PwAudioCapturer {
         };
         let (tx, rx) = sync_channel::<Vec<f32>>(64);
         let (quit_tx, quit_rx) = pipewire::channel::channel::<Terminate>();
+        let (host_tx, host_rx) = pipewire::channel::channel::<Option<String>>();
         // PipeWire not running must be an open error (callers' reopen backoff).
         // Stream-sink: the sink node must exist before we claim the default.
         let (ready_tx, ready_rx) = sync_channel::<Result<()>>(1);
@@ -227,6 +234,7 @@ impl PwAudioCapturer {
                 if let Err(e) = pw_thread(
                     tx,
                     quit_rx,
+                    host_rx,
                     channels,
                     rate_hz,
                     nodes,
@@ -247,6 +255,7 @@ impl PwAudioCapturer {
         let claimed = match &sink_name {
             Some(name) => {
                 stream_sink::claim(name);
+                let _ = host_tx.send(stream_sink::host_sink());
                 true
             }
             None => false,
@@ -255,6 +264,7 @@ impl PwAudioCapturer {
             chunks: rx,
             channels,
             quit: quit_tx,
+            host: host_tx,
             sink_name,
             claimed,
             active,
@@ -306,9 +316,11 @@ impl AudioCapturer for PwAudioCapturer {
 
     fn drain(&mut self) {
         while self.chunks.try_recv().is_ok() {}
-        // Reused parked capturer = new session: re-claim the default sink.
+        // Reused parked capturer = new session: re-claim the default sink. The
+        // operator may have changed outputs meanwhile, so the bridge hears again.
         if let (Some(name), false) = (&self.sink_name, self.claimed) {
             stream_sink::claim(name);
+            let _ = self.host.send(stream_sink::host_sink());
             self.claimed = true;
         }
         // After the backlog drain, so the producer never counts a drop against
@@ -839,6 +851,7 @@ fn mic_pw_thread(
 fn pw_thread(
     tx: std::sync::mpsc::SyncSender<Vec<f32>>,
     quit_rx: pipewire::channel::Receiver<Terminate>,
+    host_rx: pipewire::channel::Receiver<Option<String>>,
     channels: u32,
     rate_hz: u32,
     nodes: CaptureNodes,
@@ -874,9 +887,40 @@ fn pw_thread(
             .connect_rc(None)
             .context("pw audio connect (is PipeWire running in this session?)")?;
 
+        // What the operator hears: playthrough links and voice-chat pins once
+        // the claim reports the host output. Also names nodes for the driver line.
+        let bridge = Rc::new(RefCell::new(host_bridge::HostBridge::new(
+            sink_name.as_deref().unwrap_or(""),
+            mode == CaptureMode::NullSink,
+            mode.owns_sink(),
+        )));
+        // Quit flushes the bridge's undo first: a pin left behind would keep a
+        // voice app off the default after the session.
+        let quit_seq: Rc<RefCell<Option<spa::utils::result::AsyncSeq>>> =
+            Rc::new(RefCell::new(None));
         let _quit_guard = quit_rx.attach(mainloop.loop_(), {
             let mainloop = mainloop.clone();
-            move |_| mainloop.quit()
+            let bridge = bridge.clone();
+            let core = core.clone();
+            let quit_seq = quit_seq.clone();
+            move |_| {
+                if bridge.borrow_mut().clear() {
+                    if let Ok(seq) = core.sync(0) {
+                        *quit_seq.borrow_mut() = Some(seq);
+                        return;
+                    }
+                }
+                mainloop.quit();
+            }
+        });
+        let _host_guard = host_rx.attach(mainloop.loop_(), {
+            let bridge = bridge.clone();
+            let core = core.clone();
+            move |host| {
+                let mut b = bridge.borrow_mut();
+                b.set_host(host);
+                b.sync(&core);
+            }
         });
 
         // Core error ends this thread so the chunk channel disconnects and
@@ -884,6 +928,15 @@ fn pw_thread(
         // restart left `next_chunk` returning quiet-sink empties forever.
         let _core_listener = core
             .add_listener_local()
+            .done({
+                let mainloop = mainloop.clone();
+                let quit_seq = quit_seq.clone();
+                move |id, seq| {
+                    if id == pw::core::PW_ID_CORE && *quit_seq.borrow() == Some(seq) {
+                        mainloop.quit();
+                    }
+                }
+            })
             .error({
                 let mainloop = mainloop.clone();
                 move |id, _seq, res, message| {
@@ -940,22 +993,19 @@ fn pw_thread(
         // announce set — needs a bind + `info`. The daemon writes the key but
         // flushes on the next info emission, so this is last-known, not realtime.
         struct GraphDriver {
-            /// `node.name` of every Node global, so the driver can be named.
-            /// Pruned on removal — a host runs for days and streams come and go.
-            names: HashMap<u32, String>,
             /// Our node, bound so its `info` — and `node.driver-id` — arrives.
             ours: Option<(pw::node::Node, pw::node::NodeListener)>,
             /// Last reported; log only on change.
             driver: Option<u32>,
         }
-        // Null-sink has exactly one right answer (ours). Legacy topologies
-        // borrow a driver by design, so the line names it without judging.
+        // Null-sink has exactly one right answer (ours), or the host output
+        // once playthrough links it. Legacy topologies borrow a driver by
+        // design, so the line names it without judging.
         let expected_driver = match mode {
             CaptureMode::NullSink => sink_name.clone(),
             _ => None,
         };
         let watch = Rc::new(RefCell::new(GraphDriver {
-            names: HashMap::new(),
             ours: None,
             driver: None,
         }));
@@ -964,9 +1014,16 @@ fn pw_thread(
             .add_listener_local()
             .global({
                 let watch = watch.clone();
+                let bridge = bridge.clone();
+                let core = core.clone();
                 let registry = registry.clone();
                 let capture_name = capture_name.clone();
                 move |global| {
+                    {
+                        let mut b = bridge.borrow_mut();
+                        b.on_global(global, &registry);
+                        b.sync(&core);
+                    }
                     if global.type_ != pw::types::ObjectType::Node {
                         return;
                     }
@@ -974,7 +1031,6 @@ fn pw_thread(
                     let Some(name) = props.get("node.name") else {
                         return;
                     };
-                    watch.borrow_mut().names.insert(global.id, name.to_string());
                     if name != capture_name.as_str() || watch.borrow().ours.is_some() {
                         return;
                     }
@@ -985,6 +1041,7 @@ fn pw_thread(
                         .add_listener_local()
                         .info({
                             let watch = watch.clone();
+                            let bridge = bridge.clone();
                             let expected = expected_driver.clone();
                             move |info| {
                                 let Some(props) = info.props() else { return };
@@ -1001,13 +1058,19 @@ fn pw_thread(
                                     return;
                                 }
                                 w.driver = Some(id);
-                                let named = w.names.get(&id).cloned();
-                                let driver = named.as_deref().unwrap_or("<unnamed>");
+                                let b = bridge.borrow();
+                                let driver = b.node_name(id).unwrap_or("<unnamed>");
                                 match expected.as_deref() {
                                     Some(sink) if driver == sink => tracing::info!(
                                         driver,
                                         driver_id = id,
                                         "audio capture graph driver"
+                                    ),
+                                    Some(_) if b.is_host(driver) => tracing::info!(
+                                        driver,
+                                        driver_id = id,
+                                        "audio capture graph driver (host playthrough — the \
+                                         host output clocks the group)"
                                     ),
                                     Some(sink) => tracing::warn!(
                                         driver,
@@ -1036,9 +1099,9 @@ fn pw_thread(
                 }
             })
             .global_remove({
-                let watch = watch.clone();
+                let bridge = bridge.clone();
                 move |id| {
-                    watch.borrow_mut().names.remove(&id);
+                    bridge.borrow_mut().on_remove(id);
                 }
             })
             .register();

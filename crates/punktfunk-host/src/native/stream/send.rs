@@ -197,6 +197,9 @@ pub(super) struct SendStats {
     /// Frames the Windows driver dropped at its pool, session-cumulative. Written by the
     /// encode thread from the driver's telemetry; stays 0 off the driver.
     pub(super) driver_dropped: Arc<AtomicU64>,
+    /// Sealed wire bytes go here each aggregation tick; the control task diffs them into the
+    /// per-minute `link health` line's `egress_mbps`.
+    pub(super) counters: Arc<crate::session_status::SessionCounters>,
 }
 
 /// Whether this session may accept a mid-stream `Reconfigure`.
@@ -236,6 +239,9 @@ pub(super) fn send_loop(
     probe_seq: bool,
 ) {
     boost_thread_priority(false);
+    // Idle tick: with no AU in hand the loop still revisits `stop`, the FEC target and the
+    // 2 s stats window.
+    const IDLE_TICK: std::time::Duration = std::time::Duration::from_millis(50);
     // 3× default: the link carries 1× sustained, so a bounded 3× excursion is safe (WebRTC uses 2.5×).
     // `PUNKTFUNK_PACE_FACTOR=0` restores deadline-only spread.
     let pace_factor: f64 = std::env::var("PUNKTFUNK_PACE_FACTOR")
@@ -270,13 +276,20 @@ pub(super) fn send_loop(
     ) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let (mut new_frames, mut repeat_frames) = (0u64, 0u64);
     let mut streamed: Option<StreamedOpen> = None;
+    let mut burst: Option<ProbeBurst> = None;
     loop {
         if stop.load(Ordering::SeqCst) {
             break;
         }
         // Never mid-AU: a burst spliced between streamed chunks would push the tail past its deadline.
         if streamed.is_none() {
-            service_probes(&mut session, &stop, &probe_rx, &probe_result_tx, probe_seq);
+            service_burst(
+                &mut session,
+                &mut burst,
+                &probe_rx,
+                &probe_result_tx,
+                probe_seq,
+            );
         }
         apply_fec_target(&mut session, &fec_target);
         if streamed.is_none() {
@@ -295,7 +308,13 @@ pub(super) fn send_loop(
                 }
             }
         }
-        match frame_rx.recv_timeout(std::time::Duration::from_millis(50)) {
+        // Wake when the burst's next filler is due, so its rate holds while video shares the
+        // loop. Mid-AU it cannot be pumped, so the idle tick stands.
+        let wait = match burst.as_ref() {
+            Some(b) if streamed.is_none() => b.next_due().min(IDLE_TICK),
+            _ => IDLE_TICK,
+        };
+        match frame_rx.recv_timeout(wait) {
             Ok(send_msg) => {
                 let pace_rate = (stats.bitrate_kbps.load(Ordering::Relaxed) as f64
                     * 1000.0
@@ -453,6 +472,7 @@ pub(super) fn send_loop(
             let s = session.stats();
             let secs = last_perf.elapsed().as_secs_f64();
             let tx_mbps = (s.bytes_sent - last_bytes) as f64 * 8.0 / secs / 1_000_000.0;
+            stats.counters.link.publish_egress_bytes(s.bytes_sent);
             // One window of seal timing feeds both the perf line and the recorder. It runs only
             // while one of them reads it.
             let seal_perf = session.take_seal_perf();
@@ -593,5 +613,9 @@ pub(super) fn send_loop(
             new_frames = 0;
             repeat_frames = 0;
         }
+    }
+    // Stop, teardown, or a dead channel mid-burst: report what went out, leave nothing armed.
+    if let Some(b) = burst {
+        let _ = probe_result_tx.send(b.finish());
     }
 }

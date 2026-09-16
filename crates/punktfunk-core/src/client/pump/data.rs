@@ -33,6 +33,11 @@ pub(super) struct DataPump {
     /// The pinned rate this client could not hold, kbps; `0` until it sheds
     /// its backlog [`PIN_SHEDS_TO_WARN`] times. Embedders show it once.
     pub(super) unsustainable_pin_kbps: Arc<AtomicU32>,
+    /// Previous session's marks for this host ([`crate::abr::AbrMemory`]);
+    /// `None` = start at the host's echo, as before the memory existed.
+    pub(super) abr_seed: Option<crate::abr::AbrMemory>,
+    /// This session's marks, republished every window.
+    pub(super) abr_memory: Arc<Mutex<crate::abr::AbrMemory>>,
     /// Host `BitrateChanged` acks, drained in arrival order. A queue so a
     /// corrective short retarget cannot be clobbered by a full resolve ack
     /// in the same window (host-cap learning needs two consecutive shorts).
@@ -45,6 +50,9 @@ pub(super) struct DataPump {
     pub(super) pipeline_gap: Arc<AtomicU32>,
     /// Embedder-requested rate. `0` = Automatic (the only case ABR arms).
     pub(super) bitrate_kbps: u32,
+    /// "Adapt, but never above N" (kbps); `0` = no limit. Only read while
+    /// `bitrate_kbps == 0`. `PUNKTFUNK_ABR_MAX_MBPS` still overrides it.
+    pub(super) abr_max_kbps: u32,
     /// Rate the host actually configured (Welcome echo; old host echoes 0).
     pub(super) resolved_bitrate_kbps: u32,
     pub(super) negotiated_codec: u8,
@@ -70,6 +78,20 @@ pub(super) struct DataPump {
     pub(super) mode_slot: Arc<Mutex<crate::config::Mode>>,
 }
 
+/// Whether the startup capacity probe is worth its burst.
+///
+/// Only Automatic has a ceiling to learn, and only when one is not already
+/// known: under a user's bitrate limit the burst could at best confirm a number
+/// they typed. PyroWave pins the rate, and a host that echoed `0` never moves.
+fn wants_capacity_probe(
+    bitrate_kbps: u32,
+    rate_pinned: bool,
+    resolved_bitrate_kbps: u32,
+    ceiling_cap_kbps: Option<u32>,
+) -> bool {
+    bitrate_kbps == 0 && !rate_pinned && resolved_bitrate_kbps > 0 && ceiling_cap_kbps.is_none()
+}
+
 impl DataPump {
     pub(super) fn run(self) {
         let DataPump {
@@ -87,10 +109,13 @@ impl DataPump {
             frames_dropped,
             fec_recovered,
             unsustainable_pin_kbps,
+            abr_seed,
+            abr_memory: pump_abr_memory,
             bitrate_ack,
             recovery_kf: pump_recovery_kf,
             pipeline_gap: pump_pipeline_gap,
             bitrate_kbps,
+            abr_max_kbps,
             resolved_bitrate_kbps,
             negotiated_codec,
             bit_depth,
@@ -129,11 +154,21 @@ impl DataPump {
         // All-intra: no reference chain, so the channel drains to newest
         // (`FrameChannel::set_all_intra`) instead of strict FIFO.
         frames.set_all_intra(negotiated_codec == crate::quic::CODEC_PYROWAVE);
-        let mut abr = BitrateController::new(if bitrate_kbps == 0 && !rate_pinned {
-            resolved_bitrate_kbps
-        } else {
-            0
-        });
+        // A cap the user typed is the ceiling the probe would go looking for,
+        // so it stands in for the measurement (see `capacity_probe_at`).
+        let ceiling_cap = crate::abr::ceiling_cap_kbps(abr_max_kbps);
+        let mut abr = BitrateController::with_memory(
+            if bitrate_kbps == 0 && !rate_pinned {
+                resolved_bitrate_kbps
+            } else {
+                0
+            },
+            abr_max_kbps,
+            // Another codec is another encoder's bitstream; the host resolves
+            // Automatic to the same 20 Mbps for all of them, so the echo guard
+            // alone would let an AV1 mark seed an H.264 fallback.
+            abr_seed.filter(|m| m.codec == negotiated_codec),
+        );
         // Bound the probe by stream shape, not raw link capacity. A fat LAN
         // otherwise licenses rates no inter-coded stream can use.
         abr.set_stream_cap(stream_cap_kbps);
@@ -141,6 +176,15 @@ impl DataPump {
         // durations they were calibrated at. 60 Hz would take SEVERE ×0.7
         // on an ordinary one-frame encode hiccup.
         abr.set_frame_budget(refresh_hz);
+        // Seeded start: ask now, not at the first window. 750 ms above what
+        // this host proved fills the path queue, and the drain costs more
+        // than the overshoot.
+        if let Some(kbps) = abr.bring_up(Instant::now()) {
+            if ctrl_tx.try_send(CtrlRequest::SetBitrate(kbps)).is_err() {
+                abr.on_request_dropped();
+                tracing::warn!(kbps, "adaptive bitrate: control queue full at bring-up");
+            }
+        }
         // Startup capacity probe (Automatic): one burst after video flows.
         // Ceiling = delivered × 0.7. Target is `2 × stream_cap` (need
         // delivered ≥ cap × 1.43; `set_ceiling` clamps to the stream cap).
@@ -155,10 +199,13 @@ impl DataPump {
         // Burst aftermath: queue + QUIC loss-recovery sit between host
         // "complete" and our receipt. A late result is discarded.
         const CAPACITY_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
-        let mut capacity_probe_at: Option<Instant> = (bitrate_kbps == 0
-            && !rate_pinned
-            && resolved_bitrate_kbps > 0
-            && std::env::var("PUNKTFUNK_ABR_PROBE").map_or(true, |v| v != "0"))
+        let mut capacity_probe_at: Option<Instant> = (wants_capacity_probe(
+            bitrate_kbps,
+            rate_pinned,
+            resolved_bitrate_kbps,
+            ceiling_cap,
+        ) && std::env::var("PUNKTFUNK_ABR_PROBE")
+            .map_or(true, |v| v != "0"))
         .then(|| Instant::now() + CAPACITY_PROBE_DELAY);
         let mut capacity_probe_deadline: Option<Instant> = None;
         // Leading/trailing edge of any probe (startup or embedder). An
@@ -576,6 +623,12 @@ impl DataPump {
                         );
                     }
                 }
+                // Republished every window: no teardown path is guaranteed
+                // to run, and a killed client still leaves a usable mark.
+                *pump_abr_memory.lock().unwrap() = crate::abr::AbrMemory {
+                    codec: negotiated_codec,
+                    ..abr.memory()
+                };
                 flush_in_window = false;
                 last_report = Instant::now();
                 last_recovered = st.fec_recovered_shards;
@@ -820,6 +873,23 @@ fn wire_bytes(st: &crate::stats::Stats) -> u64 {
 mod tests {
     use super::*;
 
+    /// A known ceiling makes the startup burst pointless: with a limit set the
+    /// probe could only confirm a number the user typed.
+    #[test]
+    fn a_bitrate_limit_stands_in_for_the_startup_capacity_probe() {
+        assert!(wants_capacity_probe(0, false, 20_000, None), "Automatic");
+        assert!(
+            !wants_capacity_probe(0, false, 20_000, Some(12_000)),
+            "a limit already names the ceiling"
+        );
+        assert!(!wants_capacity_probe(50_000, false, 50_000, None), "fixed");
+        assert!(!wants_capacity_probe(0, true, 20_000, None), "PyroWave");
+        assert!(
+            !wants_capacity_probe(0, false, 0, None),
+            "old host echoed 0"
+        );
+    }
+
     /// DeliveryReport: "zero" while true, one confirmation when video
     /// starts, then silence (older hosts warn per unknown message).
     #[test]
@@ -973,6 +1043,7 @@ mod tests {
                 access_deadline_unix: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 access_tx,
                 audio_mute: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+                pad_slots: Arc::new(std::sync::atomic::AtomicU16::new(0)),
             }
             .run(),
         );
@@ -996,11 +1067,14 @@ mod tests {
             mode_gen: Arc::new(AtomicU32::new(0)),
             frames_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             unsustainable_pin_kbps: Arc::new(AtomicU32::new(0)),
+            abr_seed: None,
+            abr_memory: Arc::new(Mutex::new(Default::default())),
             fec_recovered: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             bitrate_ack: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             recovery_kf: Arc::new(AtomicU32::new(0)),
             pipeline_gap: pipeline_gap.clone(),
             bitrate_kbps: 20_000,
+            abr_max_kbps: 0,
             resolved_bitrate_kbps: 20_000,
             negotiated_codec: crate::quic::CODEC_HEVC,
             bit_depth: 8,

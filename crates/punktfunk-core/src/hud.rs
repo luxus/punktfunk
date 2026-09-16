@@ -240,6 +240,8 @@ pub struct Counters {
     /// Smoothed QUIC round trip, µs. `0` = unknown.
     pub rtt_us: u32,
     pub target_kbps: u32,
+    /// OS pad slots this session holds, one bit each ([`crate::quic::PadSlots`]).
+    pub pad_slots: u16,
 }
 
 /// One closed window. Latencies are raw; [`format`] applies the OS-floor policy.
@@ -316,6 +318,9 @@ pub struct StatsSnapshot {
     pub audio_rate_hz: u32,
     pub audio_bits: u8,
     pub audio_channels: u8,
+    /// OS pad slots this session holds, one bit each. Bit `n` = player `n + 1`;
+    /// `0` = no pad, which is most sessions.
+    pub pad_slots: u16,
     pub extras: Vec<Extra>,
 }
 
@@ -376,6 +381,23 @@ fn pct(part: u32, whole: u32) -> f64 {
         0.0
     } else {
         f64::from(part) * 100.0 / f64::from(whole)
+    }
+}
+
+/// How the overlay names a pad-slot mask; `None` when this session holds no pad. One
+/// place, so no client invents its own numbering for which player it is.
+///
+/// Slot `n` is player `n + 1`: a local co-op game reads the OS slot order, and slot 0
+/// is its P1.
+pub fn player_label(slots: u16) -> Option<String> {
+    let players: Vec<String> = (0..crate::input::MAX_PADS)
+        .filter(|n| slots & (1 << n) != 0)
+        .map(|n| (n + 1).to_string())
+        .collect();
+    match players.len() {
+        0 => None,
+        1 => Some(format!("player {}", players[0])),
+        _ => Some(format!("players {}", players.join(" · "))),
     }
 }
 
@@ -762,6 +784,7 @@ impl Stats {
             rtt_us: (c.rtt_us > 0).then_some(c.rtt_us),
             audio_buffer_ms: c.audio_buffer_ms,
             av_offset_ms: c.av_offset_ms,
+            pad_slots: c.pad_slots,
             ..StatsSnapshot::default()
         };
         w.restart(now);
@@ -770,6 +793,10 @@ impl Stats {
 }
 
 /// The overlay for `s` at `tier`, in the Advanced vocabulary when `advanced`.
+///
+/// The player line leads, in both vocabularies and at every tier: which controller
+/// this session is is a session fact, not a diagnostic, and a co-op guest reads it
+/// before anything else. Silent unless the session holds a pad.
 pub fn format(s: &StatsSnapshot, tier: StatsVerbosity, advanced: bool) -> Vec<HudLine> {
     if tier == StatsVerbosity::Off {
         return Vec::new();
@@ -779,6 +806,9 @@ pub fn format(s: &StatsSnapshot, tier: StatsVerbosity, advanced: bool) -> Vec<Hu
     } else {
         standard_lines(s, tier)
     };
+    if let Some(player) = player_label(s.pad_slots) {
+        lines.insert(0, text(Role::Primary, player));
+    }
     lines.extend(
         s.extras
             .iter()
@@ -1816,5 +1846,35 @@ mod tests {
         // A reader older than a field still parses a newer writer's line.
         let partial: StatsSnapshot = serde_json::from_str(r#"{"received":5,"future":1}"#).unwrap();
         assert_eq!(partial.received, 5);
+    }
+
+    /// Slot 0 is Player 1, and the line leads the overlay so a co-op guest reads it
+    /// first. Silent for the sessions that hold no pad, which is most of them.
+    #[test]
+    fn the_player_line_names_every_slot_this_session_holds() {
+        assert_eq!(player_label(0), None);
+        assert_eq!(player_label(0b1).as_deref(), Some("player 1"));
+        assert_eq!(player_label(0b10).as_deref(), Some("player 2"));
+        assert_eq!(player_label(0b1010).as_deref(), Some("players 2 · 4"));
+
+        let mut s = StatsSnapshot {
+            window_ms: 1000,
+            received: 60,
+            ..StatsSnapshot::default()
+        };
+        assert!(!format(&s, StatsVerbosity::Compact, false)[0]
+            .text
+            .starts_with("player"));
+        s.pad_slots = 0b10;
+        for advanced in [true, false] {
+            for tier in [
+                StatsVerbosity::Compact,
+                StatsVerbosity::Normal,
+                StatsVerbosity::Detailed,
+            ] {
+                assert_eq!(format(&s, tier, advanced)[0].text, "player 2");
+            }
+        }
+        assert!(format(&s, StatsVerbosity::Off, false).is_empty());
     }
 }

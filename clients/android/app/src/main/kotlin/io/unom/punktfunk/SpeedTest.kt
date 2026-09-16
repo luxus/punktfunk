@@ -45,7 +45,8 @@ sealed interface SpeedTestTarget {
             presets: PresetStore,
         ): SpeedTestTarget {
             val preset = presets.resolveFor(host, oneOffPreset) ?: return Global
-            return if (preset.overrides.bitrateKbps != null) Preset(preset) else Ask(preset)
+            val owns = preset.overrides.bitrateKbps != null || preset.overrides.abrMaxKbps != null
+            return if (owns) Preset(preset) else Ask(preset)
         }
     }
 }
@@ -149,6 +150,11 @@ suspend fun runSpeedTest(
  * Write a measured bitrate into the layer [target] names. [toPreset] picks the side of a
  * [SpeedTestTarget.Ask]; it is ignored for the other targets, which have only one answer. Returns
  * a human phrase naming where it went, for the confirmation.
+ *
+ * Written as Automatic's LIMIT, not as a fixed rate: a measurement is what the link carried once,
+ * and pinning the encoder to it gives up every adaptation for a number that stops being true when
+ * the link changes. A limit keeps both — and it is the reason this write no longer leaves the
+ * bitrate row showing a value it never chose.
  */
 fun applySpeedTestResult(
     kbps: Int,
@@ -164,14 +170,14 @@ fun applySpeedTestResult(
         SpeedTestTarget.Global -> null
     }
     return if (preset == null) {
-        onGlobalChange(settings.copy(bitrateKbps = kbps))
-        "the default bitrate"
+        onGlobalChange(settings.withBitrateMode(BitrateMode.LIMITED, kbps))
+        "the default bitrate limit"
     } else {
         // Only the bitrate moves — a speed test has nothing to say about the rest of the preset.
         // Re-read rather than trusting the copy this dialog was opened with, so a rename or another
         // edit in between isn't clobbered.
         val live = presets.byId(preset.id) ?: preset
-        presets.save(live.copy(overrides = live.overrides.copy(bitrateKbps = kbps)))
+        presets.save(live.copy(overrides = live.overrides.copy(bitrateKbps = 0, abrMaxKbps = kbps)))
         "“${live.name}”"
     }
 }

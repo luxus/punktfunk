@@ -131,6 +131,8 @@ mod client_logs;
 // Re-`Hello::launch` must not start a second copy — design/session-game-lifetime.md.
 mod launchreg;
 mod library;
+#[forbid(unsafe_code)]
+mod link_health;
 mod log_capture;
 // Network-facing secure-default surface. `not(test)` because tests mutate process env
 // (`set_var` is unsafe in 2024) and `native` has in-process C-ABI roundtrips.
@@ -184,17 +186,24 @@ use encode::Codec;
 use spike::{Options, Source};
 use std::path::PathBuf;
 
+/// Console filter when `RUST_LOG` is unset. `zbus::proxy` warns once per portal
+/// Request/Session proxy whose server answers no `org.freedesktop.DBus.Properties`
+/// — four per stream under xdg-desktop-portal-hyprland/-wlr, and nothing in the
+/// portal flow reads a property off those two transient objects. It is the module's
+/// only `warn!`, so `error` there costs nothing else. The ring keeps them regardless.
+const DEFAULT_LOG_FILTER: &str = "info,zbus::proxy=error";
+
 fn main() {
     // Before any `ureq` agent (cover-art, webhooks, catalog, updates).
     punktfunk_core::tls::install_default_provider();
-    let filter =
-        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| DEFAULT_LOG_FILTER.into());
     // SCM `service run` has no console; log to a file, not stderr.
     if windows::entry::service_run_requested() {
         windows::entry::init_file_logging(filter);
     } else {
         // stderr so stdout stays machine-readable (`openapi > spec.json`). The ring tees DEBUG+
-        // ungated by RUST_LOG so the console Logs tab works without a restart.
+        // past this filter, so the Logs tab keeps every line stderr drops.
         use tracing_subscriber::layer::SubscriberExt;
         use tracing_subscriber::Layer;
         log_capture::install_global(
@@ -315,6 +324,24 @@ pub(crate) fn refresh_capture_monitor_anchor(context: &str) {
     }
 }
 
+/// Take the credentials out of our own environment before anything can inherit them: hooks, games
+/// and the plugin runner are children of this process, and none of them has business with the
+/// admin API. `mgmt_token` keeps the values and persists a pinned one to its file.
+fn take_env_credentials() {
+    let read = |k: &str| {
+        std::env::var(k)
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    mgmt_token::adopt_env_tokens(read("PUNKTFUNK_MGMT_TOKEN"), read("PUNKTFUNK_PLUGIN_TOKEN"));
+    for key in mgmt_token::CREDENTIAL_ENV_VARS {
+        // SAFETY: the first statement of `real_main`, so this process is still single-threaded and
+        // nothing can read the environment concurrently.
+        unsafe { std::env::remove_var(key) };
+    }
+}
+
 // Package/service/driver CLI: skip the banner and the Windows GPU-pref hook (its DPI
 // probe WARNs `access denied` on `plugins add`). `service run` is the SCM host, not CLI.
 fn is_management_cli(args: &[String]) -> bool {
@@ -340,6 +367,7 @@ fn is_management_cli(args: &[String]) -> bool {
 }
 
 fn real_main() -> Result<()> {
+    take_env_credentials();
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     if matches!(
@@ -642,14 +670,6 @@ fn parse_serve(args: &[String]) -> Result<(mgmt::Options, native::NativeServe, b
                     .map_err(|_| anyhow::anyhow!("bad --mgmt-bind (want IP:PORT)"))?;
                 mgmt_bind_explicit = true;
             }
-            "--mgmt-token" => {
-                let token = next()?;
-                // Empty satisfies "token required" while authenticating nobody (`"$UNSET_VAR"`).
-                if token.trim().is_empty() {
-                    bail!("--mgmt-token must not be empty");
-                }
-                opts.token = Some(token);
-            }
             // No-op: the native plane always runs.
             "--native" => {}
             "--native-port" => {
@@ -688,7 +708,7 @@ fn parse_serve(args: &[String]) -> Result<(mgmt::Options, native::NativeServe, b
         }
         i += 1;
     }
-    // Flag, else env, else persisted `mgmt-token`, else generate. HTTPS+token even on loopback.
+    // Env (persisted), else the `mgmt-token` file, else generate. HTTPS+token even on loopback.
     if opts.token.is_none() {
         opts.token = Some(crate::mgmt_token::load_or_generate()?);
     }
@@ -696,6 +716,10 @@ fn parse_serve(args: &[String]) -> Result<(mgmt::Options, native::NativeServe, b
     // on disk for a subsystem that is not running. Scope: `plugin_may_access`, not pairing/hooks.
     if crate::plugins::runtime_status().installed {
         opts.plugin_token = Some(crate::mgmt_token::load_or_generate_plugin()?);
+        // One token per installed plugin, so the API can tell them apart: a plugin may write its
+        // own registration and its own provider, and no other's.
+        let ids: Vec<String> = crate::plugins::manifest::installed().into_keys().collect();
+        opts.plugin_tokens = crate::mgmt_token::load_or_generate_per_plugin(&ids)?;
     }
     // Default all-interfaces so paired clients browse over mTLS. Admin stays loopback in
     // `require_auth`. Packaged units ship a fixed ExecStart — `host.env` is the upgrade-safe pin;
@@ -926,9 +950,6 @@ SERVE OPTIONS:
                                  bind loopback only. Move the PORT (e.g. 0.0.0.0:47991) to share a
                                  machine with Sunshine/Apollo/Vibeshine, whose web UI owns 47990 —
                                  clients follow via mDNS and the console via mgmt-endpoint
-    --mgmt-token <TOKEN>         bearer token for the management API (or PUNKTFUNK_MGMT_TOKEN); the
-                                 admin endpoints it guards are honored only from a loopback peer
-                                 (the co-located web console), never over the LAN
     --gamestream  (--moonlight)  ALSO run the GameStream/Moonlight-compat planes (nvhttp pairing,
                                  RTSP, ENet control, _nvstream mDNS). OFF by default — they carry
                                  inherent on-path weaknesses (plain-HTTP pairing + legacy GCM nonce

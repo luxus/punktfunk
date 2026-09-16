@@ -419,6 +419,7 @@ mod session_main {
                 }
             },
             bitrate_kbps: settings.bitrate_kbps,
+            abr_max_kbps: settings.abr_max_kbps,
             audio_channels: settings.audio_channels,
             // The lossless-audio opt-in, AS STORED — the pump is what filters it, because only it
             // knows whether this box's output device will open the rate and what the host

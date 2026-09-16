@@ -39,6 +39,9 @@ pub enum RowId {
     /// `trust::Settings::video_fit`: bars, crop or stretch when the stream's shape differs.
     VideoFit,
     Bitrate,
+    /// `trust::Settings::abr_max_kbps`. Automatic's ceiling; shown only while
+    /// Bitrate is Automatic, which is the only mode that reads it.
+    BitrateCap,
     Compositor,
     Codec,
     Decoder,
@@ -195,6 +198,7 @@ const TABS: [(&str, &[RowId]); 7] = [
             RowId::RenderScale,
             RowId::VideoFit,
             RowId::Bitrate,
+            RowId::BitrateCap,
             RowId::Compositor,
         ],
     ),
@@ -332,6 +336,30 @@ fn bitrate_rungs(platform: crate::platform::Platform) -> usize {
         .position(|b| *b > ceiling)
         .unwrap_or(BITRATES.len())
 }
+/// One ladder step for a bitrate row, in kbps. Index 0 (`0`) is Automatic on the
+/// Bitrate row and No limit on the limit row. An off-ladder value must not snap to
+/// it: step to the neighbour the thumb is heading for. Only the rungs this platform
+/// may reach ([`bitrate_rungs`]) — a value stored above them (another client, a
+/// shared preset) still steps DOWN from where it is rather than being rewritten.
+fn step_bitrate(
+    cur_kbps: u32,
+    platform: crate::platform::Platform,
+    delta: i32,
+    wrap: bool,
+) -> Option<u32> {
+    let rungs = &BITRATES[..bitrate_rungs(platform)];
+    match rungs.iter().position(|b| *b == cur_kbps) {
+        Some(i) => step_option(Some(i), rungs.len(), delta, wrap),
+        None if delta < 0 => rungs.iter().rposition(|b| *b < cur_kbps),
+        // Above the ceiling: wrap goes to the first rung; clamp thuds.
+        None => rungs
+            .iter()
+            .position(|b| *b > cur_kbps)
+            .or(if wrap { Some(0) } else { None }),
+    }
+    .map(|i| rungs[i])
+}
+
 const COMPOSITORS: [(&str, &str); 6] = [
     ("auto", "Automatic"),
     ("kwin", "KWin"),
@@ -422,7 +450,9 @@ pub(crate) struct SettingsScreen {
     /// D-pad focus on the strip. TV remotes have no shoulders and no Tab key.
     strip_focus: bool,
     /// Typed Mbps while Y has the bitrate field open. Y, not A, so A still cycles.
-    custom_bitrate: Option<String>,
+    /// Typed Mbps while the field is open, and which of the two bitrate rows
+    /// opened it. `None` = closed.
+    custom_bitrate: Option<(RowId, String)>,
     /// Tray keyboard. Unused on Deck: Steam's keyboard types (same as add-host).
     keyboard: Keyboard,
 }
@@ -461,7 +491,7 @@ impl SettingsScreen {
     }
 
     fn type_char(&mut self, ch: char) -> bool {
-        let Some(buf) = self.custom_bitrate.as_mut() else {
+        let Some((_, buf)) = self.custom_bitrate.as_mut() else {
             return false;
         };
         if !permits(Charset::Digits, ch) || buf.chars().count() >= 4 {
@@ -472,7 +502,10 @@ impl SettingsScreen {
     }
 
     fn backspace(&mut self) -> bool {
-        self.custom_bitrate.as_mut().and_then(String::pop).is_some()
+        self.custom_bitrate
+            .as_mut()
+            .and_then(|(_, buf)| buf.pop())
+            .is_some()
     }
 
     pub(crate) fn edit_key(&mut self, key: crate::input::Key, ctx: &mut Ctx) -> bool {
@@ -493,9 +526,10 @@ impl SettingsScreen {
         }
     }
 
-    /// Close the field. Empty or `0` is an abandoned edit, not Automatic (the first rung).
+    /// Close the field. Empty or `0` is an abandoned edit, not the first rung
+    /// (Automatic, or No limit).
     fn commit_custom(&mut self, ctx: &mut Ctx) {
-        let Some(text) = self.custom_bitrate.take() else {
+        let Some((row, text)) = self.custom_bitrate.take() else {
             return;
         };
         let Ok(mbps) = text.parse::<u32>() else {
@@ -507,7 +541,14 @@ impl SettingsScreen {
         // Rebase first: another writer may have stored the file while the keyboard was up.
         *ctx.settings = ctx.store.load();
         let ceiling_mbps = bitrate_ceiling_kbps(ctx.platform) / 1_000;
-        ctx.settings.bitrate_kbps = mbps.min(ceiling_mbps) * 1000;
+        let kbps = mbps.min(ceiling_mbps) * 1000;
+        if row == RowId::BitrateCap {
+            ctx.settings.abr_max_kbps = kbps;
+        } else {
+            // A fixed rate replaces the limit; see the same rule in `adjust`.
+            ctx.settings.bitrate_kbps = kbps;
+            ctx.settings.abr_max_kbps = 0;
+        }
         ctx.store.save(ctx.settings);
     }
 
@@ -686,10 +727,11 @@ impl SettingsScreen {
         self.clamp_cursor(ids.len());
         // Y opens the typed bitrate. Skip under PyroWave: the row is inert (`row_spec`).
         if ev == MenuEvent::Secondary {
-            return if ids.get(self.list.cursor) == Some(&RowId::Bitrate)
+            let row = ids.get(self.list.cursor).copied();
+            return if matches!(row, Some(RowId::Bitrate | RowId::BitrateCap))
                 && ctx.settings.codec != "pyrowave"
             {
-                self.custom_bitrate = Some(String::new());
+                self.custom_bitrate = Some((row.expect("matched"), String::new()));
                 Some(MenuPulse::Confirm)
             } else {
                 None
@@ -853,10 +895,10 @@ impl SettingsScreen {
                 Hint::new(HintKey::Back, "Done"),
             ],
             // Inert under PyroWave (`row_spec`): no Adjust hint.
-            Some(RowId::Bitrate) if ctx.settings.codec == "pyrowave" => {
+            Some(RowId::Bitrate | RowId::BitrateCap) if ctx.settings.codec == "pyrowave" => {
                 vec![Hint::new(HintKey::Back, "Done")]
             }
-            Some(RowId::Bitrate) => vec![
+            Some(RowId::Bitrate | RowId::BitrateCap) => vec![
                 Hint::new(HintKey::Adjust, "Adjust"),
                 Hint::new(HintKey::Secondary, "Type a rate"),
                 Hint::new(HintKey::Back, "Done"),
@@ -913,11 +955,12 @@ impl SettingsScreen {
             .iter()
             .map(|id| row_spec(*id, ctx, &self.presets, &self.overrides))
             .collect();
-        // Field-open: the Bitrate row shows the typed digits and the caret.
-        if let (Some(text), Some(i)) = (
-            self.custom_bitrate.as_ref(),
-            ids.iter().position(|id| *id == RowId::Bitrate),
-        ) {
+        // Field-open: the edited row shows the typed digits and the caret.
+        if let Some((text, i)) = self
+            .custom_bitrate
+            .as_ref()
+            .and_then(|(row, text)| ids.iter().position(|id| id == row).map(|i| (text, i)))
+        {
             rows[i].value = Some(if text.is_empty() {
                 "Mbps".into()
             } else {
@@ -1026,6 +1069,8 @@ pub fn row_on(id: RowId, platform: crate::platform::Platform) -> bool {
 pub fn row_applies(id: RowId, ctx: &Ctx) -> bool {
     match id {
         RowId::SmoothBuffer => ctx.settings.present_priority == "smooth",
+        // Only Automatic adapts, so only Automatic has a ceiling to limit.
+        RowId::BitrateCap => ctx.settings.bitrate_kbps == 0,
         // Needs `fallback_ui`; otherwise off strands the user with no UI.
         RowId::GamepadUi => ctx.fallback_ui,
         // Hidden unless fallback_ui and the switch above is on. Sits below that
@@ -1118,7 +1163,8 @@ fn overrides_row(id: RowId, o: &SettingsOverlay) -> bool {
         RowId::Refresh => o.refresh_hz.is_some(),
         RowId::RenderScale => o.render_scale.is_some(),
         RowId::VideoFit => o.video_fit.is_some(),
-        RowId::Bitrate => o.bitrate_kbps.is_some(),
+        // One overlay key: the pair spells one mode (`SettingsOverlay::apply`).
+        RowId::Bitrate | RowId::BitrateCap => o.bitrate_kbps.is_some(),
         RowId::Compositor => o.compositor.is_some(),
         RowId::Codec => o.codec.is_some(),
         RowId::Hdr => o.hdr_enabled.is_some(),
@@ -1190,7 +1236,7 @@ fn row_spec_base(id: RowId, ctx: &Ctx, presets: &[(String, String)]) -> RowSpec 
     let enabled = match id {
         RowId::EchoCancel => s.mic_enabled,
         // PyroWave ignores stored bitrate (session sends 0). Dim; keep the value.
-        RowId::Bitrate => s.codec != "pyrowave",
+        RowId::Bitrate | RowId::BitrateCap => s.codec != "pyrowave",
         // Session still drops lossless unless `audio_channels == 2` (before the wire).
         // A live row under surround would change nothing. Delete this arm when that
         // filter learns the frame ladder — not before.
@@ -1248,6 +1294,15 @@ fn row_spec_base(id: RowId, ctx: &Ctx, presets: &[(String, String)]) -> RowSpec 
                 "Automatic".into()
             } else {
                 bitrate_label(s.bitrate_kbps)
+            },
+        ),
+        RowId::BitrateCap => (
+            None,
+            "Bitrate limit",
+            if s.abr_max_kbps == 0 {
+                "No limit".into()
+            } else {
+                bitrate_label(s.abr_max_kbps)
             },
         ),
         RowId::Compositor => (
@@ -1503,7 +1558,13 @@ pub fn detail(id: RowId, ctx: &Ctx) -> &'static str {
              doesn't apply. Pick another codec to use this setting."
         }
         RowId::Bitrate => {
-            "Automatic uses the host's default (20 Mbps). Y types an exact rate, up to 2 Gbps."
+            "Automatic starts at the host's default and follows the link. Y types an exact \
+             rate, up to 2 Gbps — a fixed rate never adapts."
+        }
+        RowId::BitrateCap => {
+            "Automatic adapts but never climbs past this. Set it to what your link really \
+             carries and the session starts there instead of finding the wall every time. \
+             Y types an exact limit."
         }
         RowId::Compositor => {
             "Which compositor drives the virtual output — honored only if available on the host."
@@ -1835,23 +1896,20 @@ pub fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
             if s.codec == "pyrowave" {
                 return false;
             }
-            // Off-ladder must not snap to Automatic (index 0). Step to the neighbour
-            // the thumb is heading for.
-            // Only the rungs this platform may reach — see [`bitrate_rungs`]. A value stored
-            // above them (set on another client, or in a shared preset) still steps DOWN
-            // from where it is rather than being silently rewritten here.
-            let rungs = &BITRATES[..bitrate_rungs(platform)];
-            let stepped = match rungs.iter().position(|b| *b == s.bitrate_kbps) {
-                Some(i) => step_option(Some(i), rungs.len(), delta, wrap),
-                None if delta < 0 => rungs.iter().rposition(|b| *b < s.bitrate_kbps),
-                // Above the ceiling: wrap goes to Automatic; clamp thuds.
-                None => rungs.iter().position(|b| *b > s.bitrate_kbps).or(if wrap {
-                    Some(0)
-                } else {
-                    None
-                }),
-            };
-            stepped.map(|i| s.bitrate_kbps = rungs[i])
+            step_bitrate(s.bitrate_kbps, platform, delta, wrap).map(|kbps| {
+                // A fixed rate and a limit are different modes, so only one of the
+                // pair is ever set — the limit row can never describe a dead value.
+                s.bitrate_kbps = kbps;
+                if kbps > 0 {
+                    s.abr_max_kbps = 0;
+                }
+            })
+        }
+        RowId::BitrateCap => {
+            if s.codec == "pyrowave" {
+                return false;
+            }
+            step_bitrate(s.abr_max_kbps, platform, delta, wrap).map(|kbps| s.abr_max_kbps = kbps)
         }
         RowId::Compositor => step_str(&COMPOSITORS, &mut s.compositor, delta, wrap),
         RowId::Codec => step_str(codecs(platform), &mut s.codec, delta, wrap),
@@ -2885,6 +2943,77 @@ pub(crate) mod tests {
         assert!(!s.editing());
     }
 
+    /// The three modes, each rendered as what is actually in effect. The limit row
+    /// exists only under Automatic, and picking a fixed rate takes the limit with
+    /// it — a row must never show a limit while a fixed rate runs.
+    #[test]
+    fn the_bitrate_rows_name_the_mode_in_force() {
+        fn value(id: RowId, ctx: &Ctx) -> String {
+            row_spec_base(id, ctx, &[]).value.unwrap_or_default()
+        }
+        with_ctx(|ctx| {
+            assert_eq!(value(RowId::Bitrate, ctx), "Automatic");
+            assert!(row_applies(RowId::BitrateCap, ctx));
+            assert_eq!(value(RowId::BitrateCap, ctx), "No limit");
+
+            // Adaptive, at most 15: the rate row still says Automatic, because it is.
+            ctx.settings.abr_max_kbps = 15_000;
+            assert_eq!(value(RowId::Bitrate, ctx), "Automatic");
+            assert_eq!(value(RowId::BitrateCap, ctx), "15 Mbps");
+
+            // A fixed rate is a different mode: the limit goes, and its row with it.
+            assert!(adjust(RowId::Bitrate, 1, false, ctx));
+            assert_eq!(ctx.settings.bitrate_kbps, 1_000);
+            assert_eq!(ctx.settings.abr_max_kbps, 0, "a fixed rate drops the limit");
+            assert!(!row_applies(RowId::BitrateCap, ctx));
+
+            // An off-ladder rate reads as its own number, never as the first rung.
+            ctx.settings.bitrate_kbps = 14_000;
+            assert_eq!(value(RowId::Bitrate, ctx), "14 Mbps");
+            ctx.settings.bitrate_kbps = 0;
+            ctx.settings.abr_max_kbps = 14_000;
+            assert_eq!(value(RowId::BitrateCap, ctx), "14 Mbps");
+
+            // The limit steps on the same ladder, and Automatic's rung is No limit.
+            assert!(adjust(RowId::BitrateCap, -1, false, ctx));
+            assert_eq!(ctx.settings.abr_max_kbps, 12_000);
+        });
+    }
+
+    /// Y on the limit row types a limit, not a rate: the two must not cross.
+    #[test]
+    fn a_typed_limit_lands_on_the_limit_row() {
+        let (mut settings, pads) = ctx_parts();
+        let library = crate::library::LibraryShared::default();
+        let store = crate::store::SnapshotStore::new(settings.clone(), Vec::new());
+        let mut ctx = Ctx {
+            hosts: &[],
+            library: &library,
+            settings: &mut settings,
+            store: &store,
+            platform: crate::platform::Platform::Desktop,
+            pads: &pads,
+            deck: false,
+            fallback_ui: false,
+            pyrowave_ok: true,
+            device_name: "t",
+            t: 0.0,
+        };
+        let mut s = SettingsScreen::with_presets(Vec::new());
+        let mut fx = Outbox::default();
+        let ids = s.row_ids(&ctx);
+        s.list.cursor = ids
+            .iter()
+            .position(|id| *id == RowId::BitrateCap)
+            .expect("the limit row");
+        s.menu(MenuEvent::Secondary, &mut ctx, &mut fx);
+        assert!(s.editing(), "Y opens the field here too");
+        s.text_input("14");
+        assert!(s.edit_key(crate::input::Key::Return, &mut ctx));
+        assert_eq!(ctx.settings.abr_max_kbps, 14_000);
+        assert_eq!(ctx.settings.bitrate_kbps, 0, "still Automatic");
+    }
+
     #[test]
     fn rates_read_in_the_biggest_round_unit() {
         assert_eq!(bitrate_label(20_000), "20 Mbps");
@@ -3207,7 +3336,7 @@ pub(crate) mod tests {
                 seen.push(*id);
             }
         }
-        assert_eq!(seen.len(), 55, "{seen:?}");
+        assert_eq!(seen.len(), 56, "{seen:?}");
         assert!(seen.contains(&RowId::StartIn));
         assert!(seen.contains(&RowId::AdvancedStats));
         assert!(seen.contains(&RowId::FollowOsTheme));

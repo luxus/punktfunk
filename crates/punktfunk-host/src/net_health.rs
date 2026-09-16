@@ -179,7 +179,8 @@ pub fn log_addresses() {
     tracing::info!(addrs = %rendered.join(" "), "host addresses");
 }
 
-/// Log every link, IPv4 address and main-table route change for the life of the host.
+/// Log every IPv4 address and main-table route event, and every link whose flags moved,
+/// for the life of the host.
 #[cfg(target_os = "linux")]
 pub fn spawn_route_watch() {
     let _ = std::thread::Builder::new()
@@ -189,6 +190,40 @@ pub fn spawn_route_watch() {
 
 #[cfg(not(target_os = "linux"))]
 pub fn spawn_route_watch() {}
+
+/// Folds a link re-announcing flags it already had. NetworkManager's periodic scan makes
+/// the kernel re-emit `RTM_NEWLINK` for an idle Wi-Fi NIC every 10-25 s, unchanged; only a
+/// move is churn. The rendered line carries the flags next to `iface=`, so the line itself
+/// is the state — [`netlink_events`] never builds them into anything longer-lived.
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct LinkDedupe(std::collections::HashMap<String, String>);
+
+#[cfg(target_os = "linux")]
+impl LinkDedupe {
+    /// True when `line` is worth a log line. A `link gone` forgets the interface, so the
+    /// re-add speaks again; address and route lines always pass, because an address re-add
+    /// is a live re-commit and not a re-announcement.
+    fn is_news(&mut self, line: &str) -> bool {
+        let Some(rest) = line.strip_prefix("link ") else {
+            return true;
+        };
+        let gone = rest.starts_with("gone ");
+        let rest = rest.strip_prefix("gone ").unwrap_or(rest);
+        let Some((iface, flags)) = rest.strip_prefix("iface=").and_then(|r| r.split_once(' '))
+        else {
+            return true;
+        };
+        if gone {
+            self.0.remove(iface);
+            return true;
+        }
+        self.0
+            .insert(iface.to_string(), flags.to_string())
+            .as_deref()
+            != Some(flags)
+    }
+}
 
 #[cfg(target_os = "linux")]
 fn route_watch() {
@@ -224,11 +259,12 @@ fn route_watch() {
         return;
     }
     let mut buf = vec![0u8; 32 * 1024];
-    // Rate limit: a container host adds veths in bursts. Past the budget the minute
-    // closes with one count instead of a flood.
+    // Rate limit: a container host adds veths in bursts. Past the budget, as for a link
+    // repeating its flags, the minute closes with one count instead of a flood.
     const BUDGET: u32 = 20;
     let mut minute = Instant::now();
-    let (mut spent, mut suppressed) = (0u32, 0u64);
+    let (mut spent, mut suppressed, mut repeats) = (0u32, 0u64, 0u64);
+    let mut links = LinkDedupe::default();
     loop {
         // SAFETY: `buf` is writable for `buf.len()` bytes and outlives the call.
         let n = unsafe { libc::recv(fd, buf.as_mut_ptr().cast(), buf.len(), 0) };
@@ -239,15 +275,22 @@ fn route_watch() {
             break;
         }
         if minute.elapsed() >= Duration::from_secs(60) {
-            if suppressed > 0 {
-                tracing::info!(suppressed, "network changed: more events not listed");
+            if suppressed > 0 || repeats > 0 {
+                tracing::info!(
+                    suppressed,
+                    repeats,
+                    "network changed: more events not listed"
+                );
             }
             minute = Instant::now();
             spent = 0;
             suppressed = 0;
+            repeats = 0;
         }
         for line in netlink_events(&buf[..n as usize]) {
-            if spent < BUDGET {
+            if !links.is_news(&line) {
+                repeats += 1;
+            } else if spent < BUDGET {
                 spent += 1;
                 tracing::info!("network changed: {line}");
             } else {
@@ -444,6 +487,71 @@ mod tests {
             lines,
             vec!["route gone dst=default via=192.168.178.1".to_string()]
         );
+    }
+
+    const UP: u32 = libc::IFF_UP as u32;
+    const UP_RUNNING: u32 = UP | libc::IFF_RUNNING as u32 | libc::IFF_LOWER_UP as u32;
+
+    /// The line the watch would log, built by the parser itself: the dedupe keys off
+    /// that exact rendering, so a format change has to fail here.
+    fn link_line(ty: u16, index: i32, flags: u32) -> String {
+        let mut body = vec![0u8; 16];
+        body[4..8].copy_from_slice(&index.to_ne_bytes());
+        body[8..12].copy_from_slice(&flags.to_ne_bytes());
+        netlink_events(&msg(ty, &body))
+            .pop()
+            .expect("one link line")
+    }
+
+    #[test]
+    fn a_link_repeating_its_flags_is_logged_once() {
+        let mut d = LinkDedupe::default();
+        let line = link_line(libc::RTM_NEWLINK, 1, UP);
+        assert_eq!(line, "link iface=lo up=true running=false carrier=false");
+        assert!(d.is_news(&line));
+        assert!(!d.is_news(&line));
+    }
+
+    #[test]
+    fn a_flag_move_and_the_move_back_both_log() {
+        let mut d = LinkDedupe::default();
+        assert!(d.is_news(&link_line(libc::RTM_NEWLINK, 1, UP)));
+        assert!(d.is_news(&link_line(libc::RTM_NEWLINK, 1, UP_RUNNING)));
+        // A carrier that returns is the news a carrier drop was.
+        assert!(d.is_news(&link_line(libc::RTM_NEWLINK, 1, UP)));
+    }
+
+    #[test]
+    fn two_interfaces_keep_their_own_flags() {
+        let mut d = LinkDedupe::default();
+        assert!(d.is_news(&link_line(libc::RTM_NEWLINK, 1, UP)));
+        assert!(d.is_news(&link_line(libc::RTM_NEWLINK, 9999, UP)));
+        assert!(!d.is_news(&link_line(libc::RTM_NEWLINK, 1, UP)));
+        assert!(!d.is_news(&link_line(libc::RTM_NEWLINK, 9999, UP)));
+    }
+
+    #[test]
+    fn a_link_that_went_away_logs_on_its_re_add() {
+        let mut d = LinkDedupe::default();
+        assert!(d.is_news(&link_line(libc::RTM_NEWLINK, 1, UP)));
+        let gone = link_line(libc::RTM_DELLINK, 1, UP);
+        assert_eq!(
+            gone,
+            "link gone iface=lo up=true running=false carrier=false"
+        );
+        assert!(d.is_news(&gone));
+        assert!(d.is_news(&link_line(libc::RTM_NEWLINK, 1, UP)));
+    }
+
+    #[test]
+    fn address_and_route_lines_never_fold() {
+        let mut d = LinkDedupe::default();
+        let addr = "address iface=lo addr=192.168.178.73/24";
+        assert!(d.is_news(addr));
+        assert!(d.is_news(addr));
+        let route = "route dst=default via=192.168.178.1 iface=lo";
+        assert!(d.is_news(route));
+        assert!(d.is_news(route));
     }
 
     #[test]

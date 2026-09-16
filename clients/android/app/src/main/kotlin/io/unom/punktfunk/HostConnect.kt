@@ -146,7 +146,8 @@ private suspend fun dial(
         val request = ConnectRequest(
             host = host, port = port, width = w, height = h, refreshHz = hz,
             certPem = identity.certPem, keyPem = identity.privateKeyPem, pinHex = pinHex,
-            bitrateKbps = settings.bitrateKbps, compositorPref = settings.compositor,
+            bitrateKbps = settings.bitrateKbps, abrMaxKbps = settings.abrMaxKbps,
+            compositorPref = settings.compositor,
             gamepadPref = gamepadPref,
             hdrEnabled = hdrEnabled, tenBitSdr = tenBitSdr, multiSliceOk = multiSlice,
             framePartsOk = frameParts,

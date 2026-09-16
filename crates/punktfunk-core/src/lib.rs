@@ -23,8 +23,10 @@
 // JS identifier.
 #[cfg(not(target_family = "wasm"))]
 pub mod abi;
+// Public for the one type the embedder persists per host; the controller stays crate-private.
+/// cbindgen:ignore
 #[cfg(feature = "quic")]
-mod abr;
+pub mod abr;
 pub mod audio;
 #[cfg(feature = "quic")]
 pub mod client;
@@ -85,7 +87,7 @@ pub use stats::Stats;
 /// Not [`WIRE_VERSION`]. The C surface can grow without a wire byte changing.
 /// Pin the integer in `abi.rs` (`abi_version_is_pinned`). Per-bump notes live
 /// in `CHANGELOG.md`.
-pub const ABI_VERSION: u32 = 34;
+pub const ABI_VERSION: u32 = 35;
 
 /// punktfunk/1 wire version. `Hello`/`Welcome` carry it; hosts equality-check it.
 ///

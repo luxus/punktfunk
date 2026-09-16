@@ -1925,6 +1925,7 @@ pub unsafe extern "C" fn punktfunk_connect_ex7(
             0,
             0,
             0,
+            0, // no ABR limit
             timeout_ms,
             std::ptr::null_mut(),
         )
@@ -1986,6 +1987,7 @@ pub unsafe extern "C" fn punktfunk_connect_ex8(
             0,
             0,
             0,
+            0, // no ABR limit
             timeout_ms,
             status_out,
         )
@@ -2048,6 +2050,7 @@ pub unsafe extern "C" fn punktfunk_connect_ex9(
             0,
             0,
             0,
+            0, // no ABR limit
             timeout_ms,
             status_out,
         )
@@ -2112,6 +2115,7 @@ pub unsafe extern "C" fn punktfunk_connect_ex10(
             0,
             0,
             0,
+            0, // no ABR limit
             timeout_ms,
             status_out,
         )
@@ -2183,6 +2187,7 @@ pub unsafe extern "C" fn punktfunk_connect_ex11(
             audio_rate_hz,
             audio_bits,
             0,
+            0, // no ABR limit
             timeout_ms,
             status_out,
         )
@@ -2249,6 +2254,7 @@ pub unsafe extern "C" fn punktfunk_connect_ex12(
             audio_rate_hz,
             audio_bits,
             video_fit,
+            0, // no ABR limit
             timeout_ms,
             status_out,
         )
@@ -2356,15 +2362,23 @@ pub struct PunktfunkConnectOpts {
     pub preferred_codec: u8,
     /// `PUNKTFUNK_CLIENT_CAP_*` bits ([`punktfunk_connect_ex9`]).
     pub client_caps: u8,
+    /// ABR limit in kbps: adapt, but never climb above this. `0` = no limit, and
+    /// it is read only while `bitrate_kbps` is `0` (Automatic). The cap binds the
+    /// negotiated start too, so a capped session never emits a faster first second.
+    pub abr_max_kbps: u32,
+    /// Always `0`. Fills what would otherwise be tail padding: C leaves padding
+    /// unspecified even under `= {0}`, so the next appended field would read a
+    /// caller's garbage. Spend this before growing the struct again.
+    pub reserved0: u32,
 }
 
 // No tail padding (append contract). On grow: freeze `CONNECT_OPTS_MIN_SIZE`, update these sizes.
 #[cfg(feature = "quic")]
 const _: () = {
     #[cfg(target_pointer_width = "64")]
-    assert!(core::mem::size_of::<PunktfunkConnectOpts>() == 96);
+    assert!(core::mem::size_of::<PunktfunkConnectOpts>() == 104);
     #[cfg(target_pointer_width = "32")]
-    assert!(core::mem::size_of::<PunktfunkConnectOpts>() == 68);
+    assert!(core::mem::size_of::<PunktfunkConnectOpts>() == 76);
 };
 
 /// Minimum `struct_size` [`punktfunk_connect_opts`] accepts. Frozen: when the
@@ -2447,6 +2461,7 @@ pub unsafe extern "C" fn punktfunk_connect_opts(
             o.audio_rate_hz,
             o.audio_bits,
             0,
+            o.abr_max_kbps,
             o.timeout_ms,
             status_out,
         )
@@ -2480,6 +2495,7 @@ unsafe fn connect_ex_impl(
     audio_rate_hz: u32,
     audio_bits: u8,
     video_fit: u8,
+    abr_max_kbps: u32,
     timeout_ms: u32,
     status_out: *mut i32,
 ) -> *mut PunktfunkConnection {
@@ -2554,6 +2570,7 @@ unsafe fn connect_ex_impl(
             pref,
             gamepad,
             bitrate_kbps,
+            abr_max_kbps,
             video_caps,
             crate::audio::normalize_channels(audio_channels),
             // Unvalidated on purpose: a bad rate is the host's to decline, not a failed connect.
@@ -2576,6 +2593,9 @@ unsafe fn connect_ex_impl(
             pin,
             identity,
             std::time::Duration::from_millis(timeout_ms as u64),
+            // No ABR memory over the C ABI: these embedders keep their host list on the
+            // platform side, so Automatic starts at the host's echo here.
+            None,
             // No abort switch: connect is blocking with nothing to poll.
             None,
         ) {
@@ -6106,8 +6126,8 @@ mod abi_version_tests {
     #[test]
     fn abi_version_is_pinned() {
         // Current ABI. A bump must update this pin.
-        assert_eq!(crate::ABI_VERSION, 34);
-        assert_eq!(super::punktfunk_abi_version(), 34);
+        assert_eq!(crate::ABI_VERSION, 35);
+        assert_eq!(super::punktfunk_abi_version(), 35);
     }
 
     #[test]

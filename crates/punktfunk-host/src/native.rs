@@ -1643,6 +1643,15 @@ pub(crate) async fn run_admitted(
     let (access_tx, access_rx) = tokio::sync::mpsc::unbounded_channel::<AccessUpdate>();
     let (audio_tx, audio_rx) =
         tokio::sync::mpsc::unbounded_channel::<punktfunk_core::quic::AudioState>();
+    // Input thread → client: which player each of this session's pads is.
+    let (pad_slots_tx, pad_slots_rx) =
+        tokio::sync::mpsc::unbounded_channel::<punktfunk_core::quic::PadSlots>();
+    // The device's stored player pick. Keyed by the pairing fingerprint, never by
+    // an address: the same device reconnecting is the same player.
+    let preferred_pad_slot = session_fp_hex.as_deref().and_then(|fp| np.pad_slot_of(fp));
+    let pad_id =
+        crate::inject::pad_pool::PadIdentity::new(session_fp_hex.as_deref(), preferred_pad_slot);
+    let pad_slots = Arc::new(std::sync::atomic::AtomicU16::new(0));
     // Launch verdict lane. Unbounded and opened here so the library resolve below
     // can refuse onto it before the stream thread exists.
     let (launch_outcome_tx, launch_outcome_rx) =
@@ -1661,6 +1670,12 @@ pub(crate) async fn run_admitted(
         audio_tx: Some(audio_tx),
         // Filled by the stream thread once capture names the head.
         head: Arc::new(std::sync::Mutex::new(None)),
+        pad_slots: pad_slots.clone(),
+        fingerprint: session_fp_hex.clone(),
+        pad_owner: pad_id.owner,
+        preferred_pad_slot: Arc::new(std::sync::atomic::AtomicU8::new(
+            preferred_pad_slot.unwrap_or(crate::session_status::NO_PAD_SLOT),
+        )),
         // Written by the input thread below, read by `GET /session/{id}/pads`.
         pads: Arc::new(crate::pad_feed::PadFeed::new()),
     };
@@ -1697,7 +1712,11 @@ pub(crate) async fn run_admitted(
         session_grants: session_grants.clone(),
         access_rx,
         audio_rx,
+        pad_slots_rx,
         launch_outcome_rx,
+        peer: peer.ip(),
+        counters: counters.clone(),
+        stats: stats.clone(),
     }));
     // Only a fingerprint has a record to watch; with no record there is nothing to expire.
     match (session_fp_hex.clone(), access_watch) {
@@ -1823,6 +1842,9 @@ pub(crate) async fn run_admitted(
                         input_route,
                         gamepad,
                         pad_audio_on,
+                        pad_id,
+                        pad_slots,
+                        Some(pad_slots_tx),
                         grants,
                         frame_map,
                         pad_feed,
@@ -2003,11 +2025,7 @@ pub(crate) async fn run_admitted(
         let iso_sink = isolation.as_ref().and_then(|i| i.sink.clone());
         #[cfg(not(target_os = "linux"))]
         let iso_sink: Option<String> = None;
-        let sink = iso_sink.or_else(|| {
-            joined
-                .as_ref()
-                .and_then(|(d, _)| d.audio_sink.lock().unwrap().clone())
-        });
+        let tap_from = joined.as_ref().map(|(d, _)| d.audio_sink.clone());
         let published = audio_sink.clone();
         let muted = controls.muted.clone();
         let counters = counters.clone();
@@ -2021,9 +2039,10 @@ pub(crate) async fn run_admitted(
                     channels,
                     budget,
                     audio_plane,
-                    sink,
+                    iso_sink,
                     join_live,
                     published,
+                    tap_from,
                     muted,
                     counters,
                 )
@@ -2201,6 +2220,12 @@ pub(crate) async fn run_admitted(
         .peer_fingerprint()
         .map(|fp| fingerprint_hex(&fp)[..12].to_string())
         .unwrap_or_else(|| conn.remote_address().ip().to_string());
+    // The title's `audio.sessions`, over every session on this display. Lifted with the session.
+    let _audio_policy = hello
+        .launch
+        .as_deref()
+        .and_then(crate::library::audio_sessions_for)
+        .map(|policy| crate::session_status::apply_audio_policy(policy, &client_label));
     // Tray toast: trust-store name (rename at approval wins), else sanitized Hello. `None` if nameless.
     let client_name = conn
         .peer_fingerprint()

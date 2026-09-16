@@ -33,6 +33,8 @@ data class SettingsOverlay(
     val height: Int? = null,
     val hz: Int? = null,
     val bitrateKbps: Int? = null,
+    /** Automatic's ceiling. Set and cleared with [bitrateKbps] — the pair spells one mode. */
+    val abrMaxKbps: Int? = null,
     val renderScale: Double? = null,
     val videoFit: String? = null,
     val codec: String? = null,
@@ -76,8 +78,16 @@ data class SettingsOverlay(
     val extra: Map<String, Any> = emptyMap(),
 ) {
     /** The one resolution seam: this overlay on top of [base]. Pure, so it is fully testable. */
-    fun apply(base: Settings): Settings =
-        SettingsFields.PRESET.fold(base) { s, f -> f.applyOverlay(this, s) }
+    fun apply(base: Settings): Settings {
+        val s = SettingsFields.PRESET.fold(base) { s, f -> f.applyOverlay(this, s) }
+        // The bitrate mode is the pair, so apply it as one: a preset written before the
+        // limit existed means Automatic, not this device's limit.
+        return if (bitrateKbps != null || abrMaxKbps != null) {
+            s.copy(bitrateKbps = bitrateKbps ?: 0, abrMaxKbps = abrMaxKbps ?: 0)
+        } else {
+            s
+        }
+    }
 
     /**
      * Record, as overrides, every tier-P field that differs between two settings snapshots.
@@ -91,8 +101,15 @@ data class SettingsOverlay(
      * whatever the global happens to be still records an override — the pin. It only ever adds
      * overrides; removing one is [clear], a different, explicit operation.
      */
-    fun absorb(before: Settings, after: Settings): SettingsOverlay =
-        SettingsFields.PRESET.fold(this) { o, f -> f.absorb(o, before, after) }
+    fun absorb(before: Settings, after: Settings): SettingsOverlay {
+        val o = SettingsFields.PRESET.fold(this) { o, f -> f.absorb(o, before, after) }
+        // Either half moving pins both, so a preset never carries half a mode.
+        return if (before.bitrateKbps != after.bitrateKbps || before.abrMaxKbps != after.abrMaxKbps) {
+            o.copy(bitrateKbps = after.bitrateKbps, abrMaxKbps = after.abrMaxKbps)
+        } else {
+            o
+        }
+    }
 
     /**
      * Drop one override by its field name, putting the row back to inheriting. [FIELD_RESOLUTION]
@@ -101,6 +118,8 @@ data class SettingsOverlay(
      */
     fun clear(field: String): SettingsOverlay = when (field) {
         FIELD_RESOLUTION -> copy(width = null, height = null)
+        // One row drives the mode, so its reset drops both halves.
+        "bitrate_kbps" -> copy(bitrateKbps = null, abrMaxKbps = null)
         else -> SettingsFields.PRESET.firstOrNull { it.key == field }?.clear(this) ?: this
     }
 

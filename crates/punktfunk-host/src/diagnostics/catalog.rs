@@ -31,6 +31,77 @@ pub(crate) fn register_all(reg: &Diagnostics) {
     reg.register(omarchy_updates);
     reg.register(vdisplay_driver);
     reg.register(pad_audio);
+    reg.register(plugin_sandbox);
+}
+
+/// Plugins run in their own sandbox, or they do not run: a box that cannot build one says so
+/// here rather than quietly running third-party code with the operator's whole account.
+#[cfg(target_os = "linux")]
+fn plugin_sandbox() -> HostCheck {
+    let id = ids::PLUGIN_SANDBOX;
+    if !crate::plugins::runtime_status().installed {
+        return HostCheck::inapplicable(id, "The plugin runner is not installed on this host.");
+    }
+    if std::env::var("PUNKTFUNK_PLUGIN_SANDBOX")
+        .is_ok_and(|v| matches!(v.trim(), "0" | "off" | "false"))
+    {
+        return HostCheck::problem(
+            id,
+            CheckStatus::Warn,
+            Severity::Critical,
+            "Plugin sandboxing is turned off",
+            "Every installed plugin runs with your account's access: your files, your session, \
+             and the host's own credentials."
+                .to_string(),
+        )
+        .with_remedy(Remedy {
+            text: "Remove PUNKTFUNK_PLUGIN_SANDBOX from host.env and restart the plugin runner."
+                .into(),
+            command: Some("systemctl --user restart punktfunk-scripting".into()),
+            relogin_required: false,
+        });
+    }
+    match bwrap_probe() {
+        Ok(()) => HostCheck::ok(id, "Each plugin runs in its own sandbox."),
+        Err(reason) => HostCheck::problem(
+            id,
+            CheckStatus::Fail,
+            Severity::Critical,
+            "Plugins cannot be sandboxed here",
+            format!("No plugin will start, so the game library stays empty: {reason}"),
+        )
+        .with_remedy(Remedy {
+            text: "Install bubblewrap (bwrap) with your package manager, then restart the plugin \
+                   runner."
+                .into(),
+            command: Some("systemctl --user restart punktfunk-scripting".into()),
+            relogin_required: false,
+        }),
+    }
+}
+
+/// Can this kernel give an unprivileged process the namespaces a sandbox is made of?
+#[cfg(target_os = "linux")]
+fn bwrap_probe() -> Result<(), String> {
+    match Command::new("bwrap")
+        .args(["--unshare-all", "--ro-bind", "/usr", "/usr", "/bin/true"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+    {
+        Ok(s) if s.success() => Ok(()),
+        Ok(_) => Err("this kernel restricts unprivileged user namespaces".to_string()),
+        Err(_) => Err("bubblewrap (bwrap) is not installed".to_string()),
+    }
+}
+
+/// Windows de-privileges the runner with its own account instead.
+#[cfg(not(target_os = "linux"))]
+fn plugin_sandbox() -> HostCheck {
+    HostCheck::inapplicable(
+        ids::PLUGIN_SANDBOX,
+        "The plugin runner here runs as its own low-privilege account rather than in a sandbox.",
+    )
 }
 
 /// The controller speaker endpoint takes the host's 4-channel open, or DualSense titles fall

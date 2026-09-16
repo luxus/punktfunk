@@ -40,9 +40,16 @@ the host's output. Turn the monitoring off rather than the mic.
 
 ## The host's own speakers
 
-If you set `PUNKTFUNK_HOST_AUDIO` (Windows) so the stream's sound also plays in the room, and
-you're streaming **from that same room**, your device's mic hears the host's speakers. Remove
-the setting while you stream from nearby, or turn the host's volume down.
+If you set `PUNKTFUNK_AUDIO_OUTPUT_MODE=host_and_client` so the stream's sound also plays in the
+room, and you're streaming **from that same room**, your device's mic hears the host's speakers.
+Remove the setting while you stream from nearby, or turn the host's volume down.
+
+## Voice chat running on the host
+
+Friends streaming in while you talk on Discord on the host hear **themselves** a beat late: the
+stream captures Discord's playback along with the game. Keep the voice app out of the stream with
+`PUNKTFUNK_AUDIO_VOICE_CHAT=host` on a Linux host — the full recipe is in
+[Friends over the internet](/docs/friends-over-the-internet#voice-chat-while-they-play).
 
 ## Virtual mixers (VoiceMeeter and friends)
 

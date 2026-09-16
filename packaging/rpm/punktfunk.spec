@@ -180,6 +180,8 @@ runtime. Enable with `systemctl --user enable --now punktfunk-web`.
 %if %{with scripting}
 %package scripting
 Summary:        punktfunk plugin/script runner (Effect SDK on bun)
+# Each plugin runs in its own bwrap sandbox; without it the runner starts no plugin at all.
+Requires:       bubblewrap
 # Runtime is BUN — the runner import()s the operator's .ts plugin files, which only bun can do. bun
 # isn't in Fedora repos, so we VENDOR it into the package (arch-specific, not noarch). The runner
 # itself is bundled to ONE self-contained JS (effect + SDK inlined), so no node_modules ship.

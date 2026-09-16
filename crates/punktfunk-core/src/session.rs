@@ -540,11 +540,15 @@ impl Session {
     /// ([`crate::packet::FLAG_PROBE`]) so a burst never consumes video `frame_index`es.
     /// Only against a client that advertised [`crate::quic::VIDEO_CAP_PROBE_SEQ`]; an
     /// older single-window reassembler would drop probe indexes as stale video.
-    pub fn submit_probe_frame(&mut self, data: &[u8], pts_ns: u64) -> Result<()> {
+    ///
+    /// Returns `(wire packets offered, packets the send buffer refused)`. A burst adds these
+    /// up itself: video shares the send loop, so a [`Stats`] delta would count its shards too.
+    pub fn submit_probe_frame(&mut self, data: &[u8], pts_ns: u64) -> Result<(u32, u32)> {
         let idx = self.packetizer.alloc_probe_index();
         let wires =
             self.seal_frame_inner(data, pts_ns, crate::packet::FLAG_PROBE as u32, Some(idx))?;
         let refs: Vec<&[u8]> = wires.iter().map(|w| w.as_slice()).collect();
+        let offered = refs.len() as u32;
         let t0 = self.seal_perf.is_some().then(std::time::Instant::now);
         let r = self.send_sealed(&refs);
         drop(refs);
@@ -552,7 +556,7 @@ impl Session {
             self.note_sock_ns(t0.elapsed().as_nanos() as u64);
         }
         self.reclaim_wires(wires);
-        r.map(|_| ())
+        r.map(|accepted| (offered, offered.saturating_sub(accepted as u32)))
     }
 
     /// Host: live-adjust FEC recovery percent. Affects the next sealed AU; the receiver

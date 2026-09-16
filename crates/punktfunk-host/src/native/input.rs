@@ -158,6 +158,10 @@ struct Pads {
     /// identity (mailbox, instance id, pairing MAC) would collide two sessions.
     /// Claimed on first present frame, released on unplug.
     slots: crate::inject::pad_pool::PadSlotMap<'static>,
+    /// Slot mask as last reported ([`Pads::take_slot_change`]). The OS slot is the
+    /// player number, so the console and the client are told when it moves — once
+    /// per change, not once per frame.
+    published: u16,
     /// One warn per session when OS slots are exhausted — not one per frame.
     slots_exhausted_warned: bool,
     /// Wire pads whose device is on its unplug grace. The pool slot follows the device out
@@ -180,14 +184,18 @@ struct Pads {
 
 impl Pads {
     /// Every pad starts on the session kind ([`resolve_gamepad`]) until it declares otherwise.
-    fn new(default: GamepadPref) -> Pads {
+    /// `id` names the device and the player slot it asked for, so its pads land on the
+    /// same OS slots they had last connect ([`crate::inject::pad_pool::PadIdentity`]).
+    fn new(default: GamepadPref, id: crate::inject::pad_pool::PadIdentity) -> Pads {
         let default = resolve_pad_kind(default);
         tracing::info!(
             default = default.as_str(),
+            preferred_slot = ?id.preferred,
             "gamepad backends: per-pad router (session default)"
         );
         Pads {
-            slots: crate::inject::pad_pool::PadSlotMap::new(),
+            slots: crate::inject::pad_pool::PadSlotMap::new(id),
+            published: 0,
             slots_exhausted_warned: false,
             pending_release: [None; MAX_WIRE_PADS],
             kinds: [default; MAX_WIRE_PADS],
@@ -358,6 +366,16 @@ impl Pads {
     /// claims the same slot. `None` once every slot on the host is held.
     fn claim_os_slot(&mut self, wire: usize) -> Option<u8> {
         self.slots.claim_for(wire)
+    }
+
+    /// The OS slots this session holds, when they have moved since the last call.
+    /// Bit `n` = slot `n` = player `n + 1`.
+    fn take_slot_change(&mut self) -> Option<u16> {
+        let now = self.slots.held_mask();
+        (now != self.published).then(|| {
+            self.published = now;
+            now
+        })
     }
 
     /// [`Self::re_index`] for the rich plane (touchpad, motion, raw HID reports).
@@ -781,6 +799,10 @@ fn send_rumble(
 /// Ends on `stop` or when `rx` disconnects. The pads (and their OS slots) go
 /// before the streamer join, so a session that preempted this one can claim
 /// them inside its 1.5 s grace.
+///
+/// `pad_id` names the device its pads belong to and the player slot the operator
+/// picked for it; `pad_slots` and `pad_slots_tx` publish the slots it ends up with,
+/// to `/status` and to the client's overlay.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn input_thread(
     rx: std::sync::mpsc::Receiver<ClientInput>,
@@ -788,6 +810,9 @@ pub(super) fn input_thread(
     inj_tx: InputRoute,
     gamepad: GamepadPref,
     pad_audio_on: bool,
+    pad_id: crate::inject::pad_pool::PadIdentity,
+    pad_slots: Arc<std::sync::atomic::AtomicU16>,
+    pad_slots_tx: Option<tokio::sync::mpsc::UnboundedSender<punktfunk_core::quic::PadSlots>>,
     // Live grant mask. Dispatch already drops non-granted traffic; the guards
     // below are deny-at-setup: without `GRANT_GAMEPAD` no arm that could create
     // a virtual pad or pad-audio streamer runs. One relaxed load per item.
@@ -801,7 +826,7 @@ pub(super) fn input_thread(
     // per-pad histogram below cannot be what the summary reads.
     counters: Arc<crate::session_status::SessionCounters>,
 ) {
-    let mut pads = Pads::new(gamepad);
+    let mut pads = Pads::new(gamepad, pad_id);
     // 0xD1 streamers; `pad_audio_on` is the negotiated Welcome cap.
     let mut pad_streams = PadAudioSlots::new();
     // Per-pad motion cadence, always on. Summarized at `info` on session end.
@@ -1107,6 +1132,14 @@ pub(super) fn input_thread(
         );
         // Held-steady UHID pads send no wire events; heartbeat re-emits. Xbox is a no-op.
         pads.heartbeat();
+        // After `pump` reaped the unplug grace, so a re-plug inside it is not reported
+        // as a pad leaving and coming back. Silent while the slots stand.
+        if let Some(mask) = pads.take_slot_change() {
+            pad_slots.store(mask, std::sync::atomic::Ordering::Relaxed);
+            if let Some(tx) = &pad_slots_tx {
+                let _ = tx.send(punktfunk_core::quic::PadSlots { slots: mask });
+            }
+        }
         if last_refresh.elapsed() >= rumble_refresh_interval {
             last_refresh = std::time::Instant::now();
             if rumble_envelope_on {
@@ -1195,6 +1228,7 @@ pub(super) fn input_thread(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inject::pad_pool::PadIdentity;
     use punktfunk_core::input::{InputEvent, InputKind};
 
     #[test]
@@ -1264,7 +1298,7 @@ mod tests {
     #[test]
     fn rich_input_is_re_addressed_into_slot_space() {
         use punktfunk_core::quic::{RichInput, HID_REPORT_MAX};
-        let mut pads = Pads::new(GamepadPref::Xbox360);
+        let mut pads = Pads::new(GamepadPref::Xbox360, PadIdentity::anonymous());
         let slot1 = pads.slots.claim_for(1).expect("a free OS slot");
         let slot0 = pads.slots.claim_for(0).expect("a free OS slot");
         assert_ne!(slot0, slot1, "two wire pads share an OS slot");
@@ -1286,12 +1320,25 @@ mod tests {
         assert!(pads.rich_in_slot_space(report(2)).is_none());
     }
 
+    /// The console and the client are told which players this session is, once per
+    /// change. Resent every frame it would be a control message per pad packet.
+    #[test]
+    fn the_slot_map_is_reported_only_when_it_moves() {
+        let mut pads = Pads::new(GamepadPref::Xbox360, PadIdentity::anonymous());
+        assert_eq!(pads.take_slot_change(), None, "no pad, nothing to say");
+        let slot = pads.claim_os_slot(0).expect("a free OS slot");
+        assert_eq!(pads.take_slot_change(), Some(1 << slot));
+        assert_eq!(pads.take_slot_change(), None, "the same slots, again");
+        pads.slots.release(0);
+        assert_eq!(pads.take_slot_change(), Some(0), "the pad left");
+    }
+
     /// A pad-audio streamer starts at the arrival and captures the endpoint / card / sink
     /// named by the pad's OS slot, so the arrival must reserve the same slot the pad's
     /// first frame would have taken — never a second name for one pad.
     #[test]
     fn an_arrival_reserves_the_slot_the_first_frame_would_claim() {
-        let mut pads = Pads::new(GamepadPref::DualSense);
+        let mut pads = Pads::new(GamepadPref::DualSense, PadIdentity::anonymous());
         let slot = pads.claim_os_slot(1).expect("a free OS slot");
         assert_eq!(pads.slots.claim_for(1), Some(slot), "first frame re-mints");
         assert_eq!(pads.claim_os_slot(1), Some(slot), "re-declare re-mints");
@@ -1331,6 +1378,9 @@ mod tests {
                     InputRoute::new(inj_tx),
                     GamepadPref::Xbox360,
                     false,
+                    PadIdentity::anonymous(),
+                    Arc::new(std::sync::atomic::AtomicU16::new(0)),
+                    None,
                     Arc::new(AtomicU32::new(0)),
                     Arc::new(std::sync::Mutex::new(
                         punktfunk_core::video_fit::Reframe::default(),
@@ -1361,7 +1411,7 @@ mod tests {
     fn a_removed_pad_keeps_its_slot_through_the_unplug_grace() {
         use std::time::{Duration, Instant};
         let t = Instant::now();
-        let mut pads = Pads::new(GamepadPref::Xbox360);
+        let mut pads = Pads::new(GamepadPref::Xbox360, PadIdentity::anonymous());
         let slot = pads.slots.claim_for(0).expect("a free OS slot");
         pads.owner[0] = Some(GamepadPref::Xbox360);
         pads.note_removed(0, true, t);

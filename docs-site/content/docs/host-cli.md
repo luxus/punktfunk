@@ -57,7 +57,6 @@ punktfunk-host serve --gamestream
 | `--native-port <PORT>` | Native QUIC port (default `9777`). |
 | `--open` | Don't require pairing — serve any device on the network. Off by default; only for trusted single-user setups. |
 | `--mgmt-bind <IP:PORT>` | Management API address (default `0.0.0.0:47990` — all interfaces, so paired clients can browse the game library over mTLS; pass `127.0.0.1:47990` to keep it loopback-only). |
-| `--mgmt-token <TOKEN>` | Override the bearer token for the management API. |
 | `--no-mdns` | Skip the mDNS adverts (native + GameStream) — for networks/containers where multicast doesn't work. Clients connect via a manually added host instead. Same as `PUNKTFUNK_MDNS=0`. |
 | `--data-port <PORT>` | Pin the per-session video data plane to this fixed UDP port — one number to open in a firewall, forward on a router or share through a port proxy. Video still follows the client's hole-punch, so a NAT on the client's side that remaps ports works. Same as `PUNKTFUNK_DATA_PORT`; default is a fresh random port per session. |
 
@@ -66,10 +65,12 @@ These are the only flags `serve` accepts.
 The management API is **always HTTPS**. It binds all interfaces by default so a **paired client** can
 fetch the game library over its mTLS certificate — but off loopback that certificate reaches only the
 read-only status + library endpoints. The **admin surface** (arming pairing, removing devices, session
-control, library edits) needs a **bearer token** and is honored **from loopback only**. Without
-`--mgmt-token` a token is generated and persisted to `~/.config/punktfunk/mgmt-token` (the web console
-reads the same file). Pass `--mgmt-bind 127.0.0.1:47990` to keep 47990 loopback-only. Every endpoint
-is in the interactive [**API Reference**](/api).
+control, library edits) needs a **bearer token** and is honored **from loopback only**. The token is
+generated on first start and persisted to `~/.config/punktfunk/mgmt-token`, owner-only; the web
+console, `ctl` and the tray read that same file. There is no flag for it, and the host drops
+`PUNKTFUNK_MGMT_TOKEN` from its own environment at startup (persisting a value set there first), so
+the games and hooks it launches cannot inherit it. Pass `--mgmt-bind 127.0.0.1:47990` to keep 47990
+loopback-only. Every endpoint is in the interactive [**API Reference**](/api).
 
 By default the host **requires pairing** — see [Pairing & Trust](/docs/pairing). On `serve` you
 **arm pairing from the web console**; the host then displays a 4-digit PIN. `--open` serves any
@@ -182,9 +183,8 @@ nothing else:
   handshake and no credential is ever transmitted — that is exit code 4.
 
 There is deliberately **no `--token` flag and no token environment variable** — a credential on a
-command line or in an environment is readable by other processes on the box. The consequence: a
-host started with `--mgmt-token` and no persisted token file can't be reached by `ctl`. Every
-packaged install persists one, so this only affects hand-run dev hosts.
+command line or in an environment is readable by other processes on the box. The host persists its
+token to that file on every start, so `ctl` always has one to read.
 
 Everything runs over loopback — `ctl` adds no listener and no new way in.
 

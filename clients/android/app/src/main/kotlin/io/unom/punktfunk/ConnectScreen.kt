@@ -991,7 +991,7 @@ fun ConnectScreen(
                     onSettingsChange,
                 )
                 presets = presetStore.all()
-                notice = "%.0f Mbit/s set in %s".format(done.recommendedMbps, where)
+                notice = "%.0f Mbit/s limit set in %s".format(done.recommendedMbps, where)
             }
             speedTest = null
         },

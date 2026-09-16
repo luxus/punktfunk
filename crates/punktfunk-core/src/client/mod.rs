@@ -299,6 +299,8 @@ pub struct NativeClient {
     fec_recovered: Arc<AtomicU64>,
     /// See [`unsustainable_pin_kbps`](Self::unsustainable_pin_kbps).
     unsustainable_pin_kbps: Arc<AtomicU32>,
+    /// See [`abr_memory`](Self::abr_memory).
+    abr_memory: Arc<Mutex<crate::abr::AbrMemory>>,
     /// Shared loss-range detector for [`note_frame_index`](Self::note_frame_index): next
     /// expected `frame_index` plus RFI throttle. Avoids per-embedder wrapping arithmetic.
     rfi: Mutex<RfiRecovery>,
@@ -319,6 +321,9 @@ pub struct NativeClient {
     /// Why the speakers are silent: [`AUDIO_MUTE_LOCAL`] | [`AUDIO_MUTE_HOST`]. The embedder
     /// owns its bit, the control task the host's; clearing one leaves the other standing.
     audio_mute: Arc<AtomicU8>,
+    /// OS pad slots the host gave this session, one bit each. Slot `n` is player
+    /// `n + 1`; `0` until a pad of ours has a device on the host.
+    pad_slots: Arc<AtomicU16>,
     /// Smoothed QUIC round trip (µs), sampled by the worker. `0` until the first sample.
     rtt_us: Arc<AtomicU32>,
     /// The stats overlay window. Receipt and 0xCF timings land in it as they are pulled.
@@ -584,6 +589,9 @@ impl NativeClient {
             compositor,
             gamepad,
             bitrate_kbps,
+            // No ABR limit: this entry point predates the setting, so Automatic
+            // means "whatever the link proves", as it always did.
+            0,
             video_caps,
             audio_channels,
             // 0/0 = unspecified, so `Hello` stays pre-hi-res. Explicit 48 000/16 would mean
@@ -602,6 +610,7 @@ impl NativeClient {
             pin,
             identity,
             timeout,
+            None,
             None,
         )
     }
@@ -627,6 +636,11 @@ impl NativeClient {
         compositor: CompositorPref,
         gamepad: GamepadPref,
         bitrate_kbps: u32,
+        // "Adapt, but never above N" in kbps; `0` = no limit. Meaningful only while
+        // `bitrate_kbps` is 0 (Automatic), and `PUNKTFUNK_ABR_MAX_MBPS` still overrides it.
+        // The ceiling binds the negotiated start too, so a 12 Mbps cap never emits a
+        // 20 Mbps second.
+        abr_max_kbps: u32,
         video_caps: u8,
         audio_channels: u8,
         audio_rate_hz: u32,
@@ -647,6 +661,10 @@ impl NativeClient {
         pin: Option<[u8; 32]>,
         identity: Option<(String, String)>,
         timeout: Duration,
+        // What the previous Automatic session on this host proved
+        // ([`NativeClient::abr_memory`]). `None` = start at the host's `Welcome` echo and
+        // re-discover the link, which is what every session did before the memory existed.
+        abr_seed: Option<crate::abr::AbrMemory>,
         // Abort while blocked. Request-access can park ~185 s; Cancel cannot honour that if
         // this call ignores the flag. Same give-up as budget expiry (quit + shutdown). Do not
         // alias onto `shutdown` — the pump means "this connection died" and a caller-set flag
@@ -689,6 +707,7 @@ impl NativeClient {
         let frames_dropped = Arc::new(AtomicU64::new(0));
         let fec_recovered = Arc::new(AtomicU64::new(0));
         let unsustainable_pin_kbps = Arc::new(AtomicU32::new(0));
+        let abr_memory = Arc::new(Mutex::new(crate::abr::AbrMemory::default()));
         let mic_stats = Arc::new(MicUplinkCounters::default());
         let hot_tids = Arc::new(Mutex::new(Vec::new()));
         let clock_offset = Arc::new(AtomicI64::new(0));
@@ -696,6 +715,7 @@ impl NativeClient {
         let audio_av_offset_ms = Arc::new(AtomicI64::new(0));
         let audio_buffer_ms = Arc::new(AtomicU32::new(0));
         let audio_mute = Arc::new(AtomicU8::new(0));
+        let pad_slots = Arc::new(AtomicU16::new(0));
         let rtt_us = Arc::new(AtomicU32::new(0));
         let decode_lat = Arc::new(Mutex::new(DecodeLatAcc::default()));
         // Pump seeds from Welcome before ready_tx, then follows every ack.
@@ -718,6 +738,7 @@ impl NativeClient {
         let frames_dropped_w = frames_dropped.clone();
         let fec_recovered_w = fec_recovered.clone();
         let unsustainable_pin_kbps_w = unsustainable_pin_kbps.clone();
+        let abr_memory_w = abr_memory.clone();
         let mic_stats_w = mic_stats.clone();
         let hot_tids_w = hot_tids.clone();
         let clock_offset_w = clock_offset.clone();
@@ -727,6 +748,7 @@ impl NativeClient {
         let pad_audio_caps_w = pad_audio_caps.clone();
         let pad_mouse_w = pad_mouse.clone();
         let audio_mute_w = audio_mute.clone();
+        let pad_slots_w = pad_slots.clone();
         let access_grants_w = access_grants.clone();
         let access_deadline_w = access_deadline_unix.clone();
         let end_reject_w = end_reject_code.clone();
@@ -756,6 +778,7 @@ impl NativeClient {
                     compositor,
                     gamepad,
                     bitrate_kbps,
+                    abr_max_kbps,
                     video_caps,
                     audio_channels,
                     audio_rate_hz,
@@ -801,6 +824,8 @@ impl NativeClient {
                     frames_dropped: frames_dropped_w,
                     fec_recovered: fec_recovered_w,
                     unsustainable_pin_kbps: unsustainable_pin_kbps_w,
+                    abr_seed,
+                    abr_memory: abr_memory_w,
                     mic_stats: mic_stats_w,
                     hot_tids: hot_tids_w,
                     clock_offset: clock_offset_w,
@@ -808,6 +833,7 @@ impl NativeClient {
                     decode_lat: decode_lat_w,
                     live_bitrate: live_bitrate_w,
                     audio_mute: audio_mute_w,
+                    pad_slots: pad_slots_w,
                     access_grants: access_grants_w,
                     access_deadline_unix: access_deadline_w,
                     access_tx,
@@ -856,6 +882,7 @@ impl NativeClient {
             cursor_state: Mutex::new(cursor_state_rx),
             access: Mutex::new(access_rx),
             audio_mute,
+            pad_slots,
             access_grants,
             access_deadline_unix,
             end_reject_code,
@@ -880,6 +907,7 @@ impl NativeClient {
             frames_dropped,
             fec_recovered,
             unsustainable_pin_kbps,
+            abr_memory,
             rfi: Mutex::new(RfiRecovery::default()),
             hot_tids,
             clock_offset,
@@ -1050,6 +1078,14 @@ impl NativeClient {
         self.unsustainable_pin_kbps.load(Ordering::Relaxed)
     }
 
+    /// What Automatic has proved on this host so far, for the embedder to persist
+    /// per host and hand back to the next connect. All-zero until the first report
+    /// window, and on a session that never ran Automatic. Live, not final — read it
+    /// whenever the session ends, however it ends.
+    pub fn abr_memory(&self) -> crate::abr::AbrMemory {
+        *self.abr_memory.lock().unwrap()
+    }
+
     /// Parity-repaired shards (loss that never became a dropped frame). Monotonic; HUD diffs
     /// successive reads against [`frames_dropped`](Self::frames_dropped).
     pub fn fec_recovered_shards(&self) -> u64 {
@@ -1173,6 +1209,7 @@ impl NativeClient {
                 .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
             rtt_us: self.rtt_us(),
             target_kbps: self.current_bitrate_kbps(),
+            pad_slots: self.pad_slots(),
         }
     }
 
@@ -1377,6 +1414,13 @@ impl NativeClient {
     /// [`audio_mute`](Self::audio_mute) to say whose mute it is.
     pub fn audio_muted(&self) -> bool {
         self.audio_mute() != 0
+    }
+
+    /// OS pad slots the host gave this session, one bit each: bit `n` = player
+    /// `n + 1`. `0` before a pad of ours has a device, or on a host too old to
+    /// send [`crate::quic::PadSlots`]. [`crate::hud::player_label`] is the wording.
+    pub fn pad_slots(&self) -> u16 {
+        self.pad_slots.load(Ordering::Relaxed)
     }
 
     /// `(pad, low, high)`; TTL of a v2 envelope is dropped. Use

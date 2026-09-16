@@ -187,7 +187,8 @@ whatever has focus then — clicking a physical monitor mid-launch can still pul
   resolution: give it its own display (**separate**), take the box over (**steal**), share the
   existing display (**join**), or refuse it (**reject**). Under **join** both clients hear the
   same audio: the second one reads the sink the first one captures, and keeps it if the first
-  one leaves. On **Windows** a second client is **rejected** even under `separate` — two clients
+  one leaves. The console's **Session** card mutes either one, and a custom entry's **Who hears
+  this title** picks per game. On **Windows** a second client is **rejected** even under `separate` — two clients
   can't yet share one virtual display's capture there. A same-client *reconnect* never
   conflicts — it resumes.
 - **Identity** — whether each client gets a **stable display identity** so your desktop environment

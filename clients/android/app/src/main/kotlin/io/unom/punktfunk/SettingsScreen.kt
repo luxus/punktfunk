@@ -868,13 +868,7 @@ private fun DisplaySettings(s: Settings, update: (Settings) -> Unit, context: an
                 "distorts it.",
         ) { fit -> update(s.copy(videoFit = fit)) }
 
-        SettingDropdown(
-            label = "Bitrate",
-            options = BITRATE_OPTIONS,
-            selected = s.bitrateKbps,
-            field = "bitrate_kbps",
-            caption = "Automatic lets the host decide.",
-        ) { kbps -> update(s.copy(bitrateKbps = kbps)) }
+        BitrateRows(s, update)
 
         // Only codecs this device can actually decode are offered — a preference the client never
         // advertises would be a dead setting (see [codecOptionsFor]).
@@ -1420,6 +1414,77 @@ internal fun <T> SettingDropdown(
             )
         }
     }
+}
+
+/**
+ * The bitrate row: mode, then the rate that mode needs.
+ *
+ * Three modes, not a rate list with Automatic glued on top of it — "adapt, but never above N" is
+ * what a constrained link actually wants, and it was reachable only through an env var. The value
+ * picker carries the console's ladder plus a typed field, so the 10 → 20 Mbps gap an earlier
+ * fixed list left is reachable, and an off-ladder value (the speed test writes one) shows as its
+ * own number instead of falling back to the first row's label.
+ */
+@Composable
+private fun BitrateRows(s: Settings, update: (Settings) -> Unit) {
+    val mode = s.bitrateMode()
+    val value = s.bitrateValueKbps()
+    // "Custom…" picked while the stored rate is still a rung — keeps the field visible until an
+    // edit makes it custom. Custom itself is read from the stored value, so nothing new persists.
+    var customPicked by remember { mutableStateOf(false) }
+    val showCustom = customPicked || (value > 0 && value !in BITRATE_RUNGS)
+    SettingDropdown(
+        label = "Bitrate",
+        options = BITRATE_MODE_OPTIONS,
+        selected = mode,
+        field = "bitrate_kbps",
+        caption = "Automatic follows the link. A limit keeps it adapting but never above your " +
+            "number — the one to pick when the link is the bottleneck. A fixed rate never adapts.",
+    ) { picked ->
+        customPicked = false
+        // Seed from whatever was on screen so switching modes keeps the number.
+        update(s.withBitrateMode(picked, if (value > 0) value else 20_000))
+    }
+    if (mode != BitrateMode.AUTOMATIC) {
+        SettingDropdown(
+            label = if (mode == BitrateMode.LIMITED) "Limit" else "Rate",
+            options = bitrateValueOptions(value),
+            selected = if (showCustom) BITRATE_CUSTOM else value,
+        ) { picked ->
+            if (picked == BITRATE_CUSTOM) {
+                customPicked = true
+            } else {
+                customPicked = false
+                update(s.withBitrateMode(mode, picked))
+            }
+        }
+        if (showCustom) {
+            BitrateField(value) { kbps -> update(s.withBitrateMode(mode, kbps)) }
+        }
+    }
+}
+
+/** The typed bitrate, in Mbps. Digits only; every usable keystroke commits, capped at the
+ *  ladder's top, while the field keeps the raw text so "1" on the way to "12" isn't rewritten
+ *  mid-typing. It snaps back to the committed value when focus leaves. */
+@Composable
+private fun BitrateField(valueKbps: Int, onCommit: (Int) -> Unit) {
+    fun shown() = if (valueKbps > 0) (valueKbps / 1000).toString() else ""
+    var text by remember { mutableStateOf(shown()) }
+    OutlinedTextField(
+        value = text,
+        onValueChange = { raw ->
+            text = raw.filter { it.isDigit() }.take(4)
+            val mbps = (text.toIntOrNull() ?: 0).coerceAtMost(BITRATE_MAX_MBPS)
+            if (mbps > 0) onCommit(mbps * 1000)
+        },
+        label = { Text("Mbps") },
+        singleLine = true,
+        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+        modifier = Modifier
+            .fillMaxWidth()
+            .onFocusChanged { if (!it.isFocused) text = shown() },
+    )
 }
 
 /** One side of a custom resolution. Digits only; every usable keystroke commits — coerced even

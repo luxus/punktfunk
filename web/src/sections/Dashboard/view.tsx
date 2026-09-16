@@ -42,6 +42,8 @@ export const DashboardView: FC<{
 	onIdrOne: (row: SessionRow) => void;
 	onMuteOne: (row: SessionRow, muted: boolean) => void;
 	onAccessOne: (row: SessionRow, level: string) => void;
+	/** Player slot for one session; `null` is the host's first-free claim. */
+	onPlayerOne: (row: SessionRow, slot: number | null) => void;
 	isStopping: boolean;
 	isRequestingIdr: boolean;
 	isEndingGame: boolean;
@@ -57,6 +59,7 @@ export const DashboardView: FC<{
 	onIdrOne,
 	onMuteOne,
 	onAccessOne,
+	onPlayerOne,
 	isStopping,
 	isRequestingIdr,
 	isEndingGame,
@@ -143,6 +146,7 @@ export const DashboardView: FC<{
 								onIdr={onIdrOne}
 								onMute={onMuteOne}
 								onAccess={onAccessOne}
+								onPlayer={onPlayerOne}
 								busy={isChangingSession}
 							/>
 

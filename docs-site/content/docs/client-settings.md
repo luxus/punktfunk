@@ -47,11 +47,19 @@ Mac you type one in, and Apple TV's rate rides with the Stream mode preset.
 
 **Bitrate** — *default: Automatic.* The number is a **total wire budget**: video, error-correction
 parity, packet framing and the audio plane's share all fit inside it, so "20 Mbps" means 20 Mbps on
-your network. For H.264, HEVC and AV1, Automatic is the host's default **20 Mbps** plus two things
-an explicit rate switches off: adaptive bitrate, and a link-capacity probe about two seconds in that
-lets the rate climb past 20 Mbps. Automatic never descends below **2 Mbps**; an explicit rate is
-fixed for the session, clamped to **500 kbps – 8 Gbps**. A host card's menu has **Test network
-speed…** to suggest a value.
+your network. Three modes, for H.264, HEVC and AV1:
+
+- **Automatic** starts at the host's default **20 Mbps** and follows the link, with a link-capacity
+  probe about two seconds in that lets the rate climb past 20 Mbps.
+- **Adaptive, at most N** keeps all of that but never climbs above your number, and starts there
+  rather than at 20 Mbps. The probe is skipped — you have already named the ceiling. This is the
+  mode for a link you know: a 12 Mbps upstream reaches its rate in the first second instead of
+  finding the same wall every session.
+- **Fixed N** switches adaptation off entirely. The rate never moves, whatever the link does.
+
+Both adaptive modes never descend below **2 Mbps**; every rate is clamped to **500 kbps – 8 Gbps**.
+Pick a rung or type your own. A host card's menu has **Test network speed…**, which sets the
+measurement as a *limit*, so the session still adapts under it.
 
 PyroWave is **always Automatic**: a fixed per-pixel budget for the negotiated mode (hundreds of
 Mbps). A fixed kbps is meaningless for the all-intra codec, so the bitrate setting is disabled
@@ -190,7 +198,9 @@ ordinary type.
 It defaults **off on Apple** because switching it on costs a permission question, which is worth
 asking only from a controller the app can see you own: Input Monitoring on a Mac (the controller
 shares its USB interface with the pad's built-in keyboard mode, so macOS treats opening it as
-keyboard listening), Bluetooth on an iPhone or iPad. Android needs no such prompt for a pad
+keyboard listening), Bluetooth on an iPhone or iPad. A Mac takes the cable only when a pad is
+attached at the moment the stream starts, so a Mac without one falls back to the radio and is
+asked for Bluetooth instead. Android needs no such prompt for a pad
 already attached, so it defaults on and simply does nothing when no SC2 is present. The capture
 engages at the next stream, and a badge confirms it.
 

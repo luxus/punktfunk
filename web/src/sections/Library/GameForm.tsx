@@ -7,6 +7,7 @@ import {
 	useGetCustomGame,
 	useUpdateCustomGame,
 } from "@/api/gen/library/library";
+import type { AudioSessions } from "@/api/gen/model/audioSessions";
 import type { CustomEntry } from "@/api/gen/model/customEntry";
 import type { CustomInput } from "@/api/gen/model/customInput";
 import type { GameEntry } from "@/api/gen/model/gameEntry";
@@ -16,6 +17,13 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import {
+	Select,
+	SelectContent,
+	SelectItem,
+	SelectTrigger,
+	SelectValue,
+} from "@/components/ui/select";
 import { apiErrorMessage } from "@/lib/errors";
 import { m } from "@/paraglide/messages";
 import { customId } from "./helpers";
@@ -43,6 +51,8 @@ interface FormState {
 	processName: string;
 	prep?: PrepCmd[];
 	hintsLoaded: boolean;
+	/** Which sessions hear the title (`audio.sessions`). `all` is the host's "no policy". */
+	audioSessions: AudioSessions;
 	// Details — the flattened GameMeta fields; numbers and lists are kept as the raw
 	// text the user typed and only parsed on submit.
 	platform: string;
@@ -69,6 +79,7 @@ const emptyForm: FormState = {
 	installDir: "",
 	processName: "",
 	hintsLoaded: false,
+	audioSessions: "all",
 	platform: "",
 	description: "",
 	developer: "",
@@ -96,6 +107,7 @@ function formFrom(entry: GameEntry): FormState {
 		installDir: "",
 		processName: "",
 		hintsLoaded: false,
+		audioSessions: "all",
 		platform: entry.platform ?? "",
 		description: entry.description ?? "",
 		developer: entry.developer ?? "",
@@ -119,6 +131,7 @@ function withStored(f: FormState, stored: CustomEntry | undefined): FormState {
 		installDir: stored.detect?.install_dir ?? "",
 		processName: stored.detect?.process_name ?? "",
 		prep: stored.prep ?? [],
+		audioSessions: stored.audio?.sessions ?? "all",
 		hintsLoaded: true,
 	};
 }
@@ -173,6 +186,11 @@ function toInput(f: FormState): CustomInput {
 				}
 			: {}),
 		...(f.prep ? { prep: f.prep } : {}),
+		// Same rule as `detect`: omitted means "keep", so send it once the row was read or when
+		// the operator narrowed it; `all` is how a stored policy is cleared.
+		...(f.hintsLoaded || f.audioSessions !== "all"
+			? { audio: { sessions: f.audioSessions } }
+			: {}),
 		platform: trim(f.platform),
 		description: trim(f.description),
 		developer: trim(f.developer),
@@ -422,6 +440,32 @@ export const GameForm: FC<{
 							help={m.library_field_process_name_help()}
 						/>
 					</fieldset>
+					<div className="space-y-1 border-t pt-4">
+						<Label htmlFor="lib-audio">{m.library_field_audio()}</Label>
+						<Select
+							value={form.audioSessions}
+							onValueChange={(v) =>
+								setForm((f) => ({ ...f, audioSessions: v as AudioSessions }))
+							}
+						>
+							<SelectTrigger id="lib-audio" size="sm">
+								<SelectValue />
+							</SelectTrigger>
+							<SelectContent>
+								<SelectItem value="all">{m.library_audio_all()}</SelectItem>
+								<SelectItem value="owner">{m.library_audio_owner()}</SelectItem>
+								<SelectItem value="joined">
+									{m.library_audio_joined()}
+								</SelectItem>
+								<SelectItem value="launcher">
+									{m.library_audio_launcher()}
+								</SelectItem>
+							</SelectContent>
+						</Select>
+						<p className="text-xs text-muted-foreground">
+							{m.library_field_audio_help()}
+						</p>
+					</div>
 					<fieldset className="space-y-4 border-t pt-2">
 						<legend className="sr-only">{m.library_details_legend()}</legend>
 						<p

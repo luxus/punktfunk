@@ -1,4 +1,5 @@
 import {
+	Gamepad2,
 	MonitorPlay,
 	RefreshCw,
 	Users,
@@ -25,12 +26,16 @@ import { levelLabel } from "@/sections/Pairing/access";
  * Every live session, one row each — the host admits several at once and the card below this
  * one only ever showed the first of them.
  *
- * The actions are per row and reach exactly that session: stop, keyframe, mute, access level.
- * A compat-plane row carries no id (the host has no per-session handle for it), so its actions
- * are off and the card header's host-wide Stop is what ends it.
+ * The actions are per row and reach exactly that session: stop, keyframe, mute, access level,
+ * player slot. A compat-plane row carries no id (the host has no per-session handle for it), so
+ * its actions are off and the card header's host-wide Stop is what ends it.
  *
- * Two columns are deliberately absent: which pads the session holds (#1094) and who owns the
- * audio device (#1093). Both are other issues and neither has a field on `SessionRow` yet.
+ * The player picker is what makes couch co-op over JOIN usable: the slot a session's controllers
+ * take is the player number a local co-op game reads, and left alone it goes to whoever moves a
+ * stick first. `pads` is what it holds now; `preferred_pad_slot` is what was asked for, and the
+ * two differ until a live pad re-plugs.
+ *
+ * One column is still absent: who owns the audio device (#1093). It has no field on `SessionRow`.
  */
 export const SessionList: FC<{
 	sessions: SessionRow[];
@@ -38,8 +43,10 @@ export const SessionList: FC<{
 	onIdr: (row: SessionRow) => void;
 	onMute: (row: SessionRow, muted: boolean) => void;
 	onAccess: (row: SessionRow, level: string) => void;
+	/** `null` hands the session back to the host's first-free claim. */
+	onPlayer: (row: SessionRow, slot: number | null) => void;
 	busy: boolean;
-}> = ({ sessions, onStop, onIdr, onMute, onAccess, busy }) => {
+}> = ({ sessions, onStop, onIdr, onMute, onAccess, onPlayer, busy }) => {
 	if (sessions.length === 0) return null;
 	return (
 		<Card>
@@ -58,6 +65,7 @@ export const SessionList: FC<{
 						onIdr={() => onIdr(s)}
 						onMute={() => onMute(s, !s.muted)}
 						onAccess={(level) => onAccess(s, level)}
+						onPlayer={(slot) => onPlayer(s, slot)}
 						busy={busy}
 					/>
 				))}
@@ -72,8 +80,9 @@ const Row: FC<{
 	onIdr: () => void;
 	onMute: () => void;
 	onAccess: (level: string) => void;
+	onPlayer: (slot: number | null) => void;
 	busy: boolean;
-}> = ({ row, onStop, onIdr, onMute, onAccess, busy }) => {
+}> = ({ row, onStop, onIdr, onMute, onAccess, onPlayer, busy }) => {
 	// No id means the compat plane: the host holds no per-session handle for it, so every
 	// action here would silently become host-wide. Off is honest; the card below still stops it.
 	const perSession = row.id != null;
@@ -92,12 +101,48 @@ const Row: FC<{
 						{row.client_name || row.client}
 					</span>
 					{row.muted && <Badge variant="secondary">{m.sessions_muted()}</Badge>}
+					{/* Which controllers the session holds right now — the badge follows the
+					    pads, not the pick, so a slot that has not moved yet reads honestly. */}
+					{row.pads.map((slot) => (
+						<Badge key={slot} variant="outline" className="tabular-nums">
+							<Gamepad2 className="size-3" />
+							{m.sessions_player_n({ n: slot + 1 })}
+						</Badge>
+					))}
 				</div>
 				<p className="mt-0.5 truncate text-xs text-muted-foreground">
 					{facts.join(" · ")}
 				</p>
 			</div>
 			<div className="flex flex-wrap items-center gap-2">
+				{/* Which player this session is. Four, not the host's sixteen slots: local
+				    co-op seats four, and the picker exists for the couch. */}
+				{perSession && (
+					<Select
+						value={row.preferred_pad_slot?.toString() ?? AUTO_PLAYER}
+						onValueChange={(v) =>
+							onPlayer(v === AUTO_PLAYER ? null : Number(v))
+						}
+						disabled={busy}
+					>
+						<SelectTrigger
+							className="h-8 w-36"
+							aria-label={m.sessions_player()}
+						>
+							<SelectValue />
+						</SelectTrigger>
+						<SelectContent>
+							<SelectItem value={AUTO_PLAYER}>
+								{m.sessions_player_auto()}
+							</SelectItem>
+							{[0, 1, 2, 3].map((slot) => (
+								<SelectItem key={slot} value={slot.toString()}>
+									{m.sessions_player_n({ n: slot + 1 })}
+								</SelectItem>
+							))}
+						</SelectContent>
+					</Select>
+				)}
 				{/* Ungoverned on the compat plane — a select there would promise enforcement
 				    the GameStream protocol has no way to carry. */}
 				{row.access_level && perSession && (
@@ -162,6 +207,9 @@ const Row: FC<{
 		</div>
 	);
 };
+
+/** No pick: the slot is whichever comes free. Not a slot number, so it cannot collide with one. */
+const AUTO_PLAYER = "auto";
 
 /** `h:mm` past an hour, else `m:ss` — a session's age reads as a duration, not seconds.
  * Shared with `LastSessionCard`, so a finished session reads the same as a live one. */

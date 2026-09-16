@@ -54,6 +54,12 @@ buffer.
 Every time is an average over the last second, like Moonlight's. A figure your device cannot measure
 is left out rather than shown as zero.
 
+A session holding a controller gets one more line above all of these — `player 2`, or `players 2 · 4`
+with more than one pad — naming the controller slots the host gave it. That is the player number a
+local co-op game reads, and the host's operator can place it; see
+[couch co-op over JOIN](/docs/access-levels#couch-co-op-over-join). Every tier shows it, and a
+session with no pad shows nothing.
+
 | Standard | What it measures | Moonlight's line |
 |---|---|---|
 | `received N fps` | Frames that arrived from the network | Incoming frame rate from network |

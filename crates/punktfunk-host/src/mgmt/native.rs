@@ -156,6 +156,11 @@ pub(crate) struct NativeClient {
     /// The record is dropped when the device's last session ends, rather than at a clock
     /// time. `expires_unix` may also be set; whichever comes first ends the grant.
     until_disconnect: bool,
+    /// Player slot this device's pads take, 0-based; `null` = whichever comes free.
+    /// Set through `PUT /session/{id}/player` while the device streams.
+    // `value_type`: an `Option<u8>` alone generates as `never` in the SDK.
+    #[schema(value_type = u32, required = false)]
+    preferred_pad_slot: Option<u8>,
 }
 
 impl NativeClient {
@@ -169,6 +174,7 @@ impl NativeClient {
             expires_unix: c.expires_unix,
             granted_unix: c.granted_unix,
             until_disconnect: c.until_disconnect,
+            preferred_pad_slot: c.preferred_pad_slot,
         }
     }
 }
@@ -533,6 +539,7 @@ pub(crate) async fn update_native_client_access(
                     expires_unix: access.expires_unix,
                     granted_unix: Some(unix_now()),
                     until_disconnect: access.until_disconnect,
+                    preferred_pad_slot: current.preferred_pad_slot,
                 });
             Json(NativeClient::from_record(stored)).into_response()
         }

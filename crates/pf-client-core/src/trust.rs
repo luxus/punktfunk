@@ -296,6 +296,11 @@ pub struct KnownHost {
     /// No lookup here is keyed by it — `fp_hex` / `addr:port` stay the keys.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
+    /// What Automatic proved, per address this host answers on. Keyed by address, not
+    /// by host: the same box over a LAN lease and over a tunnel is two links, and one
+    /// number is wrong for one of them. At most [`ABR_MARKS_MAX`], newest kept.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub abr_marks: BTreeMap<String, AbrMark>,
     /// Addresses this host left or was advertised at, newest first, at most
     /// [`PREV_ADDRS_MAX`]. A host lives at more than one — its LAN lease at home, a
     /// Tailscale address anywhere — so when `addr` goes silent `probe_known` asks these too,
@@ -346,6 +351,101 @@ impl Serialize for KnownHost {
 /// How many left-behind addresses a host keeps.
 pub const PREV_ADDRS_MAX: usize = 3;
 
+/// Addresses a host keeps an [`AbrMark`] for. One more than [`PREV_ADDRS_MAX`] so a
+/// host reached at its LAN lease and over a tunnel keeps both plus the moves between.
+pub const ABR_MARKS_MAX: usize = 4;
+/// Age at which a mark is dropped instead of used. A link's shape survives a holiday;
+/// a month later the ISP, the router and the flat may all have changed.
+pub const ABR_MARK_MAX_AGE_SECS: u64 = 30 * 24 * 60 * 60;
+
+/// What one Automatic session proved on one path to a host.
+///
+/// `echo_kbps` is what the host answered `Welcome` with: an operator who changes the
+/// host's Automatic default invalidates the rest, and the controller checks it.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct AbrMark {
+    /// Highest clean delivered rate the session proved.
+    #[serde(default)]
+    pub proven_kbps: u32,
+    /// Lowest rate a loss- or queue-driven backoff started from; `0` = never hit one.
+    #[serde(default)]
+    pub wall_kbps: u32,
+    /// The host's `Welcome` echo these were learned under.
+    #[serde(default)]
+    pub echo_kbps: u32,
+    /// The `quic::CODEC_*` bit they were learned under; `0` on a pre-codec record,
+    /// which then matches nothing and simply starts cold.
+    #[serde(default)]
+    pub codec: u8,
+    /// Unix seconds the session ended at. [`ABR_MARK_MAX_AGE_SECS`] expires it, and a
+    /// clock that went backwards reads as age zero rather than as an expiry.
+    #[serde(default)]
+    pub seen_unix: u64,
+}
+
+impl AbrMark {
+    /// This mark as the controller's seed, or `None` once it is older than
+    /// [`ABR_MARK_MAX_AGE_SECS`]. A clock that went backwards reads as age zero.
+    #[cfg(not(target_family = "wasm"))]
+    fn seed(&self, now_unix: u64) -> Option<punktfunk_core::abr::AbrMemory> {
+        let age_secs = now_unix.saturating_sub(self.seen_unix);
+        (age_secs <= ABR_MARK_MAX_AGE_SECS).then_some(punktfunk_core::abr::AbrMemory {
+            proven_kbps: self.proven_kbps,
+            wall_kbps: self.wall_kbps,
+            echo_kbps: self.echo_kbps,
+            codec: self.codec,
+            age_secs,
+        })
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// What Automatic proved last time on this path, as the controller's seed. `None` when
+/// the host is unknown, this address has no mark, or the mark has expired.
+#[cfg(not(target_family = "wasm"))]
+pub fn abr_seed(fp_hex: &str, addr: &str) -> Option<punktfunk_core::abr::AbrMemory> {
+    if fp_hex.is_empty() {
+        return None;
+    }
+    KnownHosts::read()
+        .hosts
+        .iter()
+        .find(|h| h.fp_hex == fp_hex)?
+        .abr_marks
+        .get(addr)?
+        .seed(now_unix())
+}
+
+/// Store what an Automatic session proved on this path. No-op for an unknown host or a
+/// session that proved nothing (a pinned rate, or a host too old to renegotiate).
+#[cfg(not(target_family = "wasm"))]
+pub fn remember_abr(fp_hex: &str, addr: &str, memory: punktfunk_core::abr::AbrMemory) {
+    if fp_hex.is_empty() || addr.is_empty() || memory.proven_kbps == 0 || memory.echo_kbps == 0 {
+        return;
+    }
+    let mut known = KnownHosts::load();
+    let Some(h) = known.hosts.iter_mut().find(|h| h.fp_hex == fp_hex) else {
+        return;
+    };
+    h.set_abr_mark(
+        addr,
+        AbrMark {
+            proven_kbps: memory.proven_kbps,
+            wall_kbps: memory.wall_kbps,
+            echo_kbps: memory.echo_kbps,
+            codec: memory.codec,
+            seen_unix: now_unix(),
+        },
+    );
+    let _ = known.save();
+}
+
 impl Default for KnownHost {
     /// Blank record with a fresh stable id — construction sites use
     /// `KnownHost { name, addr, port, ..Default::default() }`, so a new field here cannot
@@ -365,6 +465,7 @@ impl Default for KnownHost {
             preset_id: None,
             pinned_presets: Vec::new(),
             game_presets: BTreeMap::new(),
+            abr_marks: BTreeMap::new(),
             id: Some(crate::presets::new_record_uuid()),
             prev_addrs: Vec::new(),
         }
@@ -413,6 +514,25 @@ impl KnownHost {
     /// [`resolve_preset`] drops a dangling id, the same way it does for `preset_id`.
     pub fn preset_for_game(&self, game_id: &str) -> Option<&str> {
         self.game_presets.get(game_id).map(String::as_str)
+    }
+
+    /// Record what Automatic proved on `addr`, evicting the oldest mark past
+    /// [`ABR_MARKS_MAX`]. A host reached at many addresses keeps the recent ones.
+    /// wasm has no QUIC plane, so nothing there learns a mark to store.
+    #[cfg(not(target_family = "wasm"))]
+    fn set_abr_mark(&mut self, addr: &str, mark: AbrMark) {
+        self.abr_marks.insert(addr.to_string(), mark);
+        while self.abr_marks.len() > ABR_MARKS_MAX {
+            let Some(oldest) = self
+                .abr_marks
+                .iter()
+                .min_by_key(|(_, m)| m.seen_unix)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            self.abr_marks.remove(&oldest);
+        }
     }
 
     /// Bind (or with `None`, clear) a title's preset. Idempotent, and a clear removes
@@ -1197,8 +1317,14 @@ pub struct Settings {
     pub width: u32,
     pub height: u32,
     pub refresh_hz: u32,
-    /// Requested encoder bitrate (kbps); 0 = host default.
+    /// Requested encoder bitrate (kbps); 0 = host default (Automatic, ABR on).
     pub bitrate_kbps: u32,
+    /// Automatic's ceiling in kbps: adapt, but never climb above this. `0` = no
+    /// limit. Read only while `bitrate_kbps` is 0, so the pair spells three modes
+    /// and an older client — which sees `bitrate_kbps` alone — still reads
+    /// Automatic rather than a rate nobody chose. `PUNKTFUNK_ABR_MAX_MBPS` wins.
+    #[serde(default)]
+    pub abr_max_kbps: u32,
     /// Host render/encode at `mode × render_scale`; presenter downscales. `> 1`
     /// supersamples; `< 1` under-renders; `1.0` = native. Clamped even, codec max.
     pub render_scale: f64,
@@ -1524,6 +1650,7 @@ impl Default for Settings {
             height: 0,
             refresh_hz: 0,
             bitrate_kbps: 0,
+            abr_max_kbps: 0,
             render_scale: 1.0,
             video_fit: default_video_fit(),
             gamepad: "auto".into(),
@@ -1800,6 +1927,27 @@ mod tests {
         assert_eq!(round.forward_pad, "");
     }
 
+    /// The three bitrate modes round-trip, and a store written before the limit
+    /// existed reads as Automatic — the degrade an older client also performs,
+    /// since it sees `bitrate_kbps` alone.
+    #[test]
+    fn settings_carry_the_three_bitrate_modes() {
+        let old = r#"{"width":1280,"height":720,"refresh_hz":60,"bitrate_kbps":0}"#;
+        let s: Settings = serde_json::from_str(old).unwrap();
+        assert_eq!((s.bitrate_kbps, s.abr_max_kbps), (0, 0), "Automatic");
+
+        for (fixed, max) in [(0u32, 0u32), (0, 15_000), (50_000, 0)] {
+            let s = Settings {
+                bitrate_kbps: fixed,
+                abr_max_kbps: max,
+                ..Default::default()
+            };
+            let round: Settings =
+                serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+            assert_eq!((round.bitrate_kbps, round.abr_max_kbps), (fixed, max));
+        }
+    }
+
     /// Older WinUI shell files still load: `show_hud` aliases onto `show_stats`,
     /// dropped `engine` is ignored, missing fields default.
     #[test]
@@ -2009,6 +2157,15 @@ mod tests {
                 preset_id: Some("aaaaaaaaaaaa".into()),
                 pinned_presets: vec!["bbbbbbbbbbbb".into()],
                 game_presets: [("halo".to_string(), "cccccccccccc".to_string())].into(),
+                // Learned, not user-set, and a refresh carries none: same rule.
+                abr_marks: [(
+                    "192.168.1.50".to_string(),
+                    AbrMark {
+                        proven_kbps: 11_000,
+                        ..Default::default()
+                    },
+                )]
+                .into(),
                 id: Some("11111111-2222-4333-8444-555555555555".into()),
                 prev_addrs: vec![],
             }],
@@ -2035,6 +2192,7 @@ mod tests {
         assert_eq!(h.preset_id.as_deref(), Some("aaaaaaaaaaaa"));
         assert_eq!(h.pinned_presets, vec!["bbbbbbbbbbbb".to_string()]);
         assert_eq!(h.preset_for_game("halo"), Some("cccccccccccc"));
+        assert_eq!(h.abr_marks["192.168.1.50"].proven_kbps, 11_000);
         assert_eq!(
             h.id.as_deref(),
             Some("11111111-2222-4333-8444-555555555555")
@@ -2155,6 +2313,7 @@ mod tests {
                 preset_id: Some("aaaaaaaaaaaa".into()),
                 pinned_presets: vec!["bbbbbbbbbbbb".into()],
                 game_presets: [("halo".to_string(), "cccccccccccc".to_string())].into(),
+                abr_marks: Default::default(),
                 id: Some("11111111-2222-4333-8444-555555555555".into()),
                 prev_addrs: vec![],
             }],
@@ -2786,5 +2945,57 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&ok).unwrap(), "{\"a\":2}");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(not(target_family = "wasm"))]
+    fn abr_marks_are_per_address_expire_and_survive_a_refresh() {
+        // Store written before the field existed.
+        let old = r#"{"hosts":[{
+            "name": "Gaming PC", "addr": "192.168.1.50", "port": 9777,
+            "fp_hex": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "paired": true
+        }]}"#;
+        let mut k: KnownHosts = serde_json::from_str(old).unwrap();
+        assert!(k.hosts[0].abr_marks.is_empty(), "absent key decodes empty");
+        assert!(!serde_json::to_string(&k).unwrap().contains("abr_marks"));
+
+        // One mark per path: the LAN lease and the tunnel are different links.
+        let lan = AbrMark {
+            proven_kbps: 90_000,
+            wall_kbps: 0,
+            echo_kbps: 20_000,
+            codec: punktfunk_core::quic::CODEC_HEVC,
+            seen_unix: 1_000,
+        };
+        let wg = AbrMark {
+            proven_kbps: 11_000,
+            wall_kbps: 12_000,
+            seen_unix: 2_000,
+            ..lan
+        };
+        k.hosts[0].set_abr_mark("192.168.1.50", lan);
+        k.hosts[0].set_abr_mark("10.0.0.2", wg);
+        let round: KnownHosts = serde_json::from_str(&serde_json::to_string(&k).unwrap()).unwrap();
+        assert_eq!(round.hosts[0].abr_marks["10.0.0.2"].wall_kbps, 12_000);
+        assert_eq!(round.hosts[0].abr_marks["192.168.1.50"].proven_kbps, 90_000);
+
+        // Fresh reads as a seed; a month later there is nothing to start from.
+        assert_eq!(wg.seed(2_060).unwrap().age_secs, 60);
+        assert_eq!(wg.seed(2_000 + ABR_MARK_MAX_AGE_SECS + 1), None);
+
+        // Past the cap the oldest address goes, never the one just written.
+        for (i, addr) in ["a", "b", "c", "d"].iter().enumerate() {
+            k.hosts[0].set_abr_mark(
+                addr,
+                AbrMark {
+                    seen_unix: 3_000 + i as u64,
+                    ..wg
+                },
+            );
+        }
+        assert_eq!(k.hosts[0].abr_marks.len(), ABR_MARKS_MAX);
+        assert!(k.hosts[0].abr_marks.contains_key("d"));
+        assert!(!k.hosts[0].abr_marks.contains_key("192.168.1.50"));
     }
 }

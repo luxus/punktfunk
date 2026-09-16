@@ -39,6 +39,11 @@ pub struct SettingsOverlay {
     pub match_window: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bitrate_kbps: Option<u32>,
+    /// Automatic's ceiling. Applied, absorbed and cleared with `bitrate_kbps`:
+    /// the two spell one mode, and half an override would read a preset's
+    /// Automatic as the global's cap.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub abr_max_kbps: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub render_scale: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -117,8 +122,11 @@ impl SettingsOverlay {
         if let Some(v) = self.match_window {
             s.match_window = v;
         }
-        if let Some(v) = self.bitrate_kbps {
-            s.bitrate_kbps = v;
+        // The bitrate mode is the pair, so apply it as one: a preset written
+        // before the cap existed means Automatic, not the global's limit.
+        if self.bitrate_kbps.is_some() || self.abr_max_kbps.is_some() {
+            s.bitrate_kbps = self.bitrate_kbps.unwrap_or(0);
+            s.abr_max_kbps = self.abr_max_kbps.unwrap_or(0);
         }
         if let Some(v) = self.render_scale {
             s.render_scale = v;
@@ -221,8 +229,9 @@ impl SettingsOverlay {
         if after.match_window != before.match_window {
             self.match_window = Some(after.match_window);
         }
-        if after.bitrate_kbps != before.bitrate_kbps {
+        if after.bitrate_kbps != before.bitrate_kbps || after.abr_max_kbps != before.abr_max_kbps {
             self.bitrate_kbps = Some(after.bitrate_kbps);
+            self.abr_max_kbps = Some(after.abr_max_kbps);
         }
         if after.render_scale != before.render_scale {
             self.render_scale = Some(after.render_scale);
@@ -320,7 +329,10 @@ impl SettingsOverlay {
             "height" => self.height = None,
             "refresh_hz" => self.refresh_hz = None,
             "match_window" => self.match_window = None,
-            "bitrate_kbps" => self.bitrate_kbps = None,
+            "bitrate_kbps" => {
+                self.bitrate_kbps = None;
+                self.abr_max_kbps = None;
+            }
             "render_scale" => self.render_scale = None,
             "video_fit" => self.video_fit = None,
             "codec" => self.codec = None,
@@ -626,6 +638,49 @@ mod tests {
         let mut moved = base.clone();
         moved.bitrate_kbps = 50000;
         assert_eq!(pin.apply(&moved).bitrate_kbps, 20000);
+    }
+
+    /// The bitrate pair spells one mode, so an overlay carries both halves or
+    /// neither. A preset written before the limit existed means Automatic, and
+    /// must not read as this device's limit.
+    #[test]
+    fn a_preset_carries_the_whole_bitrate_mode() {
+        let capped = Settings {
+            bitrate_kbps: 0,
+            abr_max_kbps: 15_000,
+            ..Default::default()
+        };
+
+        // A pre-limit preset that pins Automatic stays Automatic here.
+        let legacy = SettingsOverlay {
+            bitrate_kbps: Some(0),
+            ..Default::default()
+        };
+        let out = legacy.apply(&capped);
+        assert_eq!((out.bitrate_kbps, out.abr_max_kbps), (0, 0));
+
+        // …and one that pins a fixed rate is fixed, limit gone.
+        let fixed = SettingsOverlay {
+            bitrate_kbps: Some(50_000),
+            ..Default::default()
+        };
+        let out = fixed.apply(&capped);
+        assert_eq!((out.bitrate_kbps, out.abr_max_kbps), (50_000, 0));
+
+        // Touching either half records both, and a reset drops both.
+        let mut o = SettingsOverlay::default();
+        let before = o.apply(&Settings::default());
+        let mut after = before.clone();
+        after.abr_max_kbps = 12_000;
+        o.absorb(&before, &after);
+        assert_eq!((o.bitrate_kbps, o.abr_max_kbps), (Some(0), Some(12_000)));
+        let out = o.apply(&Settings {
+            bitrate_kbps: 80_000,
+            ..Default::default()
+        });
+        assert_eq!((out.bitrate_kbps, out.abr_max_kbps), (0, 12_000));
+        assert!(o.clear("bitrate_kbps"));
+        assert_eq!((o.bitrate_kbps, o.abr_max_kbps), (None, None));
     }
 
     #[test]

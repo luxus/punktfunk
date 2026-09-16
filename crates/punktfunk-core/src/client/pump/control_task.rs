@@ -49,6 +49,9 @@ pub(super) struct ControlTask {
     /// Live mute mask ([`NativeClient::audio_mute`]). This task owns
     /// [`crate::client::AUDIO_MUTE_HOST`]; the embedder's own bit shares the cell.
     pub(super) audio_mute: Arc<AtomicU8>,
+    /// Live pad-slot mask ([`NativeClient::pad_slots`]). Latest wins — the host
+    /// resends the whole set whenever one of this session's pads comes or goes.
+    pub(super) pad_slots: Arc<std::sync::atomic::AtomicU16>,
 }
 
 impl ControlTask {
@@ -73,6 +76,7 @@ impl ControlTask {
             access_deadline_unix,
             access_tx,
             audio_mute,
+            pad_slots,
         } = self;
         // Mid-stream clock re-sync ([`ClockResync`]): a batch every
         // CLOCK_RESYNC_INTERVAL and when the pump asks (CtrlRequest::ClockResync
@@ -315,6 +319,11 @@ impl ControlTask {
                             crate::client::AUDIO_MUTE_HOST,
                             st.muted,
                         );
+                    } else if let Ok(p) = crate::quic::PadSlots::decode(&msg) {
+                        // Which players this session's pads are. The host decides it —
+                        // wire indices are per client, the OS slots are host-wide.
+                        tracing::info!(slots = p.slots, "host assigned this session's pad slots");
+                        pad_slots.store(p.slots, Ordering::Relaxed);
                     } else if let Ok(shape) = crate::quic::CursorShape::decode(&msg) {
                         // Pointer bitmap changed. try_send: overflow drops newest;
                         // the next shape change resends.

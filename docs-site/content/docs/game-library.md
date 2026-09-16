@@ -89,6 +89,11 @@ Under **Details (optional)** a title can carry:
 Every field is optional and free-form; the host doesn't normalize the values. A poster tile shows the
 platform badge only when it isn't `PC`, since that would be true of everything scanned.
 
+**Who hears this title** matters once several clients share one display
+([join](/docs/virtual-displays)): everyone, the display's owner only, the joined sessions only, or
+only the session that launched it. The others get silence for the title's run. The console's
+**Session** card can still mute any session by hand.
+
 Manual entries live in `library.json` in the host config directory. That file drives commands the host
 runs, so it is locked down to the host user (0600 on Linux, a SYSTEM+Administrators ACL on Windows) —
 treat what you type there as operator-level configuration.

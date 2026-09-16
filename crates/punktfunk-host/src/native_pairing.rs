@@ -385,6 +385,18 @@ impl NativePairing {
         self.store.list()
     }
 
+    /// Player slot this device's pads take, 0-based. `None` = the lazy claim. Expiry-blind:
+    /// it places controllers, so an expired record's pick is simply not reached.
+    pub fn pad_slot_of(&self, fp_hex: &str) -> Option<u8> {
+        self.store.get(fp_hex)?.preferred_pad_slot
+    }
+
+    /// Remember which player this device is, so its next connect lands on the same slot.
+    /// `false` (no write) for an unknown fingerprint.
+    pub fn set_pad_slot(&self, fp_hex: &str, slot: Option<u8>) -> Result<bool> {
+        self.store.set_pad_slot(fp_hex, slot)
+    }
+
     /// Count a live session for `fp_hex` until the returned guard drops. Every admitted session
     /// counts; only a "this session" record reads the total.
     pub fn session_started(self: &std::sync::Arc<Self>, fp_hex: &str) -> SessionCountGuard {

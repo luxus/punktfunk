@@ -95,6 +95,78 @@ impl AudioOutputMode {
     }
 }
 
+/// Where voice-chat apps play while a stream runs (`PUNKTFUNK_AUDIO_VOICE_CHAT`).
+/// Linux only: the other planes capture one endpoint and cannot split a mix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VoiceChatRoute {
+    /// In the stream like everything else. Right when the viewer is not in the call.
+    #[default]
+    Stream,
+    /// On the host's own output, out of the stream: friends in the call never hear
+    /// their own voices back.
+    Host,
+}
+
+impl VoiceChatRoute {
+    fn from_env() -> VoiceChatRoute {
+        let raw = std::env::var("PUNKTFUNK_AUDIO_VOICE_CHAT").unwrap_or_default();
+        if raw.trim().is_empty() {
+            return VoiceChatRoute::Stream;
+        }
+        VoiceChatRoute::parse(&raw).unwrap_or_else(|| {
+            eprintln!(
+                "punktfunk: PUNKTFUNK_AUDIO_VOICE_CHAT={raw:?} is not one of stream/host — \
+                 using stream"
+            );
+            VoiceChatRoute::Stream
+        })
+    }
+
+    pub fn parse(s: &str) -> Option<VoiceChatRoute> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "stream" | "client" => Some(VoiceChatRoute::Stream),
+            "host" | "speakers" => Some(VoiceChatRoute::Host),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            VoiceChatRoute::Stream => "stream",
+            VoiceChatRoute::Host => "host",
+        }
+    }
+}
+
+/// Lowercase fragments a voice-chat app's `application.name` or process binary
+/// contains. Discord's three builds all contain `discord`.
+pub const DEFAULT_VOICE_APPS: &[&str] = &[
+    "discord",
+    "vesktop",
+    "webcord",
+    "armcord",
+    "legcord",
+    "teamspeak",
+    "ts3client",
+    "mumble",
+];
+
+/// `PUNKTFUNK_AUDIO_VOICE_APPS`: a comma list replacing [`DEFAULT_VOICE_APPS`].
+/// Blank entries drop; an empty or unset value keeps the default list.
+pub fn parse_voice_apps(raw: Option<&str>) -> Vec<String> {
+    let listed: Vec<String> = raw
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if listed.is_empty() {
+        DEFAULT_VOICE_APPS.iter().map(|s| s.to_string()).collect()
+    } else {
+        listed
+    }
+}
+
 /// Operator and dispatch knobs resolved once. Session-mutated values stay at
 /// their call sites. Unused-on-this-platform fields stay so `Debug` and the
 /// parser remain one platform-neutral function.
@@ -157,6 +229,10 @@ pub struct HostConfig {
     pub chacha20: bool,
     /// `PUNKTFUNK_AUDIO_OUTPUT_MODE` — see [`AudioOutputMode`].
     pub audio_output_mode: AudioOutputMode,
+    /// `PUNKTFUNK_AUDIO_VOICE_CHAT` — see [`VoiceChatRoute`].
+    pub audio_voice_chat: VoiceChatRoute,
+    /// `PUNKTFUNK_AUDIO_VOICE_APPS` — see [`parse_voice_apps`]. Never empty.
+    pub audio_voice_apps: Vec<String>,
     /// `PUNKTFUNK_AUDIO_QUALITY` — encode tier (`low`/`standard`/`high`; default
     /// `high`). Raw string: the table lives in `punktfunk-core`. The audio thread
     /// warns on an unknown spelling rather than silently downgrading.
@@ -293,6 +369,8 @@ impl HostConfig {
             four_four_four: env_on("PUNKTFUNK_444").unwrap_or(true),
             chacha20: env_on("PUNKTFUNK_CHACHA20").unwrap_or(true),
             audio_output_mode: AudioOutputMode::from_env(),
+            audio_voice_chat: VoiceChatRoute::from_env(),
+            audio_voice_apps: parse_voice_apps(val("PUNKTFUNK_AUDIO_VOICE_APPS").as_deref()),
             audio_quality: val("PUNKTFUNK_AUDIO_QUALITY").map(|s| s.trim().to_lowercase()),
             audio_redundancy: env_on("PUNKTFUNK_AUDIO_REDUNDANCY"),
             audio_hires: env_on("PUNKTFUNK_AUDIO_HIRES").unwrap_or(true),
@@ -469,6 +547,28 @@ mod tests {
         ] {
             assert_eq!(AudioOutputMode::parse(m.as_str()), Some(m));
         }
+    }
+
+    #[test]
+    fn voice_chat_route_and_app_list_parse() {
+        assert_eq!(VoiceChatRoute::parse(" Host "), Some(VoiceChatRoute::Host));
+        assert_eq!(
+            VoiceChatRoute::parse("speakers"),
+            Some(VoiceChatRoute::Host)
+        );
+        assert_eq!(
+            VoiceChatRoute::parse("stream"),
+            Some(VoiceChatRoute::Stream)
+        );
+        assert_eq!(VoiceChatRoute::parse("both"), None);
+        assert_eq!(VoiceChatRoute::default(), VoiceChatRoute::Stream);
+        // A blank or absent list keeps the default; a typed one replaces it, lowercased.
+        assert_eq!(parse_voice_apps(None), DEFAULT_VOICE_APPS);
+        assert_eq!(parse_voice_apps(Some(" , ")), DEFAULT_VOICE_APPS);
+        assert_eq!(
+            parse_voice_apps(Some("Discord, firefox ,,")),
+            vec!["discord", "firefox"]
+        );
     }
 
     /// `prefers_host_hardware` and `keeps_default` must stay mutually exclusive:

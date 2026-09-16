@@ -214,6 +214,92 @@ pub(crate) struct SessionAccess {
     level: String,
 }
 
+/// Place one session's player slot
+///
+/// Which controller this session is: slot 0 is Player 1, and a local co-op game
+/// reads that order. Without a pick the slot is whichever comes free, so the pad
+/// that moves first takes Player 1 and the order changes on every reconnect.
+///
+/// The pick is a reservation, not a seizure. A pad already built keeps the slot it
+/// was created under until it re-plugs; a slot another live session asked for first
+/// stays theirs and this call answers `reserved: false`. It is remembered against
+/// the device's pairing, so the same device reconnects as the same player — an
+/// anonymous session's pick lasts only as long as the session.
+#[utoipa::path(
+    put,
+    path = "/session/{id}/player",
+    tag = "session",
+    operation_id = "setSessionPlayer",
+    params(("id" = u64, Path, description = "Session id from `GET /status`")),
+    request_body = SessionPlayerRequest,
+    responses(
+        (status = OK, description = "The pick, and whether it took the slot", body = SessionPlayer),
+        (status = BAD_REQUEST, description = "Slot past the host's pad count", body = ApiError),
+        (status = NOT_FOUND, description = "No live session with that id", body = ApiError),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+    )
+)]
+pub(crate) async fn set_session_player(
+    State(st): State<Arc<MgmtState>>,
+    Path(id): Path<u64>,
+    ApiJson(req): ApiJson<SessionPlayerRequest>,
+) -> Response {
+    if req
+        .slot
+        .is_some_and(|s| s as usize >= punktfunk_core::input::MAX_PADS)
+    {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "That player number is higher than this host has controllers for.",
+        );
+    }
+    let Some(controls) = crate::session_status::controls(id) else {
+        return no_such_session();
+    };
+    let reserved = controls.set_player(req.slot);
+    // Remember it against the pairing, so the next connect is the same player. A
+    // session with no record (anonymous) keeps the pick for this session only.
+    if let (Some(np), Some(fp)) = (st.native.as_ref(), controls.fingerprint.as_deref()) {
+        if let Err(e) = np.set_pad_slot(fp, req.slot) {
+            tracing::warn!(session = id, error = %format!("{e:#}"), "store player pick");
+        }
+    }
+    tracing::info!(
+        session = id,
+        slot = ?req.slot,
+        reserved,
+        "management API: session player slot"
+    );
+    Json(SessionPlayer {
+        slot: req.slot,
+        reserved,
+        pads: controls.pads(),
+    })
+    .into_response()
+}
+
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct SessionPlayerRequest {
+    /// Player slot, 0-based: `0` is Player 1. Omit or `null` to hand the session
+    /// back to the first-free claim.
+    #[schema(value_type = u32, required = false, example = 1)]
+    #[serde(default)]
+    slot: Option<u8>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub(crate) struct SessionPlayer {
+    /// The pick now stored for this session.
+    #[schema(value_type = u32, required = false)]
+    slot: Option<u8>,
+    /// `false` = another live session asked for that slot first and keeps it; this
+    /// session stays on the first-free claim.
+    reserved: bool,
+    /// OS pad slots the session holds right now. A pad already built keeps its slot
+    /// until it re-plugs, so this can still name the old player for a moment.
+    pads: Vec<u8>,
+}
+
 /// Recently finished sessions
 ///
 /// What each session came to — mode, codec, bitrate, frames, bring-up, and why it ended

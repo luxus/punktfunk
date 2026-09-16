@@ -37,6 +37,10 @@ internal object SettingsFields {
             prefsKey = "safe_area_right_px"),
         field("bitrateKbps", "bitrate_kbps", IntKind, { it.bitrateKbps }, { s, v -> s.copy(bitrateKbps = v) },
             overlay({ it.bitrateKbps }, { o, v -> o.copy(bitrateKbps = v) })),
+        // Automatic's ceiling. Its overlay side is paired with `bitrate_kbps` in
+        // [SettingsOverlay.apply]/[absorb]: the two spell one mode.
+        field("abrMaxKbps", "abr_max_kbps", IntKind, { it.abrMaxKbps }, { s, v -> s.copy(abrMaxKbps = v) },
+            overlay({ it.abrMaxKbps }, { o, v -> o.copy(abrMaxKbps = v) })),
         field("renderScale", "render_scale", DoubleKind, { it.renderScale }, { s, v -> s.copy(renderScale = v) },
             overlay({ it.renderScale }, { o, v -> o.copy(renderScale = v) })),
         field("videoFit", "video_fit", StrKind, { it.videoFit }, { s, v -> s.copy(videoFit = v) },

@@ -145,89 +145,175 @@ pub(super) fn software_stream(
 /// probe can show headroom past the rate a session will actually use.
 const MAX_PROBE_KBPS: u32 = 10_000_000;
 const MAX_PROBE_MS: u32 = 5_000;
+/// One pump's send ceiling: a whole catch-up backlog in one batch overruns a ~400 KiB send
+/// buffer. The rest follows on the next pump, which video shares.
+const PROBE_PUMP_BYTES: u64 = 64 * 1024;
 
-/// Burst zero-filled [`FLAG_PROBE`] AUs at `req.target_kbps` for `req.duration_ms` (clamped to
-/// `MAX_PROBE_*`). Paces by a bytes-allowed-so-far budget so scheduling jitter does not overshoot.
-/// Video is paused for the duration — the caller's loop is blocked here.
-fn run_probe_burst(
-    session: &mut Session,
-    req: ProbeRequest,
-    stop: &AtomicBool,
-    probe_seq: bool,
-) -> ProbeResult {
-    let target_kbps = req.target_kbps.min(MAX_PROBE_KBPS);
-    let duration_ms = req.duration_ms.min(MAX_PROBE_MS);
-    // Probe filler uses its own frame-index space. Without VIDEO_CAP_PROBE_SEQ the client has
-    // one reassembly window and would drop probe frames as stale — decline rather than consume
-    // video indexes the gap detector would read as a multi-thousand-frame loss after the burst.
-    if !probe_seq {
-        tracing::info!(
-            "declining speed-test probe: client predates VIDEO_CAP_PROBE_SEQ (its reassembler \
-             cannot window probe-space frames)"
-        );
-        return ProbeResult {
+/// A speed-test burst in flight: zero-filled [`FLAG_PROBE`] AUs at `target_kbps` for
+/// `duration_ms`, both clamped to `MAX_PROBE_*`. The send loop pumps it between AUs, so video
+/// keeps flowing and the burst reads the headroom beside the live stream.
+struct ProbeBurst {
+    filler: Vec<u8>,
+    target_kbps: u32,
+    /// Pacing rate and its anchor: the budget is what has elapsed since `start`, so a pump
+    /// that arrives late sends the backlog instead of forfeiting it.
+    bytes_per_sec: u64,
+    start: std::time::Instant,
+    deadline: std::time::Instant,
+    bytes_sent: u64,
+    packets_sent: u32,
+    /// Wire packets this burst offered, and those the send buffer refused. Counted per submit:
+    /// video shares the loop now, so a session-stats delta would fold its shards in.
+    wire_offered: u32,
+    send_dropped: u32,
+}
+
+impl ProbeBurst {
+    /// `None` = nothing to burst, answered with [`declined`]: an empty request, or a client
+    /// without VIDEO_CAP_PROBE_SEQ. That client has one reassembly window and would drop probe
+    /// frames as stale — and a burst in video's index space reads as a multi-thousand-frame
+    /// loss once it ends.
+    fn begin(req: ProbeRequest, probe_seq: bool) -> Option<ProbeBurst> {
+        if !probe_seq {
+            tracing::info!(
+                "declining speed-test probe: client predates VIDEO_CAP_PROBE_SEQ (its reassembler \
+                 cannot window probe-space frames)"
+            );
+            return None;
+        }
+        let target_kbps = req.target_kbps.min(MAX_PROBE_KBPS);
+        let duration_ms = req.duration_ms.min(MAX_PROBE_MS);
+        if target_kbps == 0 || duration_ms == 0 {
+            return None;
+        }
+        let bytes_per_sec = u64::from(target_kbps) * 125;
+        // ≤16 KiB ≈ a dozen MTU shards; a 256 KiB AU overflowed a ~400 KiB send buffer on one submit.
+        let chunk = (bytes_per_sec / 240).clamp(1200, 16 * 1024) as usize;
+        let start = std::time::Instant::now();
+        Some(ProbeBurst {
+            filler: vec![0u8; chunk],
+            target_kbps,
+            bytes_per_sec,
+            start,
+            deadline: start + std::time::Duration::from_millis(u64::from(duration_ms)),
             bytes_sent: 0,
             packets_sent: 0,
-            duration_ms: 0,
-            wire_packets_sent: 0,
+            wire_offered: 0,
             send_dropped: 0,
-        };
+        })
     }
-    if target_kbps == 0 || duration_ms == 0 {
-        return ProbeResult {
-            bytes_sent: 0,
-            packets_sent: 0,
-            duration_ms: 0,
-            wire_packets_sent: 0,
-            send_dropped: 0,
-        };
+
+    /// Bytes the burst is allowed to have sent by now: elapsed × rate, held at the whole
+    /// request so a late pump delivers the budget without overshooting it.
+    fn allowed_bytes(&self) -> u64 {
+        let elapsed = self.start.elapsed().min(self.deadline - self.start);
+        (elapsed.as_secs_f64() * self.bytes_per_sec as f64) as u64
     }
-    let bytes_per_sec = target_kbps as u64 * 125;
-    // ≤16 KiB ≈ a dozen MTU shards; a 256 KiB AU overflowed a ~400 KiB send buffer on one submit.
-    let chunk = (bytes_per_sec / 240).clamp(1200, 16 * 1024) as usize;
-    let filler = vec![0u8; chunk];
-    // Video is paused here, so the sealed/dropped deltas isolate host-side drops from link loss.
-    let wire0 = session.stats().packets_sent;
-    let drop0 = session.stats().packets_send_dropped;
-    let start = std::time::Instant::now();
-    let deadline = start + std::time::Duration::from_millis(duration_ms as u64);
-    let mut bytes_sent = 0u64;
-    let mut packets_sent = 0u32;
-    while std::time::Instant::now() < deadline && !stop.load(Ordering::SeqCst) {
-        let allowed = (start.elapsed().as_secs_f64() * bytes_per_sec as f64) as u64;
-        if bytes_sent < allowed {
+
+    /// Send what the budget allows now, at most [`PROBE_PUMP_BYTES`], then hand the thread
+    /// back. Sending the backlog is what keeps the measured rate true when video held the
+    /// loop for an AU.
+    fn pump(&mut self, session: &mut Session) {
+        let budget = self.allowed_bytes().min(self.bytes_sent + PROBE_PUMP_BYTES);
+        while self.bytes_sent < budget {
             // WouldBlock/ENOBUFS is part of what the probe measures (`send_dropped`) — keep going.
-            let _ = session.submit_probe_frame(&filler, now_ns());
-            bytes_sent += chunk as u64;
-            packets_sent += 1;
-        } else {
-            std::thread::sleep(std::time::Duration::from_micros(200));
+            if let Ok((offered, dropped)) = session.submit_probe_frame(&self.filler, now_ns()) {
+                self.wire_offered += offered;
+                self.send_dropped += dropped;
+            }
+            self.bytes_sent += self.filler.len() as u64;
+            self.packets_sent += 1;
         }
     }
-    let actual_ms = start.elapsed().as_millis() as u32;
-    let wire_offered = (session.stats().packets_sent - wire0) as u32;
-    let send_dropped = (session.stats().packets_send_dropped - drop0) as u32;
-    let wire_packets_sent = wire_offered.saturating_sub(send_dropped);
-    tracing::info!(
-        target_kbps,
-        duration_ms = actual_ms,
-        bytes_sent,
-        au_count = packets_sent,
-        wire_offered,
-        wire_packets_sent,
-        send_dropped,
-        "speed-test probe burst complete"
-    );
-    ProbeResult {
-        bytes_sent,
-        packets_sent,
-        duration_ms: actual_ms,
-        wire_packets_sent,
-        send_dropped,
+
+    /// The requested duration has elapsed. Callers pump before they ask, so the last of the
+    /// budget is already on the wire.
+    fn expired(&self) -> bool {
+        std::time::Instant::now() >= self.deadline
+    }
+
+    /// How long the caller may spend elsewhere: until the next filler comes due, zero while
+    /// the budget is behind, and never past the burst's own deadline.
+    fn next_due(&self) -> std::time::Duration {
+        let now = std::time::Instant::now();
+        let due = self.start
+            + std::time::Duration::from_secs_f64(
+                self.bytes_sent as f64 / self.bytes_per_sec as f64,
+            );
+        due.saturating_duration_since(now)
+            .min(self.deadline.saturating_duration_since(now))
+    }
+
+    /// End the burst and report it. Both figures are what happened, so a burst cut short by
+    /// `stop` or a teardown reports itself rather than the request.
+    fn finish(self) -> ProbeResult {
+        let duration_ms = self.start.elapsed().as_millis() as u32;
+        let wire_packets_sent = self.wire_offered.saturating_sub(self.send_dropped);
+        tracing::info!(
+            target_kbps = self.target_kbps,
+            duration_ms,
+            bytes_sent = self.bytes_sent,
+            au_count = self.packets_sent,
+            wire_offered = self.wire_offered,
+            wire_packets_sent,
+            send_dropped = self.send_dropped,
+            "speed-test probe burst complete"
+        );
+        ProbeResult {
+            bytes_sent: self.bytes_sent,
+            packets_sent: self.packets_sent,
+            duration_ms,
+            wire_packets_sent,
+            send_dropped: self.send_dropped,
+        }
     }
 }
 
-/// Drain pending speed-test requests between frames. `probe_seq` is [`VIDEO_CAP_PROBE_SEQ`].
+/// All-zero: the client reads it as a decline and keeps its negotiated ceiling.
+fn declined() -> ProbeResult {
+    ProbeResult {
+        bytes_sent: 0,
+        packets_sent: 0,
+        duration_ms: 0,
+        wire_packets_sent: 0,
+        send_dropped: 0,
+    }
+}
+
+/// Pump the live burst, else take the next request. One slice per call: the send loop goes
+/// straight back to its AUs, so the encode channel never fills and the capture pool keeps its
+/// spare buffers. Never while a streamed AU is open.
+fn service_burst(
+    session: &mut Session,
+    burst: &mut Option<ProbeBurst>,
+    probe_rx: &std::sync::mpsc::Receiver<ProbeRequest>,
+    probe_result_tx: &tokio::sync::mpsc::UnboundedSender<ProbeResult>,
+    probe_seq: bool,
+) {
+    match burst.as_mut() {
+        Some(b) => {
+            b.pump(session);
+            if b.expired() {
+                let done = burst.take().expect("armed on this branch");
+                let _ = probe_result_tx.send(done.finish());
+            }
+        }
+        None => {
+            if let Ok(req) = probe_rx.try_recv() {
+                match ProbeBurst::begin(req, probe_seq) {
+                    Some(b) => *burst = Some(b),
+                    None => {
+                        let _ = probe_result_tx.send(declined());
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Serve pending speed-test requests between frames, blocking here for each burst. The
+/// synthetic and software sources hold no capture buffers and owe no deadline; the
+/// virtual-display path pumps [`ProbeBurst`] from its send loop instead.
 fn service_probes(
     session: &mut Session,
     stop: &AtomicBool,
@@ -236,7 +322,16 @@ fn service_probes(
     probe_seq: bool,
 ) {
     while let Ok(req) = probe_rx.try_recv() {
-        let result = run_probe_burst(session, req, stop, probe_seq);
+        let result = match ProbeBurst::begin(req, probe_seq) {
+            Some(mut burst) => {
+                while !burst.expired() && !stop.load(Ordering::SeqCst) {
+                    burst.pump(session);
+                    std::thread::sleep(burst.next_due().min(std::time::Duration::from_micros(200)));
+                }
+                burst.finish()
+            }
+            None => declined(),
+        };
         let _ = probe_result_tx.send(result);
     }
 }
@@ -420,6 +515,154 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A host session onto an in-process link, and the client that reads it back.
+    fn loopback_sessions() -> (Session, Session) {
+        use punktfunk_core::config::{Config, Role};
+        let (host_tp, client_tp) = punktfunk_core::transport::loopback_pair(0, 0);
+        (
+            Session::new(Config::p1_defaults(Role::Host), Box::new(host_tp)).expect("host session"),
+            Session::new(Config::p1_defaults(Role::Client), Box::new(client_tp))
+                .expect("client session"),
+        )
+    }
+
+    /// One pump sends one slice, not the burst: the budget is what has elapsed. Across a
+    /// burst's worth of pumps the slices still add up to the bytes the client asked for.
+    #[test]
+    fn a_burst_spends_its_byte_budget_across_pumps() {
+        let (mut host, _client) = loopback_sessions();
+        let req = ProbeRequest {
+            target_kbps: 8_000,
+            duration_ms: 200,
+        };
+        let mut burst = ProbeBurst::begin(req, true).expect("a capable client arms a burst");
+        let chunk = burst.filler.len() as u64;
+        burst.pump(&mut host);
+        assert!(
+            burst.bytes_sent <= 2 * chunk,
+            "the first pump sends a slice, not the burst: {} bytes",
+            burst.bytes_sent
+        );
+        let mut pumps = 1;
+        while !burst.expired() {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            burst.pump(&mut host);
+            pumps += 1;
+        }
+        burst.pump(&mut host); // the last budgeted bytes, as the send loop does before it finishes
+        assert!(pumps > 5, "a 200 ms burst pumps many times: {pumps}");
+        let budget = 200 * 8_000 / 8; // duration_ms × kbps / 8 = bytes
+        let r = burst.finish();
+        assert!(
+            r.bytes_sent >= budget * 8 / 10 && r.bytes_sent <= budget + chunk,
+            "delivered {} of a {budget} byte budget",
+            r.bytes_sent
+        );
+        assert_eq!(r.send_dropped, 0, "an in-process link refuses nothing");
+        assert!(
+            u64::from(r.wire_packets_sent) >= u64::from(r.packets_sent),
+            "each filler AU is at least one wire packet"
+        );
+    }
+
+    /// Video AUs keep leaving the host through a burst, and the burst's report counts only
+    /// its own filler: the client's probe counter matches it exactly.
+    #[test]
+    fn video_flows_through_a_burst_and_stays_out_of_its_report() {
+        let (mut host, mut client) = loopback_sessions();
+        let req = ProbeRequest {
+            target_kbps: 8_000,
+            duration_ms: 100,
+        };
+        let mut burst = ProbeBurst::begin(req, true).expect("a capable client arms a burst");
+        let video = vec![7u8; 16 * 1024];
+        let (mut video_frames, mut sent_video) = (0u32, 0u32);
+        let drain = |client: &mut Session, video_frames: &mut u32| {
+            while let Ok(f) = client.poll_frame() {
+                if f.flags & FLAG_PROBE as u32 == 0 {
+                    *video_frames += 1;
+                }
+            }
+        };
+        while !burst.expired() {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            burst.pump(&mut host);
+            host.submit_frame(&video, now_ns(), (FLAG_PIC | FLAG_SOF) as u32)
+                .expect("a video AU during the burst");
+            sent_video += 1;
+            drain(&mut client, &mut video_frames);
+        }
+        burst.pump(&mut host);
+        drain(&mut client, &mut video_frames);
+        let r = burst.finish();
+        assert!(
+            sent_video > 3 && video_frames >= sent_video - 1,
+            "video kept flowing: {video_frames} of {sent_video} AUs arrived"
+        );
+        let st = client.stats();
+        assert_eq!(
+            u64::from(r.wire_packets_sent),
+            st.probe_packets_received,
+            "the report counts probe packets, never the video shards beside them"
+        );
+        assert!(
+            st.packets_received > st.probe_packets_received,
+            "video shared the wire with the burst"
+        );
+    }
+
+    /// A burst reports once and leaves nothing armed, and a client that cannot window probe
+    /// indexes is declined without arming anything.
+    #[test]
+    fn a_burst_disarms_itself_and_reports_once() {
+        let (mut host, _client) = loopback_sessions();
+        let (req_tx, req_rx) = std::sync::mpsc::channel::<ProbeRequest>();
+        let (res_tx, mut res_rx) = tokio::sync::mpsc::unbounded_channel::<ProbeResult>();
+        let mut burst: Option<ProbeBurst> = None;
+        let req = ProbeRequest {
+            target_kbps: 4_000,
+            duration_ms: 20,
+        };
+        req_tx.send(req).unwrap();
+        service_burst(&mut host, &mut burst, &req_rx, &res_tx, true);
+        assert!(burst.is_some(), "the request arms a burst");
+        assert!(res_rx.try_recv().is_err(), "no result until the burst ends");
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        service_burst(&mut host, &mut burst, &req_rx, &res_tx, true);
+        assert!(burst.is_none(), "an expired burst leaves nothing armed");
+        let r = res_rx.try_recv().expect("the finished burst reports");
+        assert!(r.bytes_sent > 0 && r.duration_ms >= 20, "{r:?}");
+        assert!(res_rx.try_recv().is_err(), "one result per request");
+        req_tx.send(req).unwrap();
+        service_burst(&mut host, &mut burst, &req_rx, &res_tx, false);
+        assert!(burst.is_none(), "an old client arms nothing");
+        assert_eq!(res_rx.try_recv().expect("a decline"), declined());
+    }
+
+    /// Teardown mid-burst: the report is what went out, not what was asked for.
+    #[test]
+    fn a_burst_cut_short_reports_what_it_sent() {
+        let (mut host, _client) = loopback_sessions();
+        let req = ProbeRequest {
+            target_kbps: 8_000,
+            duration_ms: 5_000,
+        };
+        let mut burst = ProbeBurst::begin(req, true).expect("a capable client arms a burst");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        burst.pump(&mut host);
+        let r = burst.finish();
+        assert!(
+            r.duration_ms >= 20 && r.duration_ms < 5_000,
+            "the window is what elapsed: {} ms",
+            r.duration_ms
+        );
+        assert!(
+            r.bytes_sent > 0 && r.bytes_sent < 5_000 * 8_000 / 8,
+            "the bytes are what went out: {}",
+            r.bytes_sent
+        );
+    }
 
     #[test]
     fn reconfig_allowed_gates_gamescope_and_per_client_mode() {

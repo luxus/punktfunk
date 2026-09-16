@@ -314,6 +314,9 @@ struct ConnectRequest {
     /// 0 = host default.
     #[serde(default)]
     bitrate_kbps: u32,
+    /// Automatic's ceiling in kbps; 0 = no limit. Read only while `bitrate_kbps` is 0.
+    #[serde(default)]
+    abr_max_kbps: u32,
     /// `CompositorPref` / `GamepadPref` wire bytes (unknown ⇒ Auto).
     #[serde(default)]
     compositor_pref: u8,
@@ -405,6 +408,7 @@ fn connect(req: ConnectRequest) -> jlong {
         key_pem: key,
         pin_hex,
         bitrate_kbps,
+        abr_max_kbps,
         compositor_pref,
         gamepad_pref,
         hdr_enabled,
@@ -487,6 +491,9 @@ fn connect(req: ConnectRequest) -> jlong {
         CompositorPref::from_u8(compositor_pref),
         GamepadPref::from_u8(gamepad_pref),
         bitrate_kbps, // 0 = host default
+        // Automatic's ceiling. Binds the negotiated start too, so a capped
+        // session never emits a faster first second than the link carries.
+        abr_max_kbps,
         video_caps(hdr_enabled, ten_bit_sdr, multi_slice_ok),
         audio_channels,
         // The audio format this session ASKS for (resolved above). A non-default pair is what
@@ -558,6 +565,9 @@ fn connect(req: ConnectRequest) -> jlong {
         // Handshake budget from Kotlin: ~10 s for a normal connect, ~185 s for "request access"
         // (the host parks the connection until the operator approves the device — see ConnectScreen).
         Duration::from_millis(timeout_ms),
+        // No ABR memory: the known-hosts store lives on the Kotlin side here, so nothing
+        // native has this host's previous session to hand in.
+        None,
         // The Kotlin side cancels by dropping the result (`Dial.cancelled`), not by aborting
         // the dial — its connect runs on a pool thread, so a parked one costs a thread, not a
         // stuck UI. Wire a flag through here if that ever stops being true.

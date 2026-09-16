@@ -31,6 +31,13 @@ data class Settings(
     val safeAreaRightPx: Int = SafeArea.AUTO_INSET,
     val bitrateKbps: Int = 0,
     /**
+     * Automatic's ceiling in kbps: adapt, but never climb above this. `0` = no limit, and it is
+     * read only while [bitrateKbps] is `0`. The pair spells [BitrateMode]'s three modes, so a
+     * client that knows only [bitrateKbps] still reads a limited session as Automatic rather than
+     * as a rate nobody chose. `PUNKTFUNK_ABR_MAX_MBPS` on the host process still wins.
+     */
+    val abrMaxKbps: Int = 0,
+    /**
      * Render-resolution multiplier: the client asks the host to render/encode at `chosen mode ×
      * renderScale` and the compositor downscales the larger decoded frame to the SurfaceView
      * (`> 1` supersamples for sharpness, at more bandwidth AND decode; `< 1` renders under native
@@ -926,18 +933,81 @@ fun Settings.preferredCodec(): Int = when (codec) {
     else -> 0
 }
 
-/** (kbps, label). `0` = host default. */
-val BITRATE_OPTIONS = listOf(
-    0 to "Automatic",
-    10_000 to "10 Mbps",
-    20_000 to "20 Mbps",
-    50_000 to "50 Mbps",
-    100_000 to "100 Mbps",
-    150_000 to "150 Mbps",
-    200_000 to "200 Mbps",
-    300_000 to "300 Mbps",
-    500_000 to "500 Mbps",
+/**
+ * What the bitrate pair means. [Settings.bitrateKbps] wins: a writer that knows only the old
+ * field cannot invent a limit, and a limit can never be mistaken for a fixed rate.
+ */
+enum class BitrateMode { AUTOMATIC, LIMITED, FIXED }
+
+/** The mode [Settings.bitrateKbps] / [Settings.abrMaxKbps] are in. */
+fun Settings.bitrateMode(): BitrateMode = when {
+    bitrateKbps > 0 -> BitrateMode.FIXED
+    abrMaxKbps > 0 -> BitrateMode.LIMITED
+    else -> BitrateMode.AUTOMATIC
+}
+
+/** The rate the mode row shows a value for; `0` while Automatic. */
+fun Settings.bitrateValueKbps(): Int = if (bitrateKbps > 0) bitrateKbps else abrMaxKbps
+
+/**
+ * Store one mode. Only one of the pair is ever non-zero, so no row can show a limit while a
+ * fixed rate runs — the bug the mode row exists to end.
+ */
+fun Settings.withBitrateMode(mode: BitrateMode, kbps: Int): Settings = when (mode) {
+    BitrateMode.AUTOMATIC -> copy(bitrateKbps = 0, abrMaxKbps = 0)
+    BitrateMode.LIMITED -> copy(bitrateKbps = 0, abrMaxKbps = kbps.coerceAtLeast(1))
+    BitrateMode.FIXED -> copy(bitrateKbps = kbps.coerceAtLeast(1), abrMaxKbps = 0)
+}
+
+/** (mode, label) for the bitrate mode picker. */
+val BITRATE_MODE_OPTIONS = listOf(
+    BitrateMode.AUTOMATIC to "Automatic",
+    BitrateMode.LIMITED to "Adaptive, at most…",
+    BitrateMode.FIXED to "Fixed rate…",
 )
+
+/**
+ * Quick-pick rungs in kbps — the console shell's ladder verbatim (`pf-console-ui`
+ * `screens::settings::BITRATES` minus its Automatic rung), so the touch and couch UIs on one
+ * device offer the same numbers. Denser below 20 Mbps, which is where a constrained link lives;
+ * anything else goes through the typed field.
+ */
+val BITRATE_RUNGS = listOf(
+    1_000, 2_000, 3_000, 4_000, 5_000, 6_000, 8_000, 10_000, 12_000, 15_000, 20_000, 25_000,
+    30_000, 40_000, 50_000, 60_000, 80_000, 100_000, 125_000, 150_000, 200_000, 250_000, 300_000,
+    400_000, 500_000, 750_000, 1_000_000, 1_500_000, 2_000_000,
+)
+
+/** The typed field's ceiling in Mbps — the ladder's top. The host takes 500 kbps – 8 Gbps. */
+const val BITRATE_MAX_MBPS = 2_000
+
+/**
+ * Mbps below 1 Gbps, Gbps above; a decimal only when rounding would collide (12.5 Mbps).
+ * Off-ladder rates are real — the typed field and the speed test both write them — so this
+ * formats any value rather than looking one up. The console's `bitrate_label` in Kotlin.
+ */
+fun bitrateLabel(kbps: Int): String {
+    fun unit(v: Double, suffix: String) =
+        if (kotlin.math.abs(v - kotlin.math.round(v)) < 0.05) {
+            "%.0f %s".format(kotlin.math.round(v), suffix)
+        } else {
+            "%.1f %s".format(v, suffix)
+        }
+    val mbps = kbps / 1000.0
+    return if (kbps >= 1_000_000) unit(mbps / 1000.0, "Gbps") else unit(mbps, "Mbps")
+}
+
+/** (kbps, label) quick picks, plus the sentinel row that opens the typed field. */
+const val BITRATE_CUSTOM = -1
+
+/** The value picker's rows for [current]: the ladder, then Custom carrying any off-ladder value. */
+fun bitrateValueOptions(current: Int): List<Pair<Int, String>> =
+    BITRATE_RUNGS.map { it to bitrateLabel(it) } +
+        (BITRATE_CUSTOM to if (current > 0 && current !in BITRATE_RUNGS) {
+            "Custom (${bitrateLabel(current)})"
+        } else {
+            "Custom…"
+        })
 
 /** (CompositorPref wire byte, label). Byte 6, a Windows host's echo, is never a choice. */
 val COMPOSITOR_OPTIONS = listOf(

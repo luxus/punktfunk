@@ -30,6 +30,7 @@ pub mod ids {
     pub const OMARCHY_UPDATES: &str = "omarchy_updates";
     pub const VDISPLAY_DRIVER: &str = "vdisplay_driver";
     pub const PAD_AUDIO: &str = "pad_audio";
+    pub const PLUGIN_SANDBOX: &str = "plugin_sandbox";
 }
 
 /// Probe result. `Inapplicable` is not `Ok`: "never on this box" and "works here" are different

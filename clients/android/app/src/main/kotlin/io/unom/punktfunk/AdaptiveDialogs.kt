@@ -326,7 +326,8 @@ fun SpeedTestPrompt(
                     color = MaterialTheme.colorScheme.onSurface,
                 )
                 PromptText(
-                    "Recommended bitrate: %.0f Mbit/s".format(phase.recommendedMbps),
+                    "Recommended limit: %.0f Mbit/s — the session still adapts below it."
+                        .format(phase.recommendedMbps),
                 )
                 PromptText(speedTestTargetNote(target))
             }
@@ -337,7 +338,7 @@ fun SpeedTestPrompt(
 /** One line saying which layer an Apply will write to, and why that one. */
 private fun speedTestTargetNote(target: SpeedTestTarget): String = when (target) {
     SpeedTestTarget.Global ->
-        "This host uses the default settings, so the bitrate goes there."
+        "This host uses the default settings, so the limit goes there."
     is SpeedTestTarget.Preset ->
         "This host streams with “${target.preset.name}”, which sets its own bitrate — " +
             "that override is what it actually reads."

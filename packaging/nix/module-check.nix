@@ -269,8 +269,10 @@ let
         && !(has appliance "punktfunk-web" "Restart=on-failure");
     }
     {
-      # The one unit here that runs arbitrary operator TypeScript by design.
-      name = "the plugin runner is sandboxed like the deb/rpm unit";
+      # Unit hardening for the supervisor and the operator's own scripts. What confines a PLUGIN
+      # is its own bwrap sandbox — these directives are a mount namespace, which does not hold
+      # against a process of the same uid.
+      name = "the plugin runner is hardened like the deb/rpm unit";
       ok =
         has appliance "punktfunk-scripting" "NoNewPrivileges=true"
         && has appliance "punktfunk-scripting" "ProtectSystem=strict"
@@ -311,6 +313,13 @@ let
         && has appliance "punktfunk-scripting" "BindReadOnlyPaths=-%h/.config/punktfunk/mgmt-endpoint"
         && has appliance "punktfunk-scripting" "BindReadOnlyPaths=-%h/.config/punktfunk/scripts"
         && has appliance "punktfunk-scripting" "BindReadOnlyPaths=-%h/.local/share/Steam";
+    }
+    {
+      # Without bwrap on its PATH the runner starts no plugin at all, and the library is empty.
+      name = "the plugin runner can build a sandbox";
+      ok = builtins.any (p: lib.hasInfix "bubblewrap" (toString p)) (
+        appliance.systemd.user.services.punktfunk-scripting.path or [ ]
+      );
     }
     {
       # PrivateTmp is OFF on purpose (the VirtualHere field report: a private /tmp hides

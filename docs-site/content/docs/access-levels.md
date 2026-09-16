@@ -46,6 +46,34 @@ Each preset is a bundle of independent grants, under **Advanced** in the edit sh
 **Controller only deliberately does not include Launch**: in co-play the owner drives what runs.
 Want a guest picking games? Turn on that one Advanced toggle.
 
+## Couch co-op over JOIN
+
+Two people, one screen, one game — the second player on their own phone or PC. Pair the guest's
+device **Controller only**, have them connect to the host you are already streaming from, and the
+host puts them on the *same* display instead of opening a second one (the session list calls that
+**Joined another session**). Their controllers arrive as extra controllers on that desktop, with
+rumble and pad audio, and nothing else they send lands. From the game's side it is simply two pads
+on one PC, which is what local co-op wants.
+
+**Who is Player 1** is a host decision, because a controller's OS slot is what a local co-op game
+reads and each client numbers its own pads from zero. Left alone, the slot goes to whichever pad
+appears first, so the order changes every time someone reconnects. The Dashboard's **Sessions**
+card carries a player picker on each row: pick **Player 1–4** and that session's controllers take
+that slot. The pick is remembered against the device's pairing, so the same device is the same
+player next time it connects — it follows the pairing, not an address.
+
+Two things the picker deliberately does not do. A controller that is already plugged in keeps the
+slot it was created under until it re-plugs, because renumbering a live pad is an unplug in front
+of the game. And a slot another live session asked for first stays theirs — the picker says so
+rather than taking it. A session with no pick keeps the old behaviour: first free slot.
+
+Up-to-date clients name the player themselves: the [stats overlay](/docs/stats) leads with
+*"player 2"* whenever the session holds a controller, so the guest can check without asking.
+
+This is a *shared* desktop, so everything under
+[what access levels do not cover](#what-this-does-not-cover) still applies: the guest sees and
+hears your whole screen, and game audio is one stream both of you hear.
+
 A session's quality controls — resolution, bitrate, keyframe requests — are *not* governed. They
 only shape that device's own stream; restricting them would cost usability and buy no security.
 

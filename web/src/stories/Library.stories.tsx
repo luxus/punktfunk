@@ -21,6 +21,7 @@ const emptyForm = {
 	installDir: "",
 	processName: "",
 	hintsLoaded: false,
+	audioSessions: "all" as const,
 	platform: "",
 	description: "",
 	developer: "",

@@ -66,6 +66,9 @@ export const statusActive: RuntimeStatus = {
 			join: false,
 			muted: false,
 			access_level: "full",
+			// Player 1 by the pick, so the co-op pair below reads the way it would on glass.
+			pads: [0],
+			preferred_pad_slot: 0,
 			uptime_s: 4_512,
 		},
 		{
@@ -78,6 +81,7 @@ export const statusActive: RuntimeStatus = {
 			join: true,
 			muted: true,
 			access_level: "view",
+			pads: [1],
 			uptime_s: 96,
 		},
 	],

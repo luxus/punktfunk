@@ -10,6 +10,7 @@ import {
 	useRequestSessionIdr,
 	useSetSessionAccess,
 	useSetSessionAudio,
+	useSetSessionPlayer,
 	useStopOneSession,
 	useStopSession,
 } from "@/api/gen/session/session";
@@ -50,6 +51,7 @@ export const SectionDashboard: FC = () => {
 	const idrOne = useRequestSessionIdr();
 	const mute = useSetSessionAudio();
 	const access = useSetSessionAccess();
+	const player = useSetSessionPlayer();
 
 	const invalidate = () =>
 		qc.invalidateQueries({ queryKey: getGetStatusQueryKey() });
@@ -163,6 +165,15 @@ export const SectionDashboard: FC = () => {
 					{ onSuccess: invalidate, onError: failed(m.access_edit_failed()) },
 				)
 			}
+			onPlayerOne={(row, slot) =>
+				row.id != null &&
+				player.mutate(
+					// `undefined`, not null: the host reads an omitted slot as the
+					// first-free claim, and the generated body has no nullable arm.
+					{ id: row.id, data: { slot: slot ?? undefined } },
+					{ onSuccess: invalidate, onError: failed(m.action_player_failed()) },
+				)
+			}
 			isStopping={stop.isPending}
 			isRequestingIdr={idr.isPending}
 			isEndingGame={endGame.isPending || stop.isPending}
@@ -170,7 +181,8 @@ export const SectionDashboard: FC = () => {
 				stopOne.isPending ||
 				idrOne.isPending ||
 				mute.isPending ||
-				access.isPending
+				access.isPending ||
+				player.isPending
 			}
 		/>
 	);

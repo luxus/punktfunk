@@ -114,6 +114,27 @@ pending device shows is one it chose for itself, and from the internet that is a
 A pairing that keeps being refused usually means a stranger is knocking into the same rate limit.
 Wait a moment and retry.
 
+## Voice chat while they play
+
+If you talk on Discord on the host while friends stream in, the default audio setup gives one of
+two wrong results: the host's speakers stay silent because the stream owns the output, or, with
+**Keep host audio playing** on a client, everyone hears everything — the friends' own voices
+included, a beat late. That is routing, not echo: Discord's playback is inside the captured mix.
+
+Two lines in `host.env` on a Linux host give the shape you want — you and the friends hear the
+game, the friends never hear themselves:
+
+```ini
+PUNKTFUNK_AUDIO_OUTPUT_MODE=host_and_client
+PUNKTFUNK_AUDIO_VOICE_CHAT=host
+```
+
+The first plays the stream's sound on the host's speakers too. The second keeps Discord, Vesktop,
+WebCord, ArmCord, Legcord, TeamSpeak and Mumble on those speakers and out of the stream; for
+Discord in a browser tab add the browser with `PUNKTFUNK_AUDIO_VOICE_APPS=discord,firefox`.
+Restart the host after editing `host.env`. If one friend should not hear the game at all, the
+console's **Session** card mutes a single session.
+
 ## What not to use
 
 ZeroTier, Hamachi and Radmin VPN work, but they expose every port on the host to the friend, not

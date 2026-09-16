@@ -28,6 +28,9 @@ pub(super) const SINK_NAME_PREFIX: &str = "punktfunk-speaker";
 /// WirePlumber preferred-sink key (subject 0 on `default` metadata;
 /// value is `{"name":"<node.name>"}` typed `Spa:String:JSON`).
 const CONFIGURED_SINK_KEY: &str = "default.configured.audio.sink";
+/// WirePlumber's elected sink (same subject and shape): what the operator
+/// hears when nothing is configured.
+const EFFECTIVE_SINK_KEY: &str = "default.audio.sink";
 
 #[derive(Debug, PartialEq)]
 enum Restore {
@@ -42,6 +45,9 @@ enum Restore {
 struct Ledger {
     holders: u32,
     restore: Option<Restore>,
+    /// `node.name` the operator heard on before the first claim: the host
+    /// bridge's playthrough and voice-chat target. Kept across releases.
+    host: Option<String>,
 }
 
 impl Ledger {
@@ -49,6 +55,18 @@ impl Ledger {
         Ledger {
             holders: 0,
             restore: None,
+            host: None,
+        }
+    }
+
+    /// Remember the elected sink the first claim found. A stale punktfunk
+    /// name (crash leftover) is not an output; the last real one stands.
+    fn note_host(&mut self, effective: Option<&str>) {
+        if let Some(name) = effective
+            .and_then(json_name)
+            .filter(|n| !n.contains(SINK_NAME_PREFIX))
+        {
+            self.host = Some(name.to_owned());
         }
     }
 
@@ -79,6 +97,18 @@ impl Ledger {
 
 static LEDGER: Mutex<Ledger> = Mutex::new(Ledger::new());
 
+/// The `name` inside WirePlumber's `{"name":"…"}` sink value.
+fn json_name(value: &str) -> Option<&str> {
+    let rest = value.split_once(r#""name":""#)?.1;
+    rest.split_once('"').map(|(name, _)| name)
+}
+
+/// The output the operator heard before the stream claimed the default, if a
+/// claim has seen one. `None` until then, or with no session manager.
+pub(super) fn host_sink() -> Option<String> {
+    LEDGER.lock().unwrap().host.clone()
+}
+
 /// Point the configured default at `sink_name` (refcounted; see module docs).
 /// Never fails the caller: missing WirePlumber still captures; apps just
 /// are not rerouted (legacy behaviour).
@@ -87,9 +117,10 @@ pub(super) fn claim(sink_name: &str) {
     let first = ledger.on_claim();
     // Latest claim wins: even with an existing holder, route to the newest session's sink.
     match set_configured_sink(Some(&format!(r#"{{"name":"{sink_name}"}}"#))) {
-        Ok(prev) => {
+        Ok(seen) => {
             if first {
-                ledger.note_previous(prev);
+                ledger.note_previous(seen.configured);
+                ledger.note_host(seen.effective.as_deref());
             }
             tracing::info!(
                 sink = sink_name,
@@ -128,10 +159,17 @@ pub(super) fn release() {
     }
 }
 
-/// Connect, find `default` metadata, read [`CONFIGURED_SINK_KEY`], set `value`
-/// (`None` deletes). Returns the previous value. Own short-lived main loop on
-/// the calling thread — claims come from session start/end, never a PW callback.
-fn set_configured_sink(value: Option<&str>) -> Result<Option<String>> {
+/// What the metadata held before a write: the configured value this claim
+/// replaces, and the elected sink the operator was hearing on.
+struct Seen {
+    configured: Option<String>,
+    effective: Option<String>,
+}
+
+/// Connect, find `default` metadata, read both sink keys, set `value` on
+/// [`CONFIGURED_SINK_KEY`] (`None` deletes). Own short-lived main loop on the
+/// calling thread — claims come from session start/end, never a PW callback.
+fn set_configured_sink(value: Option<&str>) -> Result<Seen> {
     use pipewire as pw;
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -150,6 +188,7 @@ fn set_configured_sink(value: Option<&str>) -> Result<Option<String>> {
         metadata: Option<pw::metadata::Metadata>,
         md_listener: Option<pw::metadata::MetadataListener>,
         previous: Option<String>,
+        effective: Option<String>,
         phase: u8,
         expected: Option<pw::spa::utils::result::AsyncSeq>,
         outcome: Option<Result<()>>,
@@ -158,6 +197,7 @@ fn set_configured_sink(value: Option<&str>) -> Result<Option<String>> {
         metadata: None,
         md_listener: None,
         previous: None,
+        effective: None,
         phase: 0,
         expected: None,
         outcome: None,
@@ -184,8 +224,17 @@ fn set_configured_sink(value: Option<&str>) -> Result<Option<String>> {
                             .property({
                                 let op = op.clone();
                                 move |subject, key, _type, value| {
-                                    if subject == 0 && key == Some(CONFIGURED_SINK_KEY) {
-                                        op.borrow_mut().previous = value.map(str::to_owned);
+                                    if subject == 0 {
+                                        let mut o = op.borrow_mut();
+                                        match key {
+                                            Some(CONFIGURED_SINK_KEY) => {
+                                                o.previous = value.map(str::to_owned);
+                                            }
+                                            Some(EFFECTIVE_SINK_KEY) => {
+                                                o.effective = value.map(str::to_owned);
+                                            }
+                                            _ => {}
+                                        }
                                     }
                                     0
                                 }
@@ -281,7 +330,10 @@ fn set_configured_sink(value: Option<&str>) -> Result<Option<String>> {
 
     let mut o = op.borrow_mut();
     match o.outcome.take() {
-        Some(Ok(())) => Ok(o.previous.take()),
+        Some(Ok(())) => Ok(Seen {
+            configured: o.previous.take(),
+            effective: o.effective.take(),
+        }),
         Some(Err(e)) => Err(e),
         None => Err(anyhow!("metadata loop exited unexpectedly")),
     }
@@ -333,6 +385,24 @@ mod tests {
         assert!(l.on_claim());
         l.note_previous(None);
         assert_eq!(l.on_release(), Some(Restore::Delete));
+    }
+
+    /// The host output is the elected sink's bare name; a stale punktfunk
+    /// election or a missing key keeps the last real one.
+    #[test]
+    fn host_output_is_the_elected_sink_name() {
+        assert_eq!(
+            json_name(r#"{"name":"alsa_output.hdmi"}"#),
+            Some("alsa_output.hdmi")
+        );
+        assert_eq!(json_name("garbage"), None);
+        let mut l = Ledger::new();
+        l.note_host(Some(r#"{"name":"alsa_output.hdmi"}"#));
+        assert_eq!(l.host.as_deref(), Some("alsa_output.hdmi"));
+        l.note_host(Some(r#"{"name":"punktfunk-speaker-4242-0"}"#));
+        assert_eq!(l.host.as_deref(), Some("alsa_output.hdmi"));
+        l.note_host(None);
+        assert_eq!(l.host.as_deref(), Some("alsa_output.hdmi"));
     }
 
     /// Unbalanced release must not underflow or restore.

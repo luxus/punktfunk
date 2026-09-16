@@ -441,6 +441,8 @@ package_punktfunk-web() {
 
 package_punktfunk-scripting() {
   pkgdesc="punktfunk plugin/script runner (Effect SDK on bun) — supervises host automation scripts + punktfunk-plugin-* packages"
+  # bubblewrap builds each plugin's sandbox; the runner starts no plugin without it.
+  depends=('bubblewrap')
   # bun is the runtime (it import()s the operator's .ts plugins), a vendored native binary, so this
   # package is arch-specific (not 'any'). OPT-IN: the systemd --user unit ships disabled (the runner
   # is inert until you add scripts/plugins). No nodejs/bun dependency.

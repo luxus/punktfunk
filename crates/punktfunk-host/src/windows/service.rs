@@ -181,7 +181,10 @@ fn load_host_env() {
             // Allow-list matches `interactive::merged_env_block`. A planted host.env must not
             // override `SystemRoot` — `icacls_path` / the powershell warner resolve through it.
             // `PUNKTFUNK_HOST_CMD` still passes; a non-admin-owned host.env is rejected at install.
-            let allowed = k.starts_with("PUNKTFUNK_") || k == "RUST_LOG";
+            // Credentials are excluded outright: they live in their own owner-only files, and an
+            // environment copy is what every child process inherits.
+            let secret = k.contains("TOKEN") || k.contains("PASSWORD");
+            let allowed = (k.starts_with("PUNKTFUNK_") || k == "RUST_LOG") && !secret;
             if !k.is_empty() && allowed {
                 // SAFETY: no other thread yet. The network-profile warner and the host child both
                 // start after `load_host_env` returns, so nothing reads the environment concurrently.

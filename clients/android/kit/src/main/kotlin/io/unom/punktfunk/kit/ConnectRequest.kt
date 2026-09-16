@@ -24,6 +24,9 @@ data class ConnectRequest(
     val pinHex: String,
     /** `0` = host default. */
     val bitrateKbps: Int,
+    /** Automatic's ceiling in kbps — adapt, but never climb above this. `0` = no limit, and it
+     *  is read only while [bitrateKbps] is `0`. */
+    val abrMaxKbps: Int = 0,
     /** `CompositorPref` / `GamepadPref` wire bytes (`0` = Auto). */
     val compositorPref: Int,
     val gamepadPref: Int,
@@ -91,6 +94,7 @@ data class ConnectRequest(
         .put("key_pem", keyPem)
         .put("pin_hex", pinHex)
         .put("bitrate_kbps", bitrateKbps)
+        .put("abr_max_kbps", abrMaxKbps)
         .put("compositor_pref", compositorPref)
         .put("gamepad_pref", gamepadPref)
         .put("hdr_enabled", hdrEnabled)

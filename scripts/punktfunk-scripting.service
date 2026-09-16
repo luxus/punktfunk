@@ -1,4 +1,4 @@
-# punktfunk plugin/script runner — systemd USER unit (bun runtime, OPT-IN).
+# punktfunk plugin/script runner — systemd USER unit (bun runtime, ON BY DEFAULT, opt-out).
 #
 # Runs the operator's automation under supervision: loose files in ~/.config/punktfunk/scripts/ and
 # installed `punktfunk-plugin-*` packages under ~/.config/punktfunk/plugins/. Each unit is an Effect
@@ -38,22 +38,23 @@ RestartSec=2
 KillMode=mixed
 KillSignal=SIGTERM
 TimeoutStopSec=30
-# Sandbox: the plugin token's privilege split, made real by the filesystem. A plugin holds a
-# capability-limited token, so the runner must not be able to read the full-admin `mgmt-token` or
-# the host identity key that sits beside it — same uid as the operator means file modes cannot say
-# that, but a mount namespace can. The home is an empty tmpfs and the binds below are the whole of
-# what a plugin sees of it: the Windows runner's LocalService ACL grants the scoped token plus the
-# TLS pin and nothing else, and this is that contract in the Linux idiom.
+# Sandbox, in two layers. This unit's directives confine the SUPERVISOR and the operator's own
+# loose scripts: an empty home, a read-only system, no setuid re-escalation, and a denylist over
+# the host's own credentials wherever the home tmpfs does not land.
 #
-# InaccessiblePaths is belt and braces: wherever the home tmpfs does not land — a layout that keeps
-# the home outside /home, a drop-in that removes ProtectHome — the denylist is what still stands.
+# They are not what confines a PLUGIN. These are mount-namespace options, and a mount namespace
+# does not hold against a process of the same uid: /proc/<host pid>/root reaches what it hides, as
+# /proc/<pid>/environ and kill(2) reach the rest. So each plugin runs in its own bwrap sandbox
+# (sdk/src/sandbox.ts) with its own pid namespace, which does hold, and sees the paths its manifest
+# declares plus `punktfunk-host plugins grant <plugin> <dir>` — never a drop-in widening the home
+# for everything installed.
 #
-# A plugin that must reach something else gets a drop-in — `systemctl --user edit
-# punktfunk-scripting` — with `ReadWritePaths=/mnt/games` outside the home, or `BindPaths=` /
-# `BindReadOnlyPaths=` for a path inside it.
+# A loose script that must reach something else still gets a drop-in — `systemctl --user edit
+# punktfunk-scripting` — with `ReadWritePaths=/mnt/games`, or `BindPaths=` inside the home.
 #
-# NOTE: these are all mount-namespace options, and a *user* unit needs unprivileged user namespaces
-# for them; on a kernel that restricts those, drop them via the same drop-in.
+# NOTE: these all need unprivileged user namespaces for a *user* unit, as does bwrap itself; on a
+# kernel that restricts them the runner starts no plugin and the console's Troubleshooting page
+# says so.
 #
 # PrivateTmp is deliberately OFF (field report 2026-08-03, the VirtualHere plugin). A plugin's
 # whole job is integrating with things already running on this box, and on Linux those talk over

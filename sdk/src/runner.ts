@@ -21,14 +21,24 @@ import {
 	Effect,
 	Schedule,
 } from "effect";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import { PunktfunkHost } from "./client.js";
 import { layer as hostLayer } from "./effect.js";
-import { type ConnectOptions, configDir } from "./config.js";
+import { type ConnectOptions, configDir, publishedMgmtUrl } from "./config.js";
 import { connect, type PluginDef } from "./index.js";
+import {
+	bwrapArgv,
+	grantedRoots,
+	type PluginManifest,
+	readManifest,
+	sandboxEnv,
+	sandboxProbe,
+} from "./sandbox.js";
+import { serveHostProxy } from "./host-proxy.js";
 
 export interface RunnerOptions {
 	/** Where loose scripts live. Default `<config_dir>/scripts`. */
@@ -42,6 +52,10 @@ export interface RunnerOptions {
 	connect?: ConnectOptions;
 	/** Restart backoff base (test seam). Default 1 s, capped at 60 s, jittered. */
 	restartBase?: Duration.Input;
+	/** `"off"` runs plugins in-process, as before. Set from `PUNKTFUNK_PLUGIN_SANDBOX`. */
+	sandbox?: "on" | "off";
+	/** The pinned fetch the sandbox proxy forwards with (test seam). */
+	sandboxFetch?: typeof globalThis.fetch;
 	/**
 	 * Line sink. Default: stamped stdout, with `warn`/`error` going to the matching console method
 	 * (hence stderr, and hence the right level in the console's log page — see `log-ship.ts`).
@@ -65,6 +79,11 @@ export interface Unit {
 	name: string;
 	/** Absolute path of the module to import. */
 	file: string;
+	/** The installed package's directory — absent for a loose script. */
+	packageDir?: string;
+	/** Its `punktfunk` block, when it declared one. A plugin without it gets no sandbox and no
+	 * host-run commands: it is the declaration that says what either would allow. */
+	manifest?: PluginManifest;
 }
 
 const defaultLog: LogSink = (line, level = "info") => {
@@ -351,7 +370,13 @@ export const discoverUnits = (
 			const rel = manifest.module ?? manifest.main ?? "index.js";
 			const file = path.join(dir, rel);
 			if (!fileIsSafe(file, log)) return;
-			units.push({ name, file });
+			const declared = readManifest(dir);
+			units.push({
+				name,
+				file,
+				packageDir: dir,
+				...(declared ? { manifest: declared } : {}),
+			});
 		} catch (e) {
 			log(`[runner] skipping ${name}: unreadable package.json (${e})`, "warn");
 		}
@@ -389,6 +414,117 @@ export const discoverUnits = (
 	return units;
 };
 
+/**
+ * Whether plugins run sandboxed at all. Off is an explicit operator choice, logged where they
+ * will see it — never a silent downgrade because a box could not manage a namespace.
+ */
+export const sandboxMode = (): "on" | "off" =>
+	/^(0|off|false)$/i.test(process.env.PUNKTFUNK_PLUGIN_SANDBOX ?? "") ? "off" : "on";
+
+/** This plugin's own token, written where only its sandbox can read it. */
+const writePluginToken = (stateDir: string, id: string): string | undefined => {
+	const file = path.join(stateDir, ".plugin-token");
+	try {
+		const tokens = JSON.parse(
+			fs.readFileSync(path.join(configDir(), "plugin-tokens.json"), "utf8"),
+		) as Record<string, string>;
+		const token = tokens[id];
+		if (token === undefined) return undefined;
+		fs.mkdirSync(stateDir, { recursive: true });
+		fs.writeFileSync(file, `PUNKTFUNK_PLUGIN_TOKEN=${token}\n`, { mode: 0o600 });
+		return file;
+	} catch {
+		return undefined;
+	}
+};
+
+/**
+ * Run one plugin in its own sandbox: a child process under `bwrap`, re-executing this runner in
+ * `--run-unit` mode so the plugin's code never shares an address space — or a token — with
+ * another's.
+ *
+ * Resolves when the child exits; a non-zero exit fails the effect, which is what makes the
+ * supervisor restart it with the same backoff an in-process failure gets.
+ */
+const runSandboxed = (
+	unit: Unit,
+	manifest: PluginManifest,
+	options: RunnerOptions,
+	log: LogSink,
+): Effect.Effect<"plugin", unknown> =>
+	Effect.callback<"plugin", unknown>((resume) => {
+		const id = manifest.id ?? unit.name;
+		const config = configDir();
+		const stateDir = path.join(config, "plugin-state", id);
+		const tokenFile = writePluginToken(stateDir, id);
+		if (!tokenFile) {
+			resume(
+				Effect.fail(
+					new Error(
+						`no per-plugin token for ${id} — the host mints them for installed plugins on its next start`,
+					),
+				),
+			);
+			return;
+		}
+		const runtime = process.env.XDG_RUNTIME_DIR ?? "/tmp";
+		const socket = path.join(runtime, "punktfunk", `plugin-${id}.sock`);
+		const proxy = serveHostProxy({
+			socket,
+			url: options.connect?.url ?? publishedMgmtUrl() ?? "https://127.0.0.1:47990",
+			fetch: options.sandboxFetch ?? fetch,
+		});
+		const argv = [
+			...bwrapArgv(
+				manifest,
+				{
+					stateDir,
+					tokenFile,
+					socket,
+					pluginsDir: options.pluginsDir ?? path.join(config, "plugins"),
+					bun: process.execPath,
+					runner: runnerEntry(),
+					home: os.homedir(),
+				},
+				grantedRoots(config, id),
+			),
+			process.execPath,
+			runnerEntry(),
+			"--run-unit",
+			unit.file,
+			"--unit-name",
+			unit.name,
+		];
+		const child = spawn("bwrap", argv, {
+			env: sandboxEnv(os.homedir()),
+			stdio: ["ignore", "inherit", "inherit"],
+		});
+		child.on("error", (e) => {
+			proxy.close();
+			resume(Effect.fail(e));
+		});
+		child.on("exit", (code, signal) => {
+			proxy.close();
+			if (code === 0) resume(Effect.succeed("plugin" as const));
+			else
+				resume(
+					Effect.fail(
+						new Error(`sandboxed plugin exited ${signal ? `on ${signal}` : `with ${code}`}`),
+					),
+				);
+		});
+		return Effect.sync(() => {
+			// Interruption (shutdown): SIGTERM lets the plugin's finalizers run; `--die-with-parent`
+			// is the backstop if this runner is killed outright.
+			child.kill("SIGTERM");
+			proxy.close();
+		});
+	});
+
+/** The runner bundle this process is running, which each sandbox re-execs. */
+const runnerEntry = (): string =>
+	process.env.PUNKTFUNK_RUNNER_ENTRY ?? process.argv[1] ?? "";
+
 const isPluginDef = (v: unknown): v is PluginDef =>
 	typeof v === "object" &&
 	v !== null &&
@@ -403,6 +539,12 @@ const attemptUnit = (
 	log: LogSink,
 ): Effect.Effect<"plugin" | "script", unknown> =>
 	Effect.gen(function* () {
+		// A plugin that declared a manifest runs in its own sandbox, in its own process. A loose
+		// script is the operator's own code and stays here, as does everything on a box that
+		// cannot sandbox — with the reason said out loud at startup, never silently.
+		if (unit.manifest && options.sandbox !== "off") {
+			return yield* runSandboxed(unit, unit.manifest, options, log);
+		}
 		const mod = (yield* Effect.tryPromise(
 			() => import(`${pathToFileURL(unit.file).href}?attempt=${attempt}`),
 		)) as { default?: unknown };
@@ -486,6 +628,36 @@ export const superviseUnit = (
 };
 
 /**
+ * Run exactly one unit, here, with no sandbox and no restart: this is what the child process
+ * inside a sandbox does. Restarting is the supervisor's job on the other side of the process
+ * boundary, which is also what makes a crashed plugin visible as an exit code.
+ */
+export const runOneUnit = (
+	unit: Unit,
+	options: RunnerOptions = {},
+): Effect.Effect<void, unknown> => {
+	const log = options.log ?? defaultLog;
+	log(`[${unit.name}] starting (${unit.file})`);
+	return attemptUnit(unit, 1, { ...options, sandbox: "off" }, log).pipe(
+		Effect.tap((kind) =>
+			Effect.sync(() =>
+				log(
+					kind === "script"
+						? `[${unit.name}] script completed`
+						: `[${unit.name}] plugin completed`,
+				),
+			),
+		),
+		Effect.tapCause((cause) =>
+			Effect.sync(() =>
+				log(`[${unit.name}] failed: ${Cause.pretty(cause).split("\n")[0]}`, "error"),
+			),
+		),
+		Effect.asVoid,
+	);
+};
+
+/**
  * The runner: discover units, supervise each as a fiber, run until interrupted — at which
  * point every unit is interrupted STRUCTURALLY (scoped finalizers run: facade clients close,
  * Effect plugins release what they acquired).
@@ -494,6 +666,19 @@ export const runner = (options: RunnerOptions = {}): Effect.Effect<void> => {
 	const log = options.log ?? defaultLog;
 	return Effect.scoped(
 		Effect.gen(function* () {
+			const sandboxed = options.sandbox ?? sandboxMode();
+			if (sandboxed === "off") {
+				log(
+					"[runner] PUNKTFUNK_PLUGIN_SANDBOX=off — plugins run in this process, with your account's access",
+					"warn",
+				);
+			} else {
+				const probe = sandboxProbe();
+				if (!probe.ok) {
+					log(`[runner] plugins cannot be sandboxed: ${probe.reason}`, "error");
+					log("[runner] refusing to run plugins unsandboxed — set PUNKTFUNK_PLUGIN_SANDBOX=off to accept that", "error");
+				}
+			}
 			const units = discoverUnits(options, log);
 			if (units.length === 0) {
 				log(

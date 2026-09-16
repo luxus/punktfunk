@@ -205,8 +205,8 @@ in
           `host.env` key/value pairs passed to the service via `EnvironmentFile`. See
           `''${package}/share/punktfunk-host/host.env.example` for the full surface. Booleans render
           as `1`/`0`. Leave empty to rely on the host's per-connect auto-detection of the
-          compositor + input backend. Do NOT put secrets here (world-readable in the store) — use
-          `environmentFile` instead.
+          compositor + input backend. Secrets are REFUSED here (this renders to a world-readable
+          store path) — use `environmentFile`, or let the host generate them.
         '';
       };
 
@@ -215,8 +215,10 @@ in
         default = null;
         example = "/run/secrets/punktfunk-host.env";
         description = ''
-          Extra `EnvironmentFile` layered AFTER `settings` (its values win). For secrets such as
-          `PUNKTFUNK_MGMT_TOKEN`. Loaded optionally (a missing file does not fail the unit).
+          Extra `EnvironmentFile` layered AFTER `settings` (its values win), for values that must
+          not reach the store. Loaded optionally (a missing file does not fail the unit). The host
+          keeps its own credentials in `~/.config/punktfunk/`, owner-only, and takes them out of its
+          environment at startup so the games and hooks it launches cannot inherit them.
         '';
       };
 
@@ -395,6 +397,18 @@ in
     # --- shared: whenever either half is enabled -----------------------------------------------
     (mkIf (cfg.host.enable || cfg.client.enable) {
       assertions = [
+        {
+          # `settings` renders to a world-readable store path, and every value in it is inherited
+          # by the games and hooks the host launches.
+          assertion = !(lib.any (k: lib.hasInfix "TOKEN" k || lib.hasInfix "PASSWORD" k) (
+            lib.attrNames cfg.host.settings
+          ));
+          message = ''
+            services.punktfunk.host.settings must not carry a token or a password: it becomes a
+            world-readable file in the Nix store. Use services.punktfunk.host.environmentFile, or
+            let the host generate its own credentials in ~/.config/punktfunk/.
+          '';
+        }
         {
           assertion = system == "x86_64-linux";
           message = "services.punktfunk is x86_64-linux only (desktop NVENC host; no aarch64 build).";
@@ -754,6 +768,8 @@ in
         # and retries per unit, so this is ordering only, not a hard requirement).
         after = [ "punktfunk-host.service" ];
         wantedBy = optional cfg.scripting.autoStart "default.target";
+        # Each plugin runs inside its own `bwrap` sandbox, built by the runner.
+        path = [ pkgs.bubblewrap ];
         serviceConfig = {
           Type = "simple";
           ExecStart = "${cfg.scripting.package}/bin/punktfunk-scripting";
@@ -765,11 +781,10 @@ in
           KillSignal = "SIGTERM";
           TimeoutStopSec = 30;
 
-          # Sandbox — the same confinement scripts/punktfunk-scripting.service gives the deb/rpm
-          # installs. The runner `import()`s the operator's own `.ts` files, so this is the one unit
-          # here that executes arbitrary code by design; without these it ran strictly LESS confined
-          # on NixOS than on every other channel. Keep the two files in step: module-check.nix
-          # asserts each directive below.
+          # Unit-level hardening, the same scripts/punktfunk-scripting.service gives the deb/rpm
+          # installs — keep the two in step, module-check.nix asserts each directive. It confines
+          # the supervisor and the operator's loose scripts, not a PLUGIN: those get their own
+          # bwrap sandbox, because a mount namespace on a same-uid unit is no boundary.
           NoNewPrivileges = true;
           # PrivateTmp deliberately OFF (field report 2026-08-03, the VirtualHere plugin). A
           # plugin's whole job is integrating with things already running on this box, and on Linux
