@@ -67,6 +67,21 @@ pub fn arrange(members: &[Member], layout: &Layout) -> Vec<Placement> {
     }
 }
 
+/// Whether the backend must move the output to `at`.
+///
+/// Auto-row origin of the first member is the compositor default; applying it
+/// in extend stacks on the physical. A later member or a pin at the origin is a
+/// move — KWin parks a new output to the right of the row.
+pub fn needs_apply(at: Placement, first_in_group: bool, member: &Member, layout: &Layout) -> bool {
+    if (at.x, at.y) != (0, 0) {
+        return true;
+    }
+    if !first_in_group {
+        return true;
+    }
+    layout.mode == LayoutMode::Manual && pin_of(member, layout).is_some()
+}
+
 /// Pins verbatim; unpinned members row out past the rightmost pinned edge.
 ///
 /// The cursor is seeded from every pin, so an already-placed unpinned `x`
@@ -225,6 +240,24 @@ mod tests {
         let out = arrange(&members, &layout);
         assert_eq!(out[0], Placement { x: 1920, y: 0 });
         assert_eq!(out[1], Placement { x: 0, y: 0 });
+    }
+
+    /// Skip auto-row origin of the first member (KWin default). Apply a later
+    /// member or a pin at (0, 0): new outputs park to the right of the row.
+    #[test]
+    fn origin_is_applied_when_it_is_a_move() {
+        let origin = Placement { x: 0, y: 0 };
+        let elsewhere = Placement { x: 1920, y: 0 };
+        let first = m(Some(1), 2560);
+        let later = m(Some(7), 1920);
+        assert!(!needs_apply(origin, true, &first, &Layout::default()));
+        assert!(needs_apply(elsewhere, true, &first, &Layout::default()));
+        assert!(needs_apply(origin, false, &later, &Layout::default()));
+        let pin_at_origin = manual(&[("7", 0, 0)]);
+        assert!(needs_apply(origin, true, &later, &pin_at_origin));
+        assert!(needs_apply(origin, false, &later, &pin_at_origin));
+        // Manual with no pin for this slot is auto-row.
+        assert!(!needs_apply(origin, true, &first, &manual(&[])));
     }
 
     #[test]

@@ -981,6 +981,30 @@ mod pool {
             };
             let pos = position_for_new(vec![(1, new)], new, &layout);
             assert_eq!(pos, Placement { x: 100, y: 200 });
+            assert!(crate::layout::needs_apply(pos, false, &new, &layout));
+        }
+
+        #[test]
+        fn a_manual_pin_at_origin_is_a_real_placement() {
+            use crate::layout::{Member, Placement};
+            let mut positions = BTreeMap::new();
+            positions.insert("7".to_string(), Position { x: 0, y: 0 });
+            let layout = Layout {
+                mode: LayoutMode::Manual,
+                positions,
+            };
+            let first = Member {
+                identity_slot: Some(1),
+                width: 2560,
+            };
+            let pinned = Member {
+                identity_slot: Some(7),
+                width: 1920,
+            };
+            let pos = position_for_new(vec![(1, first)], pinned, &layout);
+            assert_eq!(pos, Placement { x: 0, y: 0 });
+            assert!(crate::layout::needs_apply(pos, false, &pinned, &layout));
+            assert!(crate::layout::needs_apply(pos, true, &pinned, &layout));
         }
 
         #[test]
@@ -1451,7 +1475,7 @@ mod linux {
 
         // Position then push under the same lock (I/O-free). Apply is below,
         // outside the lock.
-        let position = {
+        let (position, apply) = {
             use crate::layout::Member;
             let layout_policy = policy::prefs()
                 .configured_effective()
@@ -1477,14 +1501,15 @@ mod linux {
                 identity_slot,
                 width: mode.width as i32,
             };
+            let first = existing.is_empty();
             let pos = position_for_new(existing, new_member, &layout_policy);
+            let apply = crate::layout::needs_apply(pos, first, &new_member, &layout_policy);
             es.push(entry);
-            pos
+            (pos, apply)
         };
-        // Apply position outside the lock (kscreen blocks). Skip (0, 0): that
-        // is the compositor default, so first-of-group and non-KWin (no-op
-        // `apply_position`) issue no positioning.
-        if (position.x, position.y) != (0, 0) {
+        // Outside the lock: kscreen blocks. `needs_apply` skips auto-row origin
+        // of the first member (compositor default) and honors a pin at (0, 0).
+        if apply {
             vd.apply_position(position.x, position.y);
         }
         let mut out = output_for(
