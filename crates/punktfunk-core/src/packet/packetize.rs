@@ -87,8 +87,9 @@ impl Packetizer {
             version: config.phase as u8,
             tail: Vec::new(),
             recovery: Vec::new(),
-            // Mirrors `ReassemblerLimits::from_config` — keep the two in step.
-            max_total_shards: (max_data + config.fec.recovery_for(max_data))
+            // Reserve the full live FEC range, like `ReassemblerLimits::from_config`.
+            // The startup percentage is not a negotiated ceiling.
+            max_total_shards: (max_data + (max_data * 90).div_ceil(100))
                 .min(config.fec.scheme.max_total_shards()),
             // Derived from the shard size below (single source of truth for the formulas).
             max_blocks: 0,
