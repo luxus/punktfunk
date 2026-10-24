@@ -11,5 +11,7 @@
 runCommand "bun-cache-registry-aliases" { nativeBuildInputs = [ python3 ]; } ''
   mkdir -p "$out/share"
   cp -a ${deps}/share/bun-cache "$out/share/bun-cache"
+  # The copied tree keeps the store mode (0555). The alias has to be created in it.
+  chmod -R u+w "$out/share/bun-cache"
   python3 ${./bun-registry-cache.py} "$out/share/bun-cache" ${lib.escapeShellArg "${npmrc}"}
 ''
