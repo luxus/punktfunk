@@ -62,12 +62,17 @@
   makeWrapper,
   stdenvNoCC,
   coreutils,
+  runCommand,
+  python3,
   # bun2nix (github:nix-community/bun2nix, pinned in flake.nix): `.fetchBunDeps` turns a generated
   # `bun.nix` into bun's global install cache, and `.hook` runs an offline `bun install` off it.
   bun2nix,
 }:
 let
   gbm = if libgbm != null then libgbm else mesa;
+
+  # bun 1.4.4's cache folder for a registry URL that is not `https://host/`.
+  linkBunRegistryCache = import ./bun-registry-cache.nix { inherit lib runCommand python3; };
 
   # Build provenance stamped into the binary (build.rs reads PUNKTFUNK_BUILD_VERSION for
   # `--version` / mgmt /health). A main checkout keeps Cargo.toml's last stable version, so
@@ -424,7 +429,14 @@ in
     # the same anonymous pull CI's rpm/deb builds do). That replaces the old single fixed-output
     # `bun install` derivation whose aggregate `outputHash` had to be hand-bumped on every lockfile
     # change — the failure mode this design removes.
-    bunDeps = bun2nix.fetchBunDeps { bunNix = src + "/web/bun.nix"; };
+    #
+    # The fetch is not the cache key. bun 1.4.4 looks up a path-bearing registry as
+    # `name@version@@host__<wyhash>@@@1`; bun2nix 2.1.2 still writes `@@host@@@1`. Without the
+    # alias, the sandbox install misses `@unom/style` and `@unom/ui` and asks git.unom.io.
+    bunDeps = linkBunRegistryCache {
+      deps = bun2nix.fetchBunDeps { bunNix = src + "/web/bun.nix"; };
+      npmrc = src + "/web/.npmrc";
+    };
     # `src` is the whole repo; the console (and its lockfile) live in web/.
     bunRoot = "web";
     # The install-time `prepare` codegen is run explicitly in buildPhase instead (below), matching
