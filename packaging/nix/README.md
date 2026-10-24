@@ -121,6 +121,12 @@ GPU driver. `nix fmt` formats the `.nix` files.
   The flake input and the npm devDependency in `web/package.json` and `sdk/package.json` must name
   the same exact version — the script checks that too. Move all three together, then `--fix`.
 
+  Regenerating `bun.nix` does not fix a registry whose URL is not `https://host/`. bun 1.4.4
+  names that cache entry `@@host__<wyhash of the .npmrc URL>@@@1`; bun2nix 2.1.2 still writes
+  `@@host@@@1`, so the sandbox install of `@unom/style` and `@unom/ui` goes back to git.unom.io.
+  [`bun-registry-cache.nix`](bun-registry-cache.nix) aliases the hashed name onto the fetched
+  tarball. `python3 packaging/nix/bun-registry-cache.py --self-test` checks the hash.
+
 - **`nix flake check` does NOT check the NixOS module.** For `nixosModules`, nix forces the value,
   asserts it is a lambda taking an open attribute set, and stops (its source still carries
   `// FIXME: if we have a 'nixpkgs' input, use it to check the module.`). Measured: a module setting
